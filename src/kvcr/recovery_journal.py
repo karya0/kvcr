@@ -17,12 +17,17 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import msgspec
 
-from .config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
+from .config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig, LocalDramInfo
 from .core import _BlockRecord, _KVCRCore
-from .guard_protocol import KVCRClient, KVCRPoolHold
-from .local_disk import _G3, _G3Residency
+from .guard_protocol import KVCRClient, KVCRPoolHold, PoolDescriptor
+from .local_disk import _G3, _G3Residency, _validate_g3_slot_geometry
 from .local_dram import _LocalDram, _LocalDramResidency, _LocalDramState
-from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
+from .memory import (
+    _JOURNAL_HEADER_BYTES,
+    KVCRPoolAttachment,
+    KVCRPoolSpec,
+    _compute_pool_geometry,
+)
 from .types import BlockKey, RecoveryMirrorError
 
 if TYPE_CHECKING:
@@ -78,8 +83,8 @@ _RECORD_TYPES = frozenset({_RECORD_BLOCK})
 #
 # Field order is the format. Append only -- never reorder or remove.
 class _RecoveryBlock(msgspec.Struct, frozen=True, array_like=True):
-    # A slot per tier, or nothing. Bare ints: wrapping one costs a byte each.
-    g2: Annotated[int, msgspec.Meta(ge=0)] | None = None
+    # One slot per ordered pool, or nothing. Even one pool uses ``[slot]``.
+    g2: list[int] | None = None
     g3: Annotated[int, msgspec.Meta(ge=0)] | None = None
 
 
@@ -104,23 +109,42 @@ def _is_recoverable(record: _BlockRecord) -> bool:
     )
 
 
-def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
+def _g2_slots(slot: int | list[int], pool_count: int) -> list[int]:
+    if (
+        type(slot) is not list
+        or len(slot) != pool_count
+        or any(type(item) is not int or item < 0 for item in slot)
+    ):
+        raise ValueError("G2 recovery slots do not match the pool group")
+    return slot
+
+
+def _project_recovery_record(record: _BlockRecord, pool_count: int) -> _RecoveryBlock:
+    g3 = record.g3.slot if record.g3 is not None else None
     local_dram = record.local_dram
-    return _RecoveryBlock(
-        g2=(
-            local_dram.slot
-            if local_dram is not None and local_dram.state is _LocalDramState.READY
-            else None
-        ),
-        g3=record.g3.slot if record.g3 is not None else None,
-    )
+    if local_dram is None or local_dram.state is not _LocalDramState.READY:
+        return _RecoveryBlock(g3=g3)
+    return _RecoveryBlock(g2=_g2_slots(local_dram.slot, pool_count), g3=g3)
 
 
-def _decode_recovery_record(payload: bytes) -> _BlockRecord:
+def _project_one_pool_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
+    """Encode one scalar core at the collection-only recovery boundary."""
+    g3 = record.g3.slot if record.g3 is not None else None
+    local_dram = record.local_dram
+    if local_dram is None or local_dram.state is not _LocalDramState.READY:
+        return _RecoveryBlock(g3=g3)
+    if type(local_dram.slot) is not int:
+        raise ValueError("scalar Local DRAM recovery slot must be an integer")
+    return _RecoveryBlock(g2=[local_dram.slot], g3=g3)
+
+
+def _decode_recovery_record(payload: bytes, pool_count: int) -> _BlockRecord:
     recovered = _RECOVERY_DECODER.decode(payload)
     return _BlockRecord(
         local_dram=(
-            _LocalDramResidency(recovered.g2, _LocalDramState.READY)
+            _LocalDramResidency(
+                _g2_slots(recovered.g2, pool_count), _LocalDramState.READY
+            )
             if recovered.g2 is not None
             else None
         ),
@@ -309,7 +333,8 @@ class RecoveryJournal:
 
 
 class _RecoveryMirror:
-    def __init__(self) -> None:
+    def __init__(self, pool_count: int) -> None:
+        self._pool_count = pool_count
         self._records: dict[BlockKey, _BlockRecord] = {}
 
     def apply(self, record_type: int, key: bytes, payload: bytes) -> None:
@@ -317,7 +342,7 @@ class _RecoveryMirror:
         # where frames are published and read, not again here.
         del record_type
         try:
-            record = _decode_recovery_record(payload)
+            record = _decode_recovery_record(payload, self._pool_count)
         except (TypeError, ValueError, msgspec.DecodeError) as error:
             raise RecoveryMirrorError("recovery record is malformed") from error
         block_key = BlockKey(key)
@@ -389,7 +414,7 @@ def _attach_journal(
 
     def publish(key: BlockKey, record: _BlockRecord) -> None:
         # TODO: Publish per-tier deltas if full-record journal traffic is material.
-        recovered = _project_recovery_record(record)
+        recovered = _project_one_pool_recovery_record(record)
         publish_frame(_RECORD_BLOCK, bytes(key), _RECOVERY_ENCODER.encode(recovered))
 
     if g3 is not None:
@@ -405,6 +430,11 @@ def install_recovery_records(
     The mechanics live on the core: seeding, admission and ranking touch
     invariants only the core owns.
     """
+    # Decode remains collection-only. Narrow only at the scalar core seam.
+    for record in records.values():
+        local_dram = record.local_dram
+        if local_dram is not None and local_dram.state is _LocalDramState.READY:
+            local_dram.slot = _g2_slots(local_dram.slot, 1)[0]
     core.adopt_recovery_records(records)
 
 
@@ -440,9 +470,11 @@ def claim_guarded_pool(
             "guard_config needs a framework control that can share its control "
             "endpoint, so that a Guard can answer on it after this worker dies"
         )
+    if backend_configs.g3 is not None:
+        _validate_g3_slot_geometry(backend_configs.g3, guard_config.row_stride)
     hold = KVCRClient(guard_config.kvcr_service_socket_path).claim(
         guard_config.pool_index,
-        guard_config.row_stride,
+        (guard_config.row_stride,),
         guard_config.compatibility_digest,
         bind_address(),
         backend_configs.g3,
@@ -454,7 +486,7 @@ def claim_guarded_pool(
         recovered = read_handback(
             hold._attachment,
             guard_config.compatibility_digest,
-            guard_config.row_stride,
+            hold.pools,
         )
     except BaseException:
         # A failing release must not mask the error that made the claim unusable.
@@ -476,10 +508,13 @@ def claimed_core(
     fail runs against it: a startup that released the pool without closing the
     core would leave it mapping bytes the next claimant is given.
     """
+    pool = claimed.hold.pools[0]
+    effective_bytes, rows = _compute_pool_geometry(pool.size_bytes, pool.row_stride)
+    local_dram = LocalDramInfo(pool.mapping_address, effective_bytes, rows)
     return _KVCRCore(
         config,
         bindings,
-        replace(backend_configs, local_dram=claimed.hold.local_dram),
+        replace(backend_configs, local_dram=local_dram),
     )
 
 
@@ -526,13 +561,13 @@ def _pack_frame(record_type: int, key: bytes, payload: bytes, size: int) -> byte
 
 
 def _recovery_frames(
-    records: Mapping[BlockKey, _BlockRecord],
+    records: Mapping[BlockKey, _BlockRecord], pool_count: int
 ) -> Iterator[tuple[int, bytes, bytes]]:
     """Every frame a returning primary needs to rebuild this state."""
     for key, record in records.items():
         if not _is_recoverable(record):
             continue
-        payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
+        payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record, pool_count))
         yield _RECORD_BLOCK, bytes(key), payload
 
 
@@ -541,11 +576,14 @@ def _recovery_frames(
 # different pool of the same shape; the digest separates finished from filling.
 _SNAPSHOT_HEADER = struct.Struct("<32sQ")
 _SNAPSHOT_DOMAIN = b"KVCR-HANDBACK\0"
-_SNAPSHOT_TERMS = struct.Struct("<QQQQQ")
+_SNAPSHOT_ALLOCATION_TERMS = struct.Struct("<QQQQQ")
+_SNAPSHOT_POOL_TERMS = struct.Struct("<QQQ")
 
 
 def canonical_pool_terms(
-    compatibility_digest: str, row_stride: int, spec: "KVCRPoolSpec"
+    compatibility_digest: str,
+    pools: tuple[PoolDescriptor, ...],
+    spec: "KVCRPoolSpec",
 ) -> bytes:
     """Encode what a handback region must not be replayed across."""
     return (
@@ -553,8 +591,18 @@ def canonical_pool_terms(
         + compatibility_digest.encode()
         + b"\0"
         + bytes.fromhex(spec.generation)
-        + _SNAPSHOT_TERMS.pack(
-            row_stride, spec.journal_bytes, spec.mapping_bytes, spec.device, spec.inode
+        + _SNAPSHOT_ALLOCATION_TERMS.pack(
+            spec.journal_bytes,
+            spec.mapping_bytes,
+            spec.device,
+            spec.inode,
+            len(pools),
+        )
+        + b"".join(
+            _SNAPSHOT_POOL_TERMS.pack(
+                pool.size_bytes, pool.row_stride, pool.offset_bytes
+            )
+            for pool in pools
         )
     )
 
@@ -652,7 +700,9 @@ def read_recovery_snapshot(
 
 
 def read_handback(
-    pool: KVCRPoolAttachment, compatibility_digest: str, row_stride: int
+    pool: KVCRPoolAttachment,
+    compatibility_digest: str,
+    pools: tuple[PoolDescriptor, ...],
 ) -> _RecoveryMirror:
     """Replay whatever the last Guard left for this pool, if anything.
 
@@ -662,8 +712,8 @@ def read_handback(
     write never finished is this service's own, and is thrown away -- nothing
     else ever would, and it would refuse every later claim on this pool too.
     """
-    mirror = _RecoveryMirror()
-    terms = canonical_pool_terms(compatibility_digest, row_stride, pool._spec)
+    mirror = _RecoveryMirror(len(pools))
+    terms = canonical_pool_terms(compatibility_digest, pools, pool._spec)
     try:
         for frame in read_recovery_snapshot(pool, terms):
             mirror.apply(*frame)
@@ -672,7 +722,7 @@ def read_handback(
             "KVCR discarding a handback region that was never finished", exc_info=True
         )
         pool.release_snapshot_region()
-        return _RecoveryMirror()
+        return _RecoveryMirror(len(pools))
     return mirror
 
 

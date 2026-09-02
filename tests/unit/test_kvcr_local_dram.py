@@ -429,10 +429,14 @@ def test_local_initialize_failure_completes_without_failing_progress() -> None:
     assert policy.removed == []
 
 
-def _g2_recovered(**slots: int) -> dict[BlockKey, _BlockRecord]:
+def _g2_recovered(
+    *, grouped: bool = True, **slots: int
+) -> dict[BlockKey, _BlockRecord]:
     return {
         BlockKey(name.encode()): _BlockRecord(
-            local_dram=_LocalDramResidency(slot, _LocalDramState.READY)
+            local_dram=_LocalDramResidency(
+                [slot] if grouped else slot, _LocalDramState.READY
+            )
         )
         for name, slot in slots.items()
     }
@@ -508,8 +512,8 @@ def test_installing_records_into_a_core_that_holds_some_is_refused() -> None:
 @pytest.mark.parametrize(
     "records",
     [
-        _g2_recovered(first=0, second=0),
-        _g2_recovered(first=0, second=4),
+        _g2_recovered(grouped=False, first=0, second=0),
+        _g2_recovered(grouped=False, first=0, second=4),
         {
             BlockKey(b"first"): _BlockRecord(
                 local_dram=_LocalDramResidency(0, _LocalDramState.FILLING)

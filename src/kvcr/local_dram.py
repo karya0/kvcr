@@ -40,7 +40,7 @@ class _LocalDramState(Enum):
 
 @dataclass(slots=True)
 class _LocalDramResidency:
-    slot: int
+    slot: int | list[int]
     state: _LocalDramState
     claim_count: int = 0
     retire_on_release: bool = False

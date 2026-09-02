@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -48,26 +49,25 @@ from kvcr.memory import _KVCRPoolOwner
 
 
 def _holders_of(registry) -> dict[int, object]:
-    """The pools a worker holds, in the shape the old binding map had."""
+    """The Guards a worker holds, in the shape the old binding map had."""
     return {
         i: p._pool_lease.current
-        for i, p in registry._pools.items()
+        for i, p in registry._guards.items()
         if p._pool_lease.current is not None
     }
 
 
 _SERVER_STOP_TIMEOUT_SECONDS = 5
 _CONNECTION_POLL_INTERVAL_SECONDS = 0.001
-
-_TEST_POOL_COUNT = 2
-_TEST_JOURNAL_BYTES = 8192
-_TEST_POOL_SIZE_BYTES = _TEST_JOURNAL_BYTES + 8192
-_TEST_ROW_STRIDE = 1024
-_TEST_DIGEST = "opaque digest: Preserve-Me EXACTLY"
-_TEST_TIER_CONFIG = _TierConfig(_TEST_ROW_STRIDE, None)
-# G3 terms are refused at decode unless a real claimant could open them, so
-# the one claim that carries G3 uses a page-aligned stride.
 _PAGE_STRIDE = os.sysconf("SC_PAGE_SIZE")
+
+_TEST_GUARD_COUNT = 2
+_TEST_JOURNAL_BYTES = 2 * _PAGE_STRIDE
+_TEST_POOL_SIZES_BYTES = (2 * _PAGE_STRIDE,)
+_TEST_ROW_STRIDE = 1024
+_TEST_ROW_STRIDES = (_TEST_ROW_STRIDE,)
+_TEST_DIGEST = "opaque digest: Preserve-Me EXACTLY"
+_TEST_TIER_CONFIG = _TierConfig(_TEST_ROW_STRIDES, None)
 
 
 class _FakeLiveness:
@@ -92,22 +92,22 @@ class _FakeLiveness:
             os.close(self._write)
 
 
-def _claim(registry, pool_index, liveness, control_bind=None):
+def _claim(registry, guard_index, liveness, control_bind=None):
     """Claim through the registry, closing the granted fd the tests never send."""
-    spec, listener_fd, lease = registry.claim(
-        pool_index,
+    spec, _pools, listener_fd, lease = registry.claim(
+        guard_index,
         _TEST_TIER_CONFIG,
         liveness,
-        control_bind or _control_bind(pool_index),
+        control_bind or _control_bind(guard_index),
     )
     os.close(listener_fd)
     return spec, lease
 
 
-def _kill_and_wait(registry, pool_index, liveness) -> None:
-    """Die the way a real claimant does: the pool's own actor notices."""
+def _kill_and_wait(registry, guard_index, liveness) -> None:
+    """Die the way a real claimant does: the Guard's own actor notices."""
     liveness.kill()
-    guard = registry._pools[pool_index]
+    guard = registry._guards[guard_index]
     _wait_until(
         lambda: guard._phase in (_Phase.STANDBY, _Phase.FAILED) or guard._failure,
         timeout=5,
@@ -139,8 +139,8 @@ def _test_socket_path() -> Path:
 @contextmanager
 def _running_server(
     tmp_path: Path,
-    pool_count: int = _TEST_POOL_COUNT,
-    pool_size_bytes: int = _TEST_POOL_SIZE_BYTES,
+    guard_count: int = _TEST_GUARD_COUNT,
+    pool_sizes_bytes: tuple[int, ...] = _TEST_POOL_SIZES_BYTES,
     journal_bytes: int = _TEST_JOURNAL_BYTES,
 ) -> Iterator[_ServerHarness]:
     socket_path = _test_socket_path()
@@ -149,8 +149,8 @@ def _running_server(
     server = _KVCRService(
         socket_path,
         pool_dir,
-        pool_count=pool_count,
-        pool_size_bytes=pool_size_bytes,
+        guard_count=guard_count,
+        pool_sizes_bytes=pool_sizes_bytes,
         compatibility_digest=_TEST_DIGEST,
         journal_bytes=journal_bytes,
     )
@@ -177,11 +177,11 @@ def _send_raw_request(
 _POOL_BINDS: dict[int, tuple[str, int]] = {}
 
 
-def _control_bind(pool_index: int = 0) -> tuple[str, int]:
-    """The address a pool answers on, stable for as long as it exists."""
-    if pool_index not in _POOL_BINDS:
-        _POOL_BINDS[pool_index] = ("127.0.0.1", free_port())
-    return _POOL_BINDS[pool_index]
+def _control_bind(guard_index: int = 0) -> tuple[str, int]:
+    """The address a Guard answers on, stable for as long as it exists."""
+    if guard_index not in _POOL_BINDS:
+        _POOL_BINDS[guard_index] = ("127.0.0.1", free_port())
+    return _POOL_BINDS[guard_index]
 
 
 # A free address a client can ask the service to bind.
@@ -215,12 +215,16 @@ def _channels_are_taken():
 
 def _stand_in_pool(spec) -> Mock:
     """The pool-tail surface a Guard reaches for, without a real mapping."""
-    attachment = Mock(address=1234, data_address=1234 + spec.journal_bytes, _spec=spec)
+    attachment = Mock(address=1234, _spec=spec)
     attachment.mapped_snapshot.return_value = nullcontext(None)
     return attachment
 
 
-def _new_registry(tmp_path: Path, pool_count: int = 1) -> _PoolRegistry:
+def _new_registry(
+    tmp_path: Path,
+    guard_count: int = 1,
+    pool_sizes_bytes: tuple[int, ...] = _TEST_POOL_SIZES_BYTES,
+) -> _PoolRegistry:
     """A registry of real Guards over stand-in pool mappings."""
     journal = Mock()
     journal.read_next.return_value = None
@@ -230,8 +234,8 @@ def _new_registry(tmp_path: Path, pool_count: int = 1) -> _PoolRegistry:
     ):
         return _PoolRegistry(
             tmp_path,
-            pool_count,
-            _TEST_POOL_SIZE_BYTES,
+            guard_count,
+            pool_sizes_bytes,
             _TEST_JOURNAL_BYTES,
             _TEST_DIGEST,
         )
@@ -255,16 +259,48 @@ def test_socket_is_private(tmp_path: Path) -> None:
         assert stat.S_IMODE(harness.server.socket_path.stat().st_mode) == 0o600
 
 
+def test_client_claims_one_grouped_allocation_with_independent_strides(
+    tmp_path: Path,
+) -> None:
+    pool_sizes = (2 * _PAGE_STRIDE, 3 * _PAGE_STRIDE)
+    row_strides = (_TEST_ROW_STRIDE, 3 * _TEST_ROW_STRIDE)
+    g3 = G3Options(
+        paths=(tmp_path / "g3.data",),
+        capacity_bytes_per_file=_PAGE_STRIDE + 1,
+        backend="FILE",
+    )
+    with _running_server(
+        tmp_path,
+        guard_count=2,
+        pool_sizes_bytes=pool_sizes,
+    ) as harness:
+        with pytest.raises(KVCRServiceError, match="out of range"):
+            harness.client.claim(2, _TEST_ROW_STRIDES, _TEST_DIGEST, _control_bind(2))
+        with pytest.raises(KVCRServiceError, match="row-stride count"):
+            harness.client.claim(1, _TEST_ROW_STRIDES, _TEST_DIGEST, _control_bind(1))
+
+        hold = harness.client.claim(1, row_strides, _TEST_DIGEST, _control_bind(1), g3)
+        hold.release()
+        guard = harness.server._registry._guards[1]
+        spec = guard._owner.spec
+        assert spec.mapping_bytes == _TEST_JOURNAL_BYTES + sum(pool_sizes)
+        offsets = (_TEST_JOURNAL_BYTES, _TEST_JOURNAL_BYTES + pool_sizes[0])
+        assert tuple(
+            (pool.size_bytes, pool.row_stride, pool.offset_bytes)
+            for pool in guard._recovery.pools
+        ) == tuple(zip(pool_sizes, row_strides, offsets))
+
+
 def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
     tmp_path: Path,
 ) -> None:
     """Pools lease independently; close keeps, names, and can retry a wedged one."""
-    registry = _new_registry(tmp_path, pool_count=2)
-    guard = registry._pools[0]
+    registry = _new_registry(tmp_path, guard_count=2)
+    guard = registry._guards[0]
     first, second, third = _FakeLiveness(), _FakeLiveness(), _FakeLiveness()
     first_spec, stale = _claim(registry, 0, first)
-    _spec, _fd, _lease = registry.claim(
-        1, _TierConfig(_TEST_ROW_STRIDE * 2, None), second, _control_bind(1)
+    _spec, _pools, _fd, _lease = registry.claim(
+        1, _TierConfig((_TEST_ROW_STRIDE * 2,), None), second, _control_bind(1)
     )
     os.close(_fd)
     # One pool's geometry says nothing about another's.
@@ -277,17 +313,17 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
 
     # The retried release of the old lease must not end the new one.
     registry.release(0, stale)
-    assert registry._pools[0]._pool_lease.current is current
+    assert registry._guards[0]._pool_lease.current is current
     assert third.closed is False
 
     first_path = Path(guard._owner.spec.path)
-    second_path = Path(registry._pools[1]._owner.spec.path)
+    second_path = Path(registry._guards[1]._owner.spec.path)
     # An unclosable mapping keeps its file: unlinking would hide committed RAM.
     guard._recovery.attachment.close.side_effect = RuntimeError("mapping held")
     with pytest.raises(RuntimeError, match="mapping held"):
         registry.close()
-    assert registry._pools.keys() == {0}
-    assert registry._pools[0]._recovery.attachment is not None
+    assert registry._guards.keys() == {0}
+    assert registry._guards[0]._recovery.attachment is not None
     assert first_path.exists()
     # The pool behind it still went, files and all.
     assert second.closed is True and not second_path.exists()
@@ -298,13 +334,13 @@ def test_registry_lifecycle_from_independent_leases_to_a_wedged_close(
     guard._pool_lease.listener = stubborn
     with pytest.raises(OSError, match="will not close"):
         registry.close()
-    assert registry._pools.keys() == {0}
-    assert registry._pools[0]._pool_lease.listener is stubborn
+    assert registry._guards.keys() == {0}
+    assert registry._guards[0]._pool_lease.listener is stubborn
 
     # With nothing left refusing, the retried close finally takes the pool.
     guard._pool_lease.listener = None
     registry.close()
-    assert registry._pools == {} and third.closed is True
+    assert registry._guards == {} and third.closed is True
 
 
 def test_refused_claims_do_not_bind_the_pool(tmp_path: Path) -> None:
@@ -328,11 +364,11 @@ def test_refused_claims_do_not_bind_the_pool(tmp_path: Path) -> None:
 
         taken = (str(squatter.getsockname()[0]), int(squatter.getsockname()[1]))
         with pytest.raises(KVCRServiceError, match="control listener"):
-            harness.client.claim(0, _TEST_ROW_STRIDE, _TEST_DIGEST, control_bind=taken)
+            harness.client.claim(0, _TEST_ROW_STRIDES, _TEST_DIGEST, control_bind=taken)
 
         # The rejected claims left the pool free to take normally.
         harness.client.claim(
-            0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind()
+            0, _TEST_ROW_STRIDES, _TEST_DIGEST, _control_bind()
         ).release()
 
 
@@ -381,14 +417,16 @@ def test_a_grant_tells_the_pools_guard_and_a_clean_release_stands_it_down(
         ),
         _running_server(tmp_path) as harness,
     ):
-        guard = harness.server._registry._pools[1]
+        guard = harness.server._registry._guards[1]
         # Built and started with the pool, before any claim named it.
         assert guard._phase is _Phase.UNCONFIGURED
 
-        hold = harness.client.claim(1, _PAGE_STRIDE, _TEST_DIGEST, _control_bind(), g3)
+        hold = harness.client.claim(
+            1, (_PAGE_STRIDE,), _TEST_DIGEST, _control_bind(), g3
+        )
         assert guard._phase is _Phase.PRIMARY and guard._control is control
         assert guard._configured == _TierConfig(
-            _PAGE_STRIDE,
+            (_PAGE_STRIDE,),
             _G3Config(
                 paths=(str(g3.paths[0]),),
                 capacity_bytes_per_file=g3.capacity_bytes_per_file,
@@ -413,8 +451,8 @@ def test_a_failed_claim_pins_nothing_and_an_unfreeable_endpoint_is_fatal(
     tmp_path: Path,
 ) -> None:
     """A failed claim gives back lease and endpoint; an unfreeable address is fatal."""
-    registry = _new_registry(tmp_path, pool_count=2)
-    guard = registry._pools[0]
+    registry = _new_registry(tmp_path, guard_count=2)
+    guard = registry._guards[0]
     bound: list[socket.socket] = []
     try:
         # Everything fallible runs before the lease exists.
@@ -431,7 +469,7 @@ def test_a_failed_claim_pins_nothing_and_an_unfreeable_endpoint_is_fatal(
         assert guard._pool_lease.bind_address == _control_bind(0)
 
         # A rollback that cannot free the pool's address must stop the service.
-        fatal = registry._pools[1]
+        fatal = registry._guards[1]
         adopt_failure = RuntimeError("adopt failed")
         unbind_failure = OSError("close failed")
         uncontained: list[BaseException] = []
@@ -457,7 +495,7 @@ def test_a_failed_claim_pins_nothing_and_an_unfreeable_endpoint_is_fatal(
         # The transition ended: nothing is left reserved against this pool.
         assert fatal._reserved is None and fatal._pool_lease.current is None
     finally:
-        registry._pools[1]._pool_lease.listener = None
+        registry._guards[1]._pool_lease.listener = None
         for listener in bound:
             listener.close()
         registry.close()
@@ -469,7 +507,7 @@ def test_a_standby_survives_failed_claims_and_hands_over_to_a_replacement(
     """Refused or failed claims cost a standby nothing; a good one inherits all."""
     control_bind = _control_bind(0)
     registry = _new_registry(tmp_path)
-    guard = registry._pools[0]
+    guard = registry._guards[0]
     # The promotion itself is stubbed: what this exercises is the lifecycle
     # around a standby, not the recovery machinery inside one.
     guard._promote = Mock()
@@ -498,7 +536,7 @@ def test_a_standby_survives_failed_claims_and_hands_over_to_a_replacement(
         with pytest.raises(KVCRServiceError, match="another tier configuration"):
             registry.claim(
                 0,
-                _TierConfig(_TEST_ROW_STRIDE * 2, None),
+                _TierConfig((_TEST_ROW_STRIDE * 2,), None),
                 _FakeLiveness(),
                 control_bind,
             )
@@ -536,8 +574,8 @@ def test_slow_promotion_does_not_block_other_pools_or_shutdown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    registry = _new_registry(tmp_path, pool_count=2)
-    guard = registry._pools[0]
+    registry = _new_registry(tmp_path, guard_count=2)
+    guard = registry._guards[0]
     promotion_started = threading.Event()
     continue_promotion = threading.Event()
     first = _FakeLiveness()
@@ -563,10 +601,10 @@ def test_slow_promotion_does_not_block_other_pools_or_shutdown(
         monkeypatch.setattr(
             "kvcr.kvcr_service._REGISTRY_TRANSITION_TIMEOUT_SECONDS", 1.0
         )
-        with pytest.raises(TimeoutError, match="pool transitions"):
+        with pytest.raises(TimeoutError, match="Guard transitions"):
             registry.close()
         # The wedged pool is kept and named; its neighbour still went.
-        assert registry._pools.keys() == {0} and second.closed is True
+        assert registry._guards.keys() == {0} and second.closed is True
     finally:
         continue_promotion.set()
         monkeypatch.undo()
@@ -581,14 +619,17 @@ def test_claim_refusals_and_internal_failures_do_not_bind(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with _running_server(tmp_path) as harness:
-        spec = harness.server._registry._pools[0]._owner.spec
+        spec = harness.server._registry._guards[0]._owner.spec
         with pytest.raises(KVCRServiceError, match="compatibility digest"):
             harness.client.claim(
-                0, _TEST_ROW_STRIDE, _TEST_DIGEST.swapcase(), _control_bind()
+                0, _TEST_ROW_STRIDES, _TEST_DIGEST.swapcase(), _control_bind()
             )
         with pytest.raises(KVCRServiceError, match="one complete KV row"):
             harness.client.claim(
-                0, _TEST_POOL_SIZE_BYTES + 1, _TEST_DIGEST, _control_bind()
+                0,
+                (_TEST_POOL_SIZES_BYTES[0] + 1,),
+                _TEST_DIGEST,
+                _control_bind(),
             )
         assert "Unexpected failure while handling KVCR claim" not in caplog.text
 
@@ -600,7 +641,9 @@ def test_claim_refusals_and_internal_failures_do_not_bind(
                 Mock(side_effect=internal_error),
             )
             with pytest.raises(KVCRServiceError, match="internal KVCR service error"):
-                harness.client.claim(0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind())
+                harness.client.claim(
+                    0, _TEST_ROW_STRIDES, _TEST_DIGEST, _control_bind()
+                )
 
         log_record = next(
             record
@@ -609,15 +652,15 @@ def test_claim_refusals_and_internal_failures_do_not_bind(
         )
         assert log_record.exc_info is not None
         assert log_record.exc_info[1] is internal_error
-        assert harness.server._registry._pools[0]._owner.spec is spec
+        assert harness.server._registry._guards[0]._owner.spec is spec
         assert _holders_of(harness.server._registry) == {}
         harness.client.claim(
-            0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind()
+            0, _TEST_ROW_STRIDES, _TEST_DIGEST, _control_bind()
         ).release()
 
 
 def test_held_connection_accepts_only_release(tmp_path: Path) -> None:
-    with _running_server(tmp_path, pool_count=1) as harness:
+    with _running_server(tmp_path, guard_count=1) as harness:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.connect(str(harness.server.socket_path))
             channel = FramedConnection(connection)
@@ -670,7 +713,8 @@ def test_fork_and_exec_do_not_preserve_claimant_access(
                 "import time",
                 "from kvcr.guard_protocol import KVCRClient",
                 f"hold = KVCRClient({str(harness.server.socket_path)!r}).claim("
-                f"0, {_TEST_ROW_STRIDE}, {_TEST_DIGEST!r}, {_control_bind()!r})",
+                f"0, {_TEST_ROW_STRIDES!r}, {_TEST_DIGEST!r}, "
+                f"{_control_bind()!r})",
                 "forked_pid = os.fork()",
                 "if forked_pid == 0:",
                 "    hold._connection.close()",
@@ -697,11 +741,13 @@ def test_fork_and_exec_do_not_preserve_claimant_access(
             forked_pidfd = os.pidfd_open(forked_pid)
             forked_poller = select.poll()
             forked_poller.register(forked_pidfd, select.POLLIN)
-            spec = harness.server._registry._pools[0]._owner.spec
+            spec = harness.server._registry._guards[0]._owner.spec
             assert spec is not None
             assert spec.path not in Path(f"/proc/{forked_pid}/maps").read_text()
             with pytest.raises(KVCRServiceError, match="held"):
-                harness.client.claim(0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind())
+                harness.client.claim(
+                    0, _TEST_ROW_STRIDES, _TEST_DIGEST, _control_bind()
+                )
 
             child.terminate()
             child.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
@@ -747,7 +793,7 @@ def test_startup_rollback_gives_back_every_pool_but_a_wedged_one(
         pytest.raises(RuntimeError, match="attach failed"),
     ):
         _PoolRegistry(
-            tmp_path, 3, _TEST_POOL_SIZE_BYTES, _TEST_JOURNAL_BYTES, _TEST_DIGEST
+            tmp_path, 3, _TEST_POOL_SIZES_BYTES, _TEST_JOURNAL_BYTES, _TEST_DIGEST
         )
 
     # The pool that closed is gone with the one that never attached; the pool
@@ -781,8 +827,8 @@ def test_startup_allocation_failure_rolls_back_before_listener(
         _KVCRService(
             _test_socket_path(),
             tmp_path,
-            pool_count=3,
-            pool_size_bytes=_TEST_POOL_SIZE_BYTES,
+            guard_count=3,
+            pool_sizes_bytes=_TEST_POOL_SIZES_BYTES,
             compatibility_digest=_TEST_DIGEST,
             journal_bytes=_TEST_JOURNAL_BYTES,
         )
@@ -818,7 +864,7 @@ def test_shutdown_does_not_unlink_replaced_socket_path(tmp_path: Path) -> None:
 def test_idle_client_does_not_block_shutdown_cleanup(tmp_path: Path) -> None:
     with _running_server(tmp_path) as harness:
         pool_paths = list((tmp_path / "pools").glob("kvcr-pool_*-*"))
-        assert len(pool_paths) == _TEST_POOL_COUNT
+        assert len(pool_paths) == _TEST_GUARD_COUNT
         socket_path = harness.server.socket_path
         _wait_for_connection_state(harness.server, connected=False)
         idle_connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -890,7 +936,7 @@ def test_a_failed_grant_delivery_retracts_through_the_guard(tmp_path: Path) -> N
     handler.request = accepted
     handler.channel = _Channel()
     handler.server = _Server()
-    guard = registry._pools[0]
+    guard = registry._guards[0]
     guard.abort_grant = Mock(wraps=guard.abort_grant)
     guard.release = Mock(wraps=guard.release)
     try:
@@ -921,7 +967,7 @@ def test_an_undelivered_grants_lease_survives_its_connection(
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     registry = _new_registry(tmp_path)
     # Promotion's serving core is not under test; the freed lease is.
-    registry._pools[0]._promote = Mock()
+    registry._guards[0]._promote = Mock()
     server = object.__new__(_ThreadingUnixServer)
     server.registry = registry
     server.compatibility_digest = _TEST_DIGEST
@@ -946,7 +992,7 @@ def test_an_undelivered_grants_lease_survives_its_connection(
         child.kill()
         child.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
         # Death freed it: the pool's own actor promotes, and the lease is gone.
-        guard = registry._pools[0]
+        guard = registry._guards[0]
         _wait_until(lambda: guard._phase is _Phase.STANDBY, timeout=5)
         assert _holders_of(registry) == {}
     finally:
@@ -961,7 +1007,7 @@ def test_promotion_failure_fails_the_pool_and_stops_the_whole_service(
 ) -> None:
     """A failed promotion is escalated, fences its pool, and keeps the first error."""
     registry = _new_registry(tmp_path)
-    guard = registry._pools[0]
+    guard = registry._guards[0]
     failure = RuntimeError("promotion failed")
     guard._promote = Mock(side_effect=failure)
 
@@ -976,7 +1022,6 @@ def test_promotion_failure_fails_the_pool_and_stops_the_whole_service(
         _claim(registry, 0, liveness)
 
         _kill_and_wait(registry, 0, liveness)
-
         assert server._fatal_error is failure
         server.shutdown.assert_called_once_with()
         assert registry._refusing.is_set() is True
@@ -1037,18 +1082,18 @@ def test_a_lease_older_than_the_idle_timeout_still_releases_cleanly(
     """The accept-time idle timeout must not sever a held connection."""
     monkeypatch.setattr("kvcr.kvcr_service._CLIENT_IDLE_TIMEOUT_SECONDS", 0.2)
     with _running_server(tmp_path) as harness:
-        hold = harness.client.claim(0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind())
+        hold = harness.client.claim(0, _TEST_ROW_STRIDES, _TEST_DIGEST, _control_bind())
         time.sleep(0.5)
 
         hold.release()
 
-        assert harness.server._registry._pools[0]._pool_lease.current is None
+        assert harness.server._registry._guards[0]._pool_lease.current is None
 
 
 def test_refuse_claims_is_a_barrier_no_grant_can_cross(tmp_path: Path) -> None:
     """refuse_claims waits out in-flight commits; nothing grants once it returns."""
     registry = _new_registry(tmp_path)
-    guard = registry._pools[0]
+    guard = registry._guards[0]
     in_adopt = threading.Event()
     resume = threading.Event()
     returned = threading.Event()
@@ -1108,7 +1153,7 @@ def test_a_failed_release_reports_promptly_and_fences_the_pool_first(
 ) -> None:
     """A hand-back failure is the answer now, reported once nothing can claim."""
     registry = _new_registry(tmp_path)
-    guard = registry._pools[0]
+    guard = registry._guards[0]
     guard._release = Mock(side_effect=failure)
     claimable_when_reported: list[bool] = []
     registry.on_uncontained_failure = lambda _error: claimable_when_reported.append(
@@ -1139,7 +1184,7 @@ def test_a_pidfd_that_breaks_while_its_process_lives_is_service_fatal(
 ) -> None:
     """Promotion on a broken descriptor could seat a second server on the pool."""
     registry = _new_registry(tmp_path)
-    guard = registry._pools[0]
+    guard = registry._guards[0]
     guard._promote = Mock()
     uncontained: list[BaseException] = []
     registry.on_uncontained_failure = uncontained.append
@@ -1163,7 +1208,7 @@ def test_a_close_in_progress_absorbs_races_and_answers_stragglers(
 ) -> None:
     """Races against a close are absorbed, and queued work is still answered."""
     registry = _new_registry(tmp_path)
-    guard = registry._pools[0]
+    guard = registry._guards[0]
     liveness = _FakeLiveness()
     _spec, lease = _claim(registry, 0, liveness)
     gate = threading.Event()
@@ -1207,17 +1252,72 @@ def test_a_close_in_progress_absorbs_races_and_answers_stragglers(
 
 def test_shutdown_drains_a_held_connection(tmp_path: Path) -> None:
     with _running_server(tmp_path) as harness:
-        hold = harness.client.claim(0, _TEST_ROW_STRIDE, _TEST_DIGEST, _control_bind())
+        hold = harness.client.claim(0, _TEST_ROW_STRIDES, _TEST_DIGEST, _control_bind())
         harness.stop()
         _wait_for_connection_state(harness.server, connected=False)
         hold._attachment.close()
         hold._connection.close()
 
 
-def test_a_pool_no_bigger_than_its_journal_is_rejected_at_the_flag() -> None:
-    """Sized at or below the journal, a pool has nothing left to cache with."""
-    flags = "--socket-path s --pool-dir d --pool-count 1 --compatibility-digest g"
+def _service_args(*, guard_count: str = "2", pool_sizes_gb: str = "1") -> list[str]:
+    return (
+        "--socket-path s --pool-dir d --guard-count".split()
+        + [guard_count, "--pool-sizes-gb", pool_sizes_gb]
+        + "--compatibility-digest g".split()
+    )
+
+
+def test_pool_size_list_preserves_order_and_floors_each_item_to_pages() -> None:
+    raw_sizes = (2 * _PAGE_STRIDE + 123, 3 * _PAGE_STRIDE + 456)
+    parsed = _parse_args(
+        _service_args(
+            guard_count="3",
+            pool_sizes_gb=",".join(str(size / (1 << 30)) for size in raw_sizes),
+        )
+    )
+
+    expected = (2 * _PAGE_STRIDE, 3 * _PAGE_STRIDE)
+    assert parsed.guard_count == 3
+    assert parsed.pool_sizes_bytes == expected
+    assert parsed.mapping_bytes == 100 * (1 << 20) + sum(expected)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "nan",
+        "0",
+        "1e300",
+        str((_PAGE_STRIDE - 1) / (1 << 30)),
+        str(Decimal(_PAGE_STRIDE) / (1 << 30) - Decimal("1e-30")),
+        str(1 << 33),
+    ],
+)
+def test_invalid_pool_size_items_are_rejected(
+    value: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     with pytest.raises(SystemExit):
-        _parse_args([*flags.split(), "--pool-size-gb", "0.05"])
-    parsed = _parse_args([*flags.split(), "--pool-size-gb", "0.2"])
-    assert parsed.pool_size_bytes > 100 * (1 << 20)
+        _parse_args(_service_args(pool_sizes_gb=value))
+    assert "--pool-sizes-gb" in capsys.readouterr().err
+
+
+def test_guard_count_must_be_positive() -> None:
+    with pytest.raises(SystemExit):
+        _parse_args(_service_args(guard_count="0"))
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--pool-count",
+        "--pool-size-gb",
+        "--pool-sizes",
+    ],
+)
+def test_old_and_abbreviated_flags_are_rejected(
+    flag: str,
+) -> None:
+    with pytest.raises(SystemExit):
+        _parse_args([*_service_args(), flag, "1"])

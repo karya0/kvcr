@@ -1,23 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""KVCR-Service: the process that owns what outlives a worker.
-
-Today that is shared-memory pools and their recovery Guards; a worker claims one.
-"""
+"""KVCR-Service owns Guarded shared-memory pool groups beyond a worker's life."""
 
 import argparse
 import contextlib
 import functools
 import logging
-import math
+import mmap
 import os
 import re
 import signal
 import socket
 import socketserver
 import stat
+import sys
 import threading
 import time
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -34,6 +33,7 @@ from .guard_protocol import (
     _PROTOCOL_VERSION,
     _RELEASE_DECODER,
     PidfdLiveness,
+    PoolDescriptor,
     _Claim,
     _Error,
     _Granted,
@@ -61,72 +61,74 @@ _ORPHANED_POOL_NAME = re.compile(rf"{re.escape(_POOL_PREFIX)}-.+-[0-9a-f]{{32}}"
 
 
 class _PoolRegistry:
-    """A directory of pools, each owned end to end by its own Guard thread.
+    """A directory of pool groups, each owned by one Guard thread.
 
-    No locks: each pool's mailbox orders its claims, releases and deaths;
-    pools share nothing but the refusal flag.
+    No locks: each Guard's mailbox orders its claims, releases and deaths;
+    Guards share nothing but the refusal flag.
     """
 
     def __init__(
         self,
         pool_dir: str | os.PathLike[str],
-        pool_count: int,
-        pool_size_bytes: int,
+        guard_count: int,
+        pool_sizes_bytes: tuple[int, ...],
         journal_bytes: int,
         compatibility_digest: str,
     ) -> None:
         self._pool_dir = Path(pool_dir).resolve()
         if not self._pool_dir.is_dir():
             raise ValueError(f"KVCR pool directory does not exist: {self._pool_dir}")
-        self._pool_count = pool_count
-        self._pools: dict[int, _Guard] = {}
+        self._guard_count = guard_count
+        self._guards: dict[int, _Guard] = {}
         self._refusing = threading.Event()
         # Stand-in until the owning server takes over; only it can stop the service.
         self.on_uncontained_failure = functools.partial(
             logger.critical, "Uncontained KVCR pool failure: %s"
         )
         self._purge_orphaned_pools()
-        for rank in range(pool_count):
+        mapping_bytes = journal_bytes + sum(pool_sizes_bytes)
+        for rank in range(guard_count):
             try:
                 owner = _KVCRPoolOwner.allocate(
                     pool_id=f"pool_{rank}",
-                    pool_size_bytes=pool_size_bytes,
+                    pool_size_bytes=mapping_bytes,
                     journal_bytes=journal_bytes,
                     pool_dir=self._pool_dir,
                 )
-                # Built with the pool, not a claim: a Guard that cannot attach its
-                # pool is better discovered at startup than when a worker dies.
+                # Built with the group, not a claim: a Guard that cannot attach its
+                # allocation is better discovered at startup than when a worker dies.
                 try:
                     guard = _Guard(
                         owner.spec,
                         functools.partial(self._guard_failed, rank),
                         compatibility_digest=compatibility_digest,
-                        pool_index=rank,
+                        guard_index=rank,
+                        pool_sizes_bytes=pool_sizes_bytes,
                         owner=owner,
                         refusing=self._refusing.is_set,
                     )
                 except BaseException:
-                    # Nothing has recorded this pool yet, so the sweep below cannot
-                    # reach it and its file would outlive the process.
+                    # Nothing has recorded this pool group yet, so the sweep
+                    # below cannot reach it and its file would outlive the process.
                     owner.close()
                     raise
                 # Recorded before it starts, so a failed preparation is rolled back by
                 # the sweep below.
-                self._pools[rank] = guard
+                self._guards[rank] = guard
                 guard.start()
             except BaseException:
                 self._release_pools()
                 raise
 
     def _release_pools(self) -> None:
-        """Give back every pool built so far, for a startup that cannot finish."""
-        for pool_index, guard in list(self._pools.items()):
+        """Give back every pool group built so far after a failed startup."""
+        for guard_index, guard in list(self._guards.items()):
             # Even an interrupt must not stop the sweep: the startup failure is
-            # already propagating, and every pool left behind is committed RAM.
+            # already propagating, and every group left behind is committed RAM.
             try:
                 guard.close()
             except BaseException:
-                # The Guard's thread may still hold this pool's mapping, and
+                # The Guard's thread may still hold this group's mapping, and
                 # unlinking under it would fault the process. Leave the file
                 # for the next start's purge, and keep the pool visible.
                 logger.warning(
@@ -135,7 +137,7 @@ class _PoolRegistry:
                     exc_info=True,
                 )
                 continue
-            del self._pools[pool_index]
+            del self._guards[guard_index]
 
     def _purge_orphaned_pools(self) -> None:
         """Remove pool files no live daemon owns.
@@ -166,62 +168,62 @@ class _PoolRegistry:
                 else:
                     logger.info("Leaving KVCR pool still in use: %s", path)
 
-    def _pool(self, pool_index: int) -> _Guard:
-        if not (0 <= pool_index < self._pool_count):
+    def _guard(self, guard_index: int) -> _Guard:
+        if not (0 <= guard_index < self._guard_count):
             raise KVCRServiceError(
-                f"pool_index {pool_index} is out of range [0, {self._pool_count})"
+                f"guard_index {guard_index} is out of range [0, {self._guard_count})"
             )
-        guard = self._pools.get(pool_index)
+        guard = self._guards.get(guard_index)
         if guard is None:
-            raise KVCRServiceError(f"no claimable KVCR pool {pool_index}")
+            raise KVCRServiceError(f"no claimable KVCR Guard {guard_index}")
         return guard
 
     def claim(
         self,
-        pool_index: int,
+        guard_index: int,
         tier_config: _TierConfig,
         liveness: PidfdLiveness,
         control_bind: tuple[str, int],
-    ) -> "tuple[KVCRPoolSpec, int, _Lease]":
-        """Give a pool to a primary, and hand back the endpoint it answers on.
+    ) -> "tuple[KVCRPoolSpec, tuple[PoolDescriptor, ...], int, _Lease]":
+        """Give a pool group to a primary and return its Guard endpoint.
 
         The refusal check is a fast path only; the grant commits on the pool's
         actor under the same lock refuse_claims reads, so no grant follows it.
         """
         if self._refusing.is_set():
             raise KVCRServiceError("KVCR pool registry is closed")
-        return self._pool(pool_index).claim(liveness, tier_config, control_bind)
+        return self._guard(guard_index).claim(liveness, tier_config, control_bind)
 
-    def release(self, pool_index: int, lease: "_Lease") -> None:
-        self._pool(pool_index).release(lease)
+    def release(self, guard_index: int, lease: "_Lease") -> None:
+        self._guard(guard_index).release(lease)
 
-    def abort_grant(self, pool_index: int, lease: "_Lease") -> None:
+    def abort_grant(self, guard_index: int, lease: "_Lease") -> None:
         """Take back a grant its claimant declared it never served."""
-        self._pool(pool_index).abort_grant(lease)
+        self._guard(guard_index).abort_grant(lease)
 
     def refuse_claims(self) -> None:
-        """Stop granting pools without waiting for the close path to run.
+        """Stop granting pool groups without waiting for the close path to run.
 
-        Each pool's phase lock is the barrier: after this returns, no grant can
+        Each Guard's phase lock is the barrier: after this returns, no grant can
         commit. Pre-barrier grants may still deliver; those leases are fenced.
         """
         self._refusing.set()
-        # Snapshot: close() deletes pools from the dict on other threads.
-        for guard in list(self._pools.values()):
+        # Snapshot: close() deletes groups from the dict on other threads.
+        for guard in list(self._guards.values()):
             with guard._phase_lock:
                 pass
 
     def close(self) -> None:
-        """Give every pool back, keeping the first reason one would not go.
+        """Give every pool group back, keeping the first reason one would not go.
 
-        A pool that will not close keeps only its own file and endpoint and
+        A group that will not close keeps only its own file and endpoint and
         stays listed, so a later close can try it again; failing that, the
         flock dies with the process and the next start reclaims.
         """
         self._refusing.set()
         failure: BaseException | None = None
-        # Tell all pools before waiting on any: a wedged one must not block the rest.
-        for guard in self._pools.values():
+        # Tell all Guards before waiting on any: a wedged one must not block the rest.
+        for guard in self._guards.values():
             try:
                 guard.begin_close()
             except BaseException as error:  # noqa: BLE001 - raised below
@@ -229,35 +231,35 @@ class _PoolRegistry:
         deadline = time.monotonic() + _REGISTRY_TRANSITION_TIMEOUT_SECONDS
         wedged: list[int] = []
         kept: set[int] = set()
-        for pool_index in sorted(self._pools):
+        for guard_index in sorted(self._guards):
             try:
-                if self._pools[pool_index].finish_close(deadline):
-                    wedged.append(pool_index)
-                    kept.add(pool_index)
+                if self._guards[guard_index].finish_close(deadline):
+                    wedged.append(guard_index)
+                    kept.add(guard_index)
             except BaseException as error:  # noqa: BLE001 - raised below
                 failure = failure or error
-                kept.add(pool_index)
-        # Wedged pools stay visible; drained ones stay listed until the whole
+                kept.add(guard_index)
+        # Wedged groups stay visible; drained ones stay listed until the whole
         # drain finished, so a release racing shutdown is absorbed.
-        for pool_index in [index for index in self._pools if index not in kept]:
-            del self._pools[pool_index]
+        for guard_index in [index for index in self._guards if index not in kept]:
+            del self._guards[guard_index]
         if failure is not None:
             raise failure
         if wedged:
             raise TimeoutError(
-                f"timed out waiting for KVCR pool transitions: pools {wedged} leaked"
+                f"timed out waiting for KVCR Guard transitions: Guards {wedged} leaked"
             )
 
     def _guard_failed(
-        self, pool_index: int, _guard: "_Guard", error: BaseException
+        self, guard_index: int, _guard: "_Guard", error: BaseException
     ) -> None:
         """A Guard has stopped being one, which the service cannot survive.
 
-        TODO: no per-pool containment. Its pool can no longer be recovered and may
-        still hold an endpoint the service cannot reach. One pool takes the others'
+        TODO: no per-Guard containment. Its group can no longer be recovered and may
+        still hold an endpoint the service cannot reach. One Guard takes the others'
         workers with it; add isolation back if that stops being acceptable.
         """
-        logger.critical("KVCR pool %d Guard failed", pool_index)
+        logger.critical("KVCR Guard %d failed", guard_index)
         self.on_uncontained_failure(error)
 
 
@@ -295,7 +297,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 self.channel.send(response)
             return
 
-        pool_index, listener_fd, lease = grant
+        guard_index, listener_fd, lease = grant
         try:
             # No timeout: a held connection must wait as long as the lease lives.
             # Inside the try: shutdown may have landed; listener_fd closes either way.
@@ -312,12 +314,12 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         finally:
             with contextlib.suppress(OSError):
                 os.close(listener_fd)
-        self._await_release(pool_index, lease)
+        self._await_release(guard_index, lease)
 
-    def _await_release(self, pool_index: int, lease: "_Lease") -> None:
+    def _await_release(self, guard_index: int, lease: "_Lease") -> None:
         """Wait for the one message a held connection may send: its release.
 
-        The pool's actor watches the pidfd, not this thread. EOF only ends the
+        The Guard actor watches the pidfd, not this thread. EOF only ends the
         connection; the lease outlives it, and a death still promotes.
         """
         while True:
@@ -328,21 +330,21 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
                 self._send_error(error)
                 continue
-            if self._release_or_fail(pool_index, lease, release.activated):
+            if self._release_or_fail(guard_index, lease, release.activated):
                 with contextlib.suppress(OSError):
                     self.channel.send(_Released(_PROTOCOL_VERSION))
             return
 
     def _release_or_fail(
-        self, pool_index: int, lease: "_Lease", activated: bool = True
+        self, guard_index: int, lease: "_Lease", activated: bool = True
     ) -> bool:
         try:
             if activated:
-                self.server.registry.release(pool_index, lease)
+                self.server.registry.release(guard_index, lease)
             else:
                 # The claimant declared it never served this lease; the Guard
                 # it stood down may resume serving.
-                self.server.registry.abort_grant(pool_index, lease)
+                self.server.registry.abort_grant(guard_index, lease)
         except KVCRServiceError as error:
             # Registry closing: claimant learns the release did not commit; not fatal.
             self._send_error(error)
@@ -402,15 +404,21 @@ class _ThreadingUnixServer(
             raise KVCRServiceError(
                 "KVCR compatibility digest does not match the service"
             )
-        spec, listener_fd, lease = self.registry.claim(
-            request.pool_index,
+        spec, pools, listener_fd, lease = self.registry.claim(
+            request.guard_index,
             request.tier_config,
             liveness,
             (request.control_host, request.control_port),
         )
         return (
-            _Granted(request.pool_index, spec, request.tier_config, _PROTOCOL_VERSION),
-            (request.pool_index, listener_fd, lease),
+            _Granted(
+                request.guard_index,
+                spec,
+                request.tier_config,
+                pools,
+                _PROTOCOL_VERSION,
+            ),
+            (request.guard_index, listener_fd, lease),
         )
 
     def fail(self, error: BaseException) -> None:
@@ -451,8 +459,8 @@ class _KVCRService:
         self,
         socket_path: str | os.PathLike[str],
         pool_dir: str | os.PathLike[str],
-        pool_count: int,
-        pool_size_bytes: int,
+        guard_count: int,
+        pool_sizes_bytes: tuple[int, ...],
         compatibility_digest: str,
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
     ) -> None:
@@ -465,7 +473,11 @@ class _KVCRService:
         # per pod and clears the path before starting it.
         _unlink_stale_socket(self.socket_path)
         self._registry = _PoolRegistry(
-            pool_dir, pool_count, pool_size_bytes, journal_bytes, compatibility_digest
+            pool_dir,
+            guard_count,
+            pool_sizes_bytes,
+            journal_bytes,
+            compatibility_digest,
         )
         try:
             self._server = _ThreadingUnixServer(
@@ -565,36 +577,44 @@ def _handle_shutdown_signal(signum: int, frame: FrameType | None) -> None:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse and validate the service's command line."""
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--socket-path", required=True)
     parser.add_argument("--pool-dir", required=True)
-    parser.add_argument("--pool-count", type=int, required=True)
-    parser.add_argument("--pool-size-gb", type=float, required=True)
+    parser.add_argument("--guard-count", type=int, required=True)
+    parser.add_argument("--pool-sizes-gb", required=True)
     parser.add_argument("--compatibility-digest", required=True)
     args = parser.parse_args(argv)
 
-    # Reject nan/inf before converting to int, which would otherwise raise a
-    # raw ValueError/OverflowError instead of an argparse usage error.
-    if not math.isfinite(args.pool_size_gb) or args.pool_size_gb <= 0:
-        parser.error("--pool-size-gb must be a positive, finite number")
-    if args.pool_count < 1:
-        parser.error("--pool-count must be at least 1")
+    if args.guard_count < 1:
+        parser.error("--guard-count must be at least 1")
 
-    args.pool_size_bytes = int(args.pool_size_gb * (1 << 30))
-    if args.pool_size_bytes <= _DEFAULT_JOURNAL_BYTES:
-        # The journal is carved out of this size, not added to it, so a pool this small
-        # has no room to cache anything.
-        parser.error(
-            "--pool-size-gb must exceed the "
-            f"{_DEFAULT_JOURNAL_BYTES >> 20} MiB journal each pool reserves"
-        )
+    try:
+        sizes_gb = tuple(Decimal(value) for value in args.pool_sizes_gb.split(","))
+    except InvalidOperation:
+        parser.error("--pool-sizes-gb must contain positive, finite numbers")
+    if not all(size.is_finite() and size > 0 for size in sizes_gb):
+        parser.error("--pool-sizes-gb must contain positive, finite numbers")
+    if any(size > sys.maxsize for size in sizes_gb):
+        parser.error("--pool-sizes-gb describes an allocation that is too large")
+    with localcontext() as context:
+        context.prec = max(len(size.as_tuple().digits) for size in sizes_gb) + 10
+        sizes_bytes = tuple(size * (1 << 30) for size in sizes_gb)
+    if any(size > sys.maxsize for size in sizes_bytes):
+        parser.error("--pool-sizes-gb describes an allocation that is too large")
+    args.pool_sizes_bytes = tuple(
+        int(size) // mmap.PAGESIZE * mmap.PAGESIZE for size in sizes_bytes
+    )
+    if not all(args.pool_sizes_bytes):
+        parser.error("--pool-sizes-gb values must be at least one memory page")
+    args.mapping_bytes = _DEFAULT_JOURNAL_BYTES + sum(args.pool_sizes_bytes)
+    if args.mapping_bytes > sys.maxsize:
+        parser.error("--pool-sizes-gb describes an allocation that is too large")
     return args
 
 
 def main() -> None:
     """Run the standalone KVCR service daemon."""
     args = _parse_args()
-    pool_size_bytes = args.pool_size_bytes
 
     shutdown_signals = {signal.SIGINT, signal.SIGTERM}
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, shutdown_signals)
@@ -605,18 +625,19 @@ def main() -> None:
         server = _KVCRService(
             args.socket_path,
             args.pool_dir,
-            pool_count=args.pool_count,
-            pool_size_bytes=pool_size_bytes,
+            guard_count=args.guard_count,
+            pool_sizes_bytes=args.pool_sizes_bytes,
             compatibility_digest=args.compatibility_digest,
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         logging.basicConfig(level=logging.INFO)
         logger.info(
-            "KVCR service ready: socket=%s pools=%d pool_size_bytes=%d "
-            "journal_bytes=%d",
+            "KVCR service ready: socket=%s guards=%d pool_sizes_bytes=%s "
+            "mapping_bytes=%d journal_bytes=%d",
             args.socket_path,
-            args.pool_count,
-            pool_size_bytes,
+            args.guard_count,
+            args.pool_sizes_bytes,
+            args.mapping_bytes,
             _DEFAULT_JOURNAL_BYTES,
         )
         server.serve_forever()

@@ -20,6 +20,7 @@ from .control_channels import (
 from .guard_protocol import (
     KVCRClient,
     KVCRPoolHold,
+    PoolDescriptor,
 )
 from .hint_parser import ROUTER_HINT_CAPABILITIES, ROUTER_HINT_KEY
 
@@ -34,6 +35,7 @@ __all__ = [
     "KVCRMsgFramingError",
     "KVCRGuardProtocolError",
     "KVCRPoolHold",
+    "PoolDescriptor",
     "KVCRServiceError",
     "ROUTER_HINT_CAPABILITIES",
     "ROUTER_HINT_KEY",

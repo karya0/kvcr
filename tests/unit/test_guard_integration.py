@@ -28,7 +28,7 @@ from _kvcr_test_utils import (
     free_port,
 )
 
-from kvcr import KVCR, KVCRBindings
+from kvcr import KVCR, KVCRBindings, KVCRClient
 from kvcr import progress as kvcr_progress
 from kvcr.config import (
     FrameworkDramInput,
@@ -39,8 +39,11 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.control_channels import ZmqPeerControlChannel
+from kvcr.core import _BlockRecord
 from kvcr.guard import _Guard
 from kvcr.kvcr_service import _KVCRService
+from kvcr.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.recovery_journal import RecoveryJournal, _recovery_frames, read_handback
 from kvcr.types import BlockKey, CacheTier, QueryStatus
 
 _TIMEOUT_SECONDS = 5
@@ -193,6 +196,24 @@ def _primary_child(
     time.sleep(60)
 
 
+def _group_primary_child(socket_path: str, control_port: str) -> None:
+    """Claim one pool group, fill every pool, and publish one grouped slot."""
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    hold = KVCRClient(socket_path).claim(
+        0,
+        (page_size + page_size // 2, page_size),
+        _DIGEST,
+        ("127.0.0.1", int(control_port)),
+    )
+    for index, pool in enumerate(hold.pools):
+        ctypes.memset(pool.mapping_address, ord("A") + index, pool.size_bytes)
+    record = _BlockRecord(local_dram=_LocalDramResidency([0, 0], _LocalDramState.READY))
+    journal = RecoveryJournal(hold._attachment)
+    journal.publish(*next(iter(_recovery_frames({BlockKey(b"grouped"): record}, 2))))
+    print("ready", flush=True)
+    time.sleep(60)
+
+
 def _stale_peer_child(control_port: str, probe_port: str) -> None:
     """A dead primary's peer: it sends into the pool's endpoint and must get
     a terminal refusal back, not silence until its operation deadline."""
@@ -227,16 +248,22 @@ def _stale_peer_child(control_port: str, probe_port: str) -> None:
 @pytest.fixture
 def live_service(
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> Iterator[tuple[_KVCRService, Callable[..., subprocess.Popen[str]]]]:
-    """A one-pool service on its own thread; children it spawns die with it."""
+    """A service on its own thread; children it spawns die with it."""
+    pool_count = getattr(request, "param", 1)
     pool_dir = tmp_path / "pools"
     pool_dir.mkdir()
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    pool_sizes = (
+        (2 * page_size, page_size) if pool_count == 2 else (page_size,) * pool_count
+    )
     service = _KVCRService(
         tmp_path / "service.sock",
         pool_dir,
-        pool_count=1,
-        pool_size_bytes=8192 + os.sysconf("SC_PAGE_SIZE"),
-        journal_bytes=8192,
+        guard_count=1,
+        pool_sizes_bytes=pool_sizes,
+        journal_bytes=2 * page_size,
         compatibility_digest=_DIGEST,
     )
     server_thread = threading.Thread(target=service.serve_forever)
@@ -318,7 +345,7 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
         "_real_nixl_primary_child", service.socket_path, g3_path, control_port
     )
     _await_marker(primary, "ready", _REAL_NIXL_TIMEOUT_SECONDS)
-    guard = service._registry._pools[0]
+    guard = service._registry._guards[0]
 
     primary.kill()
     primary.wait(timeout=_TIMEOUT_SECONDS)
@@ -406,6 +433,61 @@ def test_a_promoted_guard_serves_real_nixl_transfers(
         replacement.close()
 
 
+@pytest.mark.parametrize("live_service", [2], indirect=True)
+def test_two_pool_group_survives_guard_failover_and_reclaim(
+    monkeypatch: pytest.MonkeyPatch,
+    live_service: tuple[_KVCRService, Callable[..., subprocess.Popen[str]]],
+) -> None:
+    """One crash moves both pools to the Guard and one claim takes both back."""
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    control_port = free_port()
+    guard_agent = _FileBackedNixlAgent()
+    guard_agent.state = "DONE"
+    monkeypatch.setattr(kvcr_progress, "nixl_agent_config", lambda **kwargs: kwargs)
+    monkeypatch.setattr(kvcr_progress, "nixl_agent", lambda _name, _config: guard_agent)
+    service, spawn = live_service
+
+    primary = spawn("_group_primary_child", service.socket_path, control_port)
+    _await_marker(primary, "ready")
+    guard = service._registry._guards[0]
+    pools = guard._recovery.pools
+
+    primary.kill()
+    primary.wait(timeout=_TIMEOUT_SECONDS)
+    _wait_until(lambda: guard._serving, timeout=_TIMEOUT_SECONDS)
+
+    key = BlockKey(b"grouped")
+    record = guard._core._block_record_map[key]
+    assert record.local_dram == _LocalDramResidency(0, _LocalDramState.READY)
+    assert guard._core._local_dram.memory_region == (
+        pools[0].mapping_address,
+        page_size + page_size // 2,
+    )
+
+    replacement = KVCRClient(service.socket_path).claim(
+        0,
+        (page_size + page_size // 2, page_size),
+        _DIGEST,
+        ("127.0.0.1", control_port),
+    )
+    try:
+        recovered = read_handback(
+            replacement._attachment,
+            _DIGEST,
+            replacement.pools,
+        ).take_records()
+        recovered_record = recovered[key]
+        assert recovered_record.local_dram is not None
+        assert recovered_record.local_dram.slot == [0, 0]
+        for index, pool in enumerate(replacement.pools):
+            assert (
+                ctypes.string_at(pool.mapping_address, page_size)
+                == bytes((ord("A") + index,)) * page_size
+            )
+    finally:
+        replacement.release()
+
+
 @pytest.mark.parametrize("recovery", ["kept", "given-up"])
 def test_request_timeout_during_promotion_then_retry_uses_guard(
     tmp_path: Path,
@@ -484,7 +566,7 @@ def test_request_timeout_during_promotion_then_retry_uses_guard(
         child.kill()
         child.wait(timeout=_TIMEOUT_SECONDS)
         assert promotion_started.wait(timeout=_TIMEOUT_SECONDS)
-        guard = service._registry._pools[0]
+        guard = service._registry._guards[0]
 
         now[0] = 6.0
         _wait_until(
@@ -556,7 +638,7 @@ def test_replacement_primary_takes_the_cache_back_from_a_guard(
     # operation deadline instead of failing them now.
     idle = spawn("_primary_child", service.socket_path, g3_path, control_port, "idle")
     _await_marker(idle, "ready")
-    first_guard = service._registry._pools[0]
+    first_guard = service._registry._guards[0]
     idle.kill()
     idle.wait(timeout=_TIMEOUT_SECONDS)
     _wait_until(lambda: first_guard._serving, timeout=_TIMEOUT_SECONDS)
