@@ -4,8 +4,10 @@
 
 import ctypes
 import logging
+import mmap
 import threading
 from contextlib import nullcontext, suppress
+from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -37,7 +39,7 @@ from kvcr.config import (
     LocalDramInfo,
 )
 from kvcr.core import _BlockRecord
-from kvcr.guard_protocol import KVCRPoolHold
+from kvcr.guard_protocol import KVCRPoolHold, PoolDescriptor
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
 from kvcr.memory import KVCRPoolSpec
@@ -109,8 +111,11 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
 _GUARD_CONFIG = KVCRGuardConfig(
     kvcr_service_socket_path="/tmp/kvcr.sock",
     pool_index=3,
-    row_stride=1024,
+    row_stride=mmap.PAGESIZE,
     compatibility_digest="Opaque-Digest",
+)
+_POOL_DESCRIPTOR = PoolDescriptor(
+    8192, _GUARD_CONFIG.row_stride, offset_bytes=8192, mapping_address=1234
 )
 # No Guard has handed anything back, so nothing is at its handback path.
 _UNSERVED_POOL = SimpleNamespace(
@@ -122,7 +127,7 @@ _UNSERVED_POOL = SimpleNamespace(
         generation="b" * 32,
         device=0,
         inode=0,
-        mapping_bytes=8192 + 32,
+        mapping_bytes=8192 + _POOL_DESCRIPTOR.size_bytes,
         journal_bytes=8192,
     ),
 )
@@ -159,7 +164,7 @@ def test_a_guarded_startup_that_fails_gives_back_everything_it_took(
     """Refused before the claim, or unwound after it: core closed, pool returned."""
     events: list[str] = []
     hold = _fake_hold(
-        local_dram=LocalDramInfo(1234, 8192, 8),
+        pools=(_POOL_DESCRIPTOR,),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
         release=lambda **_kwargs: events.append("hold.release"),
@@ -238,7 +243,7 @@ def test_startup_timeout_retains_nonquiescent_resources(
     entered = threading.Event()
     unblock = threading.Event()
     hold = _fake_hold(
-        local_dram=LocalDramInfo(1234, 8192, 8),
+        pools=(_POOL_DESCRIPTOR,),
         _attachment=_UNSERVED_POOL,
         _control_listener_fd=None,
         release=Mock(),
@@ -307,7 +312,7 @@ def test_service_journal_is_attached_before_primary_start(
     events: list[str] = []
     attachment = _UNSERVED_POOL
     hold = _fake_hold(
-        local_dram=LocalDramInfo(1234, 8192, 8),
+        pools=(_POOL_DESCRIPTOR,),
         _attachment=attachment,
         _control_listener_fd=7,
         release=lambda **_kwargs: events.append("hold.release"),
@@ -357,23 +362,19 @@ def test_service_journal_is_attached_before_primary_start(
         KVCRConfig(nixl_agent_name="target"),
         KVCRBindings(Mock(), Mock(), Mock(), framework_control=primary_control),
         KVCRBackendConfigs(g3=g3_config),
-        KVCRGuardConfig(
-            kvcr_service_socket_path="/tmp/kvcr.sock",
-            pool_index=3,
-            row_stride=1024,
-            compatibility_digest="Opaque-Digest",
-        ),
+        _GUARD_CONFIG,
     )
 
     claim.assert_called_once_with(
         3,
-        1024,
+        (_GUARD_CONFIG.row_stride,),
         "Opaque-Digest",
         ("127.0.0.1", 5555),
         g3_config,
     )
     assert constructor.call_args.args[1].framework_control is primary_control
     assert constructor.call_args.args[2].g3 is g3_config
+    assert constructor.call_args.args[2].local_dram == LocalDramInfo(1234, 8192, 2)
     # The region is consumed after the core starts, and the listener is taken last
     # during adoption -- a failure before that leaves the hold owning the descriptor.
     assert events == [
@@ -389,6 +390,35 @@ def test_service_journal_is_attached_before_primary_start(
     controller.close()
     assert events[-2:] == ["core.close", "hold.release"]
     assert controller._pool_hold is None
+
+
+@pytest.mark.parametrize(
+    ("row_stride", "capacity_bytes"),
+    [
+        (mmap.PAGESIZE - 1, mmap.PAGESIZE),
+        (mmap.PAGESIZE, mmap.PAGESIZE + 1),
+    ],
+    ids=["unaligned-stride", "partial-capacity"],
+)
+def test_invalid_scalar_g3_geometry_fails_before_client_claim(
+    tmp_path,
+    monkeypatch,
+    row_stride: int,
+    capacity_bytes: int,
+) -> None:
+    client = Mock()
+    monkeypatch.setattr(kvcr_recovery, "KVCRClient", client)
+    control = Mock()
+    control.control_bind_address.return_value = ("127.0.0.1", 5555)
+    g3 = G3Options(paths=(tmp_path / "g3",), capacity_bytes_per_file=capacity_bytes)
+    bindings = KVCRBindings(Mock(), Mock(), Mock(), framework_control=control)
+    guard_config = replace(_GUARD_CONFIG, row_stride=row_stride)
+    with pytest.raises(ValueError):
+        kvcr_recovery.claim_guarded_pool(
+            guard_config, bindings, KVCRBackendConfigs(g3=g3)
+        )
+
+    client.assert_not_called()
 
 
 def test_service_dram_rejects_explicit_local_dram_before_claim(monkeypatch) -> None:

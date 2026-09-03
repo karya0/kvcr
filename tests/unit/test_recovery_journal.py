@@ -8,10 +8,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import msgspec
 import pytest
 from _kvcr_test_utils import _recovered_record
 
 from kvcr.core import _BlockRecord
+from kvcr.guard_protocol import PoolDescriptor
 from kvcr.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
 from kvcr.recovery_journal import (
     _JOURNAL_HEADER_BYTES,
@@ -147,9 +149,9 @@ def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     g3.emit(key, _BlockRecord())
     frames = [journal.read_next() for _ in range(4)]
     assert journal.read_next() is None
-    assert [_decode_recovery_record(payload) for _, _, payload in frames] == [
-        _recovered_record(g2=2),
-        _recovered_record(g2=2, g3=7),
+    assert [_decode_recovery_record(payload, 1) for _, _, payload in frames] == [
+        _recovered_record(g2=[2]),
+        _recovered_record(g2=[2], g3=7),
         _recovered_record(g3=7),
         _BlockRecord(),
     ]
@@ -271,41 +273,73 @@ def _attached(tmp_path: Path) -> Iterator[KVCRPoolAttachment]:
 
 def _write_slot(pool: KVCRPoolAttachment, terms: bytes, key: bytes, slot: int) -> None:
     """One-slot handback region: the smallest finished snapshot."""
-    frames = _recovery_frames({BlockKey(key * 32): _recovered_record(g2=slot)})
+    frames = _recovery_frames({BlockKey(key * 32): _recovered_record(g2=[slot])}, 1)
     write_recovery_snapshot(pool, terms, frames)
+
+
+def test_canonical_pool_terms_bind_ordered_geometry_and_allocation_identity() -> None:
+    spec = KVCRPoolSpec(
+        pool_id="pool_0",
+        path=f"/tmp/kvcr-pool_0-{_GENERATION}",
+        generation=_GENERATION,
+        device=7,
+        inode=11,
+        mapping_bytes=5 * mmap.PAGESIZE,
+        journal_bytes=2 * mmap.PAGESIZE,
+    )
+    pools = (
+        PoolDescriptor(mmap.PAGESIZE, 1024, 2 * mmap.PAGESIZE, 0x1000),
+        PoolDescriptor(2 * mmap.PAGESIZE, 2048, 3 * mmap.PAGESIZE, 0x2000),
+    )
+
+    def terms_for(candidate=pools, digest=_TEST_DIGEST, allocation=spec):
+        return canonical_pool_terms(digest, candidate, allocation)
+
+    terms = terms_for()
+
+    relocated = msgspec.structs.replace(pools[0], mapping_address=0x3000)
+    assert terms_for((relocated, pools[1])) == terms
+
+    for field, value in (
+        ("size_bytes", 8192),
+        ("row_stride", 2048),
+        ("offset_bytes", 12288),
+    ):
+        changed = msgspec.structs.replace(pools[0], **{field: value})
+        assert terms_for((changed, pools[1])) != terms
+    assert terms_for(tuple(reversed(pools))) != terms
+    assert terms_for(allocation=msgspec.structs.replace(spec, device=8)) != terms
 
 
 def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -> None:
     """Replayed whole under its own terms, discardable when torn, gone once released."""
     with _attached(tmp_path) as pool:
         path = Path(pool._spec.path)
-        terms = canonical_pool_terms(_TEST_DIGEST, 4096, pool._spec)
+        pools = (PoolDescriptor(pool._spec.data_bytes, 4096, pool._spec.journal_bytes),)
+        terms = canonical_pool_terms(_TEST_DIGEST, pools, pool._spec)
         assert list(read_recovery_snapshot(pool, terms)) == []
 
         records = {
-            BlockKey(b"a" * 32): _recovered_record(g2=3),
+            BlockKey(b"a" * 32): _recovered_record(g2=[3]),
             # One with both halves, one only on disk.
-            BlockKey(b"b" * 32): _recovered_record(g2=4, g3=9),
+            BlockKey(b"b" * 32): _recovered_record(g2=[4], g3=9),
             BlockKey(b"c" * 32): _recovered_record(g3=2),
         }
-        write_recovery_snapshot(pool, terms, _recovery_frames(records))
+        write_recovery_snapshot(pool, terms, _recovery_frames(records, 1))
         # Inside the pool file, so it has no name of its own to be found under.
         assert set(tmp_path.iterdir()) == {path}
         assert path.stat().st_size > pool._spec.mapping_bytes
 
         # The mirror the ring feeds is also what replays the region.
-        mirror = _RecoveryMirror()
+        mirror = _RecoveryMirror(1)
         for frame in read_recovery_snapshot(pool, terms):
             mirror.apply(*frame)
         assert mirror.take_records() == records
 
         # A slot number only means the same bytes under the same geometry.
-        for other in (
-            canonical_pool_terms("another-digest", 4096, pool._spec),
-            canonical_pool_terms(_TEST_DIGEST, 8192, pool._spec),
-        ):
-            with pytest.raises(RecoveryJournalError, match="other terms"):
-                list(read_recovery_snapshot(pool, other))
+        other = canonical_pool_terms("another-digest", pools, pool._spec)
+        with pytest.raises(RecoveryJournalError, match="other terms"):
+            list(read_recovery_snapshot(pool, other))
 
         # Stopped once the replacing body has landed but before its header has.
         interrupted = Mock(
@@ -328,7 +362,7 @@ def test_a_handback_region_lives_and_dies_inside_the_pool_file(tmp_path: Path) -
             region[: _SNAPSHOT_HEADER.size] = bytes(_SNAPSHOT_HEADER.size)
         with pytest.raises(RecoveryJournalTornError, match="unfinished"):
             list(read_recovery_snapshot(pool, terms))
-        assert read_handback(pool, _TEST_DIGEST, 4096)._records == {}
+        assert read_handback(pool, _TEST_DIGEST, pools)._records == {}
         assert list(read_recovery_snapshot(pool, terms)) == []
 
         # A released region is truncated away, so it replays nothing.

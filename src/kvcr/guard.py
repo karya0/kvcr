@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Private journal-backed Guard for one service-owned pool."""
+"""Private journal-backed Guard for one service-owned pool group."""
 
 import concurrent.futures
 import enum
@@ -21,8 +21,9 @@ from .api import KVCRBindings
 from .config import KVCRBackendConfigs, KVCRConfig, LocalDramInfo
 from .control_channels import KVCRServiceError, ZmqPeerControlChannel
 from .core import _BlockRecord, _KVCRCore
-from .guard_protocol import PidfdLiveness, _TierConfig
+from .guard_protocol import PidfdLiveness, PoolDescriptor, _TierConfig
 from .local_disk import _G3Residency
+from .local_dram import _LocalDramResidency
 from .memory import (
     KVCRPoolAttachment,
     KVCRPoolSpec,
@@ -33,6 +34,7 @@ from .recovery_journal import (
     RecoveryJournal,
     RecoveryJournalError,
     RecoveryMirrorError,
+    _g2_slots,
     _recovery_frames,
     _RecoveryMirror,
     canonical_pool_terms,
@@ -54,10 +56,10 @@ _Lease = PidfdLiveness
 
 
 class _PoolLease:
-    """One pool's holder identity and persistent control listener."""
+    """One Guard's holder identity and persistent control listener."""
 
-    def __init__(self, pool_index: int) -> None:
-        self._pool_index = pool_index
+    def __init__(self, guard_index: int) -> None:
+        self._guard_index = guard_index
         self.current: _Lease | None = None
         self.listener: socket.socket | None = None
         # As the claimant asked: getsockname() is numeric and rejects aliases.
@@ -79,7 +81,7 @@ class _PoolLease:
         if self.listener is not None:
             if self.bind_address != address:
                 raise KVCRServiceError(
-                    f"KVCR pool {self._pool_index} answers on "
+                    f"KVCR Guard {self._guard_index} answers on "
                     f"{self.bind_address[0]}:{self.bind_address[1]} and cannot be "
                     "moved to "
                     f"{address[0]}:{address[1]}"
@@ -89,7 +91,7 @@ class _PoolLease:
             listener = socket.create_server(address)
         except OSError as error:
             raise KVCRServiceError(
-                f"KVCR pool {self._pool_index} control listener "
+                f"KVCR Guard {self._guard_index} control listener "
                 f"{address[0]}:{address[1]} is unavailable: {error}"
             ) from error
         self.listener = listener
@@ -165,12 +167,54 @@ def _with_g3(
     return records
 
 
-class _RecoveryState:
-    """One pool's attachment, journal, and mutable recovery ownership."""
+class _Pool0RecoveryAdapter:
+    """Project a complete pool group into one scalar core and restore it."""
 
-    def __init__(self, spec: KVCRPoolSpec, compatibility_digest: str) -> None:
+    def __init__(self, pool_count: int) -> None:
+        self._pool_count = pool_count
+        # No BlockKeys or record-table copy: only original residencies and slots.
+        self._projected: list[tuple[_LocalDramResidency, list[int]]] = []
+
+    def project(self, records: dict[BlockKey, _BlockRecord]) -> None:
+        for record in records.values():
+            residency = record.local_dram
+            if residency is None:
+                continue
+            slots = _g2_slots(residency.slot, self._pool_count)
+            if self._pool_count > 1:
+                self._projected.append((residency, slots))
+            residency.slot = slots[0]
+
+    def restore(self, records: dict[BlockKey, _BlockRecord]) -> None:
+        """Restore the pool-group shape after the scalar core stops."""
+        for residency, slots in self._projected:
+            if type(residency.slot) is int:
+                slots[0] = residency.slot
+                residency.slot = slots
+        self._projected.clear()
+        for record in records.values():
+            residency = record.local_dram
+            if residency is None or type(residency.slot) is not int:
+                continue
+            if self._pool_count == 1:
+                residency.slot = [residency.slot]
+            else:
+                record.local_dram = None
+
+
+class _RecoveryState:
+    """One pool group's attachment, descriptors, and mutable recovery."""
+
+    def __init__(
+        self,
+        spec: KVCRPoolSpec,
+        compatibility_digest: str,
+        pool_sizes_bytes: tuple[int, ...],
+    ) -> None:
         self._spec = spec
         self._compatibility_digest = compatibility_digest
+        self._pool_sizes_bytes = pool_sizes_bytes
+        self.pools: tuple[PoolDescriptor, ...] = ()
         self.attachment: KVCRPoolAttachment | None = None
         self._journal: RecoveryJournal | None = None
         self.mirror: _RecoveryMirror | None = None
@@ -182,16 +226,32 @@ class _RecoveryState:
         self.attachment = KVCRPoolAttachment.attach(self._spec)
         self._journal = RecoveryJournal(self.attachment)
 
-    def recover(self, row_stride: int) -> _RecoveryMirror:
-        """Return held recovery or read the prior handback under this stride."""
-        if self.mirror is not None:
-            return self.mirror
-        return read_handback(self.attachment, self._compatibility_digest, row_stride)
+    def configure(self, row_strides: tuple[int, ...]) -> None:
+        """Take up an ordered layout and its prior recovery atomically."""
+        if len(row_strides) != len(self._pool_sizes_bytes):
+            raise ValueError(
+                "row-stride count must equal the number of pools in the Guard"
+            )
+        offset = self._spec.journal_bytes
+        descriptors = []
+        for size_bytes, row_stride in zip(self._pool_sizes_bytes, row_strides):
+            descriptors.append(
+                PoolDescriptor(
+                    size_bytes, row_stride, offset, self.attachment.address + offset
+                )
+            )
+            offset += size_bytes
+        pools = tuple(descriptors)
+        mirror = self.mirror
+        if mirror is None:
+            mirror = read_handback(self.attachment, self._compatibility_digest, pools)
+        self.pools = pools
+        self.mirror = mirror
 
     def start_primary(self) -> None:
         """Arm recovery for the accepted primary and reset its journal."""
         if self.mirror is None:
-            self.mirror = _RecoveryMirror()
+            self.mirror = _RecoveryMirror(len(self._pool_sizes_bytes))
         self._journal.reset()
 
     def poll(self) -> bool:
@@ -230,7 +290,7 @@ class _RecoveryState:
             except RecoveryJournalError as error:
                 self._drop_recovery(error)
         # A handover still needs somewhere to put the core's eventual records.
-        self.mirror = _RecoveryMirror()
+        self.mirror = _RecoveryMirror(len(self._pool_sizes_bytes))
         return records
 
     def prepare_to_serve(
@@ -242,9 +302,6 @@ class _RecoveryState:
         }
         return _without_g3(records)
 
-    def local_dram_info(self, effective_bytes: int, rows: int) -> LocalDramInfo:
-        return LocalDramInfo(self.attachment.data_address, effective_bytes, rows)
-
     def release_snapshot_region(self) -> None:
         self.attachment.release_snapshot_region()
 
@@ -254,12 +311,12 @@ class _RecoveryState:
     # replacement serves whatever is in the slots. Refusing two pools that name
     # the same paths is the cheap first step; it does not cover a second
     # service, or a KVCR using G3 with no pool at all.
-    def hand_back(self, records: dict[BlockKey, _BlockRecord], row_stride: int) -> None:
-        """Write and mirror a closed core's map under the stride it served."""
+    def hand_back(self, records: dict[BlockKey, _BlockRecord]) -> None:
+        """Write and mirror a closed core's mutable record table in place."""
         mirror = self.mirror
         records = _with_g3(records, self._g3_records)
         try:
-            self._write_handback(records, row_stride)
+            self._write_handback(records)
         except OSError as error:
             if error.errno not in _RECOVERY_CAPACITY_ERRORS:
                 raise
@@ -269,13 +326,13 @@ class _RecoveryState:
             mirror.adopt(records)
         self._g3_records = {}
 
-    def release(self, row_stride: int) -> None:
+    def release(self) -> None:
         """Write the current primary's journal tail, then drop its mirror."""
         mirror = self.mirror
         try:
             while (frame := self._journal.read_next()) is not None:
                 mirror.apply(*frame)
-            self._write_handback(mirror.take_records(), row_stride)
+            self._write_handback(mirror.take_records())
         except RecoveryJournalError as error:
             self._drop_recovery(error)
         except OSError as error:
@@ -291,15 +348,11 @@ class _RecoveryState:
         )
         self.mirror = None
 
-    def _write_handback(
-        self,
-        records: Mapping[BlockKey, _BlockRecord],
-        row_stride: int,
-    ) -> None:
+    def _write_handback(self, records: Mapping[BlockKey, _BlockRecord]) -> None:
         write_recovery_snapshot(
             self.attachment,
-            canonical_pool_terms(self._compatibility_digest, row_stride, self._spec),
-            _recovery_frames(records),
+            canonical_pool_terms(self._compatibility_digest, self.pools, self._spec),
+            _recovery_frames(records, len(self.pools)),
         )
 
     def close(self) -> None:
@@ -310,10 +363,11 @@ class _RecoveryState:
             self._journal = None
             self.mirror = None
             self._g3_records = {}
+            self.pools = ()
 
 
 class _Command:
-    """One request on the pool's mailbox, and the future its answer arrives on."""
+    """One request on the Guard's mailbox, and the future its answer arrives on."""
 
     def __init__(self, operation: str, args: tuple[Any, ...] = ()) -> None:
         self.operation, self.args = operation, args
@@ -337,8 +391,8 @@ class _Phase(enum.Enum):
 
 
 class _Guard:
-    """One pool's lifecycle actor: owns the pool file, control endpoint, holder
-    pidfd, and recovery state, alive as long as the service owns the pool.
+    """One pool group's lifecycle actor: owns its allocation, control endpoint,
+    holder pidfd, and recovery state, alive as long as the service owns the group.
     Outlives every primary: a claim is reported to it, not what creates it.
     """
 
@@ -348,22 +402,24 @@ class _Guard:
         failure_callback: Callable[..., None] | None = None,
         *,
         compatibility_digest: str,
-        pool_index: int = 0,
+        guard_index: int = 0,
+        pool_sizes_bytes: tuple[int, ...],
         owner: _KVCRPoolOwner | None = None,
         refusing: Callable[[], bool] = lambda: False,
     ) -> None:
         self._spec = spec
-        self._pool_index = pool_index
-        # Owned here, not by the registry: one thread owns one pool, so a
+        self._guard_index = guard_index
+        # Owned here, not by the registry: one thread owns one pool group, so a
         # claim needs no lock -- the mailbox is the reservation.
         self._owner = owner
         self._refusing = refusing
-        self._pool_lease = _PoolLease(pool_index)
+        self._pool_lease = _PoolLease(guard_index)
         # Owned by the current primary.
         self._control: ZmqPeerControlChannel | None = None
         self._configured: _TierConfig | None = None
-        self._recovery = _RecoveryState(spec, compatibility_digest)
+        self._recovery = _RecoveryState(spec, compatibility_digest, pool_sizes_bytes)
         self._core = None
+        self._pool0_adapter: _Pool0RecoveryAdapter | None = None
         self._commands: queue.Queue[_Command] = queue.Queue()
         self._ops = {
             "claim": self._claim,
@@ -402,8 +458,8 @@ class _Guard:
 
     def claim(
         self, liveness: PidfdLiveness, tier_config: _TierConfig, bind: tuple[str, int]
-    ) -> "tuple[KVCRPoolSpec, int, _Lease]":
-        """Give this pool to a primary, with the endpoint its Guard answers on.
+    ) -> "tuple[KVCRPoolSpec, tuple[PoolDescriptor, ...], int, _Lease]":
+        """Give this pool group to a primary, with its Guard's endpoint.
         Reserved on the requesting thread: a mid-transition pool answers busy
         immediately instead of queueing the claimant.
         """
@@ -432,7 +488,7 @@ class _Guard:
                 if self._reserved is _Phase.PROMOTING:
                     # The death of this same lease got here first; it wins.
                     return
-                raise KVCRServiceError(f"KVCR pool {self._pool_index} is busy")
+                raise KVCRServiceError(f"KVCR Guard {self._guard_index} is busy")
             self._reserved = _Phase.RELEASING
         self._submit(_Command(operation, (lease,)))
 
@@ -481,15 +537,15 @@ class _Guard:
             if self._failure is not None:
                 raise self._failure
             if self._reserved is not None:
-                raise KVCRServiceError(f"KVCR pool {self._pool_index} is busy")
+                raise KVCRServiceError(f"KVCR Guard {self._guard_index} is busy")
             if self._phase is _Phase.PRIMARY:
                 lease = self._pool_lease.current
                 if self._pool_lease.poll_pidfd(lease) is None:
                     raise KVCRServiceError(
-                        f"KVCR pool {self._pool_index} is held by another worker"
+                        f"KVCR Guard {self._guard_index} is held by another worker"
                     )
                 # Dead but not yet promoted: the actor is the sole authority.
-                raise KVCRServiceError(f"KVCR pool {self._pool_index} is busy")
+                raise KVCRServiceError(f"KVCR Guard {self._guard_index} is busy")
             if self._phase in (_Phase.FAILED, _Phase.CLOSED):
                 raise KVCRServiceError("KVCR pool registry is closed")
             self._reserved = _Phase.CLAIMING
@@ -611,7 +667,7 @@ class _Guard:
 
     def _claim(
         self, liveness: PidfdLiveness, tier_config: _TierConfig, bind: tuple[str, int]
-    ) -> "tuple[KVCRPoolSpec, int, _Lease]":
+    ) -> "tuple[KVCRPoolSpec, tuple[PoolDescriptor, ...], int, _Lease]":
         """Give the pool to a primary, and take up the endpoint it named.
         All fallible work runs before the lease exists, and commit and refusal
         share one lock: a lease is never half-granted.
@@ -628,11 +684,15 @@ class _Guard:
                 duplicate.close()
                 raise
             self._adopt(control, tier_config)
+            pools = tuple(
+                PoolDescriptor(pool.size_bytes, pool.row_stride, pool.offset_bytes)
+                for pool in self._recovery.pools
+            )
             with self._phase_lock:
                 if not self._closing and not self._refusing():
                     self._pool_lease.current = liveness
                     self._phase = _Phase.PRIMARY
-                    return self._spec, granted_fd, liveness
+                    return self._spec, pools, granted_fd, liveness
             # Refused at the commit: a closing service must not grant a pool.
             # Everything adopted goes back as a release would have put it.
             self._release()
@@ -695,7 +755,7 @@ class _Guard:
             self._phase = _Phase.STANDBY
 
     def _escalate(self, error: BaseException) -> None:
-        logger.critical("KVCR pool %d Guard failed", self._pool_index)
+        logger.critical("KVCR Guard %d failed", self._guard_index)
         try:
             self._failure_callback(self, error)
         except BaseException:  # noqa: BLE001 - retain the original failure
@@ -718,23 +778,21 @@ class _Guard:
             if self._failure is not None:
                 raise self._failure
             self._refuse_incompatible(tier_config)
-            served_under = self._configured.row_stride if self._configured else 0
             # The prior handback is this lease's baseline. Read now, under
-            # the claim's stride: refusing at promotion stops the service,
+            # the claim's layout: refusing at promotion stops the service,
             # and a claimant dying in between takes everything with it.
-            recovered = self._recovery.recover(tier_config.row_stride)
+            self._recovery.configure(tier_config.row_strides)
             # Last, once nothing left can refuse this claim: a pool whose handback
             # would not replay has not chosen anything, and a corrected claim can
             # still have it.
-            self._configure(tier_config)
-            self._recovery.mirror = recovered
+            self._configured = tier_config
         except BaseException:
             control.close()
             raise
 
         try:
             if self._serving:
-                self._hand_back(served_under)
+                self._hand_back()
                 self._resumable = True
             # A refused handback is cold for the new lease, not unmirrored.
             self._recovery.start_primary()
@@ -757,17 +815,17 @@ class _Guard:
         if self._failure is not None:
             raise self._failure
         if self._serving:
-            self._hand_back(self._configured.row_stride)
+            self._hand_back()
             # Re-adopt lets start_primary() retain or replace the mirror.
             self._recovery.mirror = None
         elif self._recovery.mirror is not None:
-            self._recovery.release(self._configured.row_stride)
+            self._recovery.release()
         if self._control is not None:
             self._control.close()
             self._control = None
 
     def _refuse_incompatible(self, tier_config: _TierConfig) -> None:
-        """Refuse tiers other than the ones this pool was claimed with.
+        """Refuse tiers other than the ones this pool group was claimed with.
         The first claim fixes configuration for the service's lifetime: the
         bytes stay, and a changed stride or G3 path order misnames every slot.
         """
@@ -775,13 +833,6 @@ class _Guard:
             raise RecoveryMirrorError(
                 "KVCR pool was claimed with another tier configuration"
             )
-
-    def _configure(self, tier_config: _TierConfig) -> None:
-        """Take up this primary's tiers: the geometry check runs before the
-        assignment, so a bad configuration leaves the old one intact.
-        """
-        _compute_pool_geometry(self._spec.data_bytes, tier_config.row_stride)
-        self._configured = tier_config
 
     def _poll(self) -> bool:
         """Mirror what is waiting; True if more remains. The batch bounds a
@@ -828,21 +879,23 @@ class _Guard:
         self._serve(self._recovery.take_for_promotion())
 
     def _serve(self, records: dict[BlockKey, _BlockRecord]) -> None:
-        """Answer on this pool's endpoint, with whatever came back from it.
+        """Answer on this pool group's endpoint, with whatever came back from it.
 
         Serving nothing is still serving: answering refuses peers that staying
         bound would leave hanging. G2 only, no G3: that half is kept whole for
         the replacement. A new NIXL agent name keeps peers off the dead one's.
         """
         records = self._recovery.prepare_to_serve(records)
+        adapter = _Pool0RecoveryAdapter(len(self._recovery.pools))
+        adapter.project(records)
+        self._pool0_adapter = adapter
 
         def reject_pin(keys: object) -> int:
             raise RuntimeError("Guard has no framework-owned memory")
 
-        effective_bytes, rows = _compute_pool_geometry(
-            self._spec.data_bytes, self._configured.row_stride
-        )
-        dram = self._recovery.local_dram_info(effective_bytes, rows)
+        pool = self._recovery.pools[0]
+        effective_bytes, rows = _compute_pool_geometry(pool.size_bytes, pool.row_stride)
+        dram = LocalDramInfo(pool.mapping_address, effective_bytes, rows)
         core = _KVCRCore(
             KVCRConfig(
                 nixl_agent_name=f"KVCR-Guard-{uuid.uuid4()}",
@@ -865,16 +918,19 @@ class _Guard:
         core.start()
         self._serving = True
 
-    def _hand_back(self, row_stride: int) -> None:
-        """Stop serving, leaving this pool's state where the next primary looks.
+    def _hand_back(self) -> None:
+        """Stop serving, leaving this pool group's state where the next primary looks.
         The core closes first: the Guard stops answering, and region and
         records both come from the map close leaves behind.
         """
         core = self._core
-        if core is None or self._recovery.mirror is None:
+        adapter = self._pool0_adapter
+        if core is None or adapter is None or self._recovery.mirror is None:
             raise RecoveryMirrorError("a serving Guard has no state to hand back")
         core.close()
-        self._recovery.hand_back(core._block_record_map, row_stride)
+        adapter.restore(core._block_record_map)
+        self._recovery.hand_back(core._block_record_map)
+        self._pool0_adapter = None
         self._core = None
         self._serving = False
 
