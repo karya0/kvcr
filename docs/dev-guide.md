@@ -314,8 +314,8 @@ IDs, or raw endpoints.
 ### KVCR service daemon
 
 The KVCR service daemon owns pool lifecycle. It pre-allocates `--pool-count`
-fixed-size pools before exposing its socket. A worker claims a pool by index;
-the pool outlives that worker but not the service:
+fixed-size pools before exposing its socket, one per Guard. A worker claims a
+Guard by index; its pool outlives that worker but not the service:
 
 ```bash
 python -m kvcr.kvcr_service \
@@ -330,7 +330,7 @@ python -m kvcr.kvcr_service \
 | --- | --- | --- |
 | `--socket-path` | *(required)* | Unix socket the workers connect to |
 | `--pool-dir` | *(required)* | Writable directory holding the pool files |
-| `--pool-count` | *(required)* | Number of pools available by index |
+| `--pool-count` | *(required)* | Number of single-pool Guards available by index |
 | `--pool-size-gb` | *(required)* | Total mapped size of each pool |
 | `--compatibility-digest` | *(required)* | Exact digest every claimant must provide |
 
@@ -338,7 +338,7 @@ Each pool reserves a fixed 100 MiB journal, taken out of `--pool-size-gb`
 rather than added to it: a 64 GiB pool caches 64 GiB minus 100 MiB.
 
 The pre-release wire protocol remains version 1. A worker calls
-`KVCRClient.claim(pool_index, row_stride, compatibility_digest, control_bind)`,
+`KVCRClient.claim(guard_index, row_stride, compatibility_digest, control_bind)`,
 naming the address its Guard will answer on. The digest must match the service
 exactly, and callers must change it whenever the row stride or any other
 KV-cache layout term changes. The returned `KVCRPoolHold` describes the mapped
