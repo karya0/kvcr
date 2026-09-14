@@ -75,6 +75,7 @@ class _PoolRegistry:
         pool_sizes_bytes: tuple[int, ...],
         journal_bytes: int,
         compatibility_digest: str,
+        resiliency_enabled: bool = True,
     ) -> None:
         self._pool_dir = Path(pool_dir).resolve()
         if not self._pool_dir.is_dir():
@@ -95,6 +96,7 @@ class _PoolRegistry:
                     pool_size_bytes=mapping_bytes,
                     journal_bytes=journal_bytes,
                     pool_dir=self._pool_dir,
+                    resiliency_enabled=resiliency_enabled,
                 )
                 # Built with the group, not a claim: a Guard that cannot attach its
                 # allocation is better discovered at startup than when a worker dies.
@@ -470,6 +472,7 @@ class _KVCRService:
         pool_sizes_bytes: tuple[int, ...],
         compatibility_digest: str,
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
+        resiliency_enabled: bool = True,
     ) -> None:
         self.socket_path = Path(socket_path).resolve()
         if not self.socket_path.parent.is_dir():
@@ -480,7 +483,12 @@ class _KVCRService:
         # per pod and clears the path before starting it.
         _unlink_stale_socket(self.socket_path)
         self._registry = _PoolRegistry(
-            pool_dir, guard_count, pool_sizes_bytes, journal_bytes, compatibility_digest
+            pool_dir,
+            guard_count,
+            pool_sizes_bytes,
+            journal_bytes,
+            compatibility_digest,
+            resiliency_enabled=resiliency_enabled,
         )
         try:
             self._server = _ThreadingUnixServer(
@@ -619,6 +627,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
     )
     parser.add_argument("--compatibility-digest", required=True)
+    parser.add_argument("--disable-resiliency", action="store_true")
     args = parser.parse_args(argv)
     if args.guard_count < 1:
         parser.error("--guard-count must be at least 1")
@@ -641,16 +650,18 @@ def main() -> None:
             guard_count=args.guard_count,
             pool_sizes_bytes=args.pool_sizes_bytes,
             compatibility_digest=args.compatibility_digest,
+            resiliency_enabled=not args.disable_resiliency,
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         logging.basicConfig(level=logging.INFO)
         logger.info(
             "KVCR service ready: socket=%s guards=%d pool_sizes_bytes=%s "
-            "journal_bytes=%d",
+            "journal_bytes=%d resiliency_enabled=%s",
             args.socket_path,
             args.guard_count,
             args.pool_sizes_bytes,
             _DEFAULT_JOURNAL_BYTES,
+            not args.disable_resiliency,
         )
         server.serve_forever()
     except _ShutdownRequested:

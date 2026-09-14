@@ -191,7 +191,8 @@ class _RecoveryState:
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
         self.attachment = KVCRPoolAttachment.attach(self._spec)
-        self._journal = RecoveryJournal(self.attachment)
+        if self._spec.resiliency_enabled:
+            self._journal = RecoveryJournal(self.attachment)
 
     def configure(self, pool_layouts: PoolBlockLayouts) -> None:
         """Take up an ordered layout and its prior recovery atomically."""
@@ -208,13 +209,15 @@ class _RecoveryState:
             offset += size_bytes
         pools = tuple(descriptors)
         mirror = self.mirror
-        if mirror is None:
+        if mirror is None and self._spec.resiliency_enabled:
             mirror = read_handback(self.attachment, self._compatibility_digest, pools)
         self.pools = pools
         self.mirror = mirror
 
     def start_primary(self) -> None:
         """Arm recovery for the accepted primary and reset its journal."""
+        if not self._spec.resiliency_enabled:
+            return
         if self.mirror is None:
             self.mirror = _RecoveryMirror(tuple(pool.name for pool in self.pools))
         self._journal.reset()
@@ -715,6 +718,9 @@ class _Guard:
 
     def _promote_for(self, lease: "_Lease") -> None:
         """Take the pool over from the primary that just died."""
+        if not self._spec.resiliency_enabled:
+            self._stand_down(lease)
+            return
         try:
             self._promote()
         finally:
@@ -793,6 +799,10 @@ class _Guard:
         if self._control is not None:
             self._control.close()
             self._control = None
+        if not self._spec.resiliency_enabled:
+            error = self._pool_lease.unbind()
+            if error is not None:
+                raise error
 
     def _refuse_incompatible(self, tier_config: _TierConfig) -> None:
         """Refuse tiers other than the ones this pool group was claimed with.

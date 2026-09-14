@@ -53,6 +53,7 @@ class KVCRPoolSpec(msgspec.Struct, frozen=True):
     inode: Annotated[int, msgspec.Meta(ge=0)]
     mapping_bytes: Annotated[int, msgspec.Meta(gt=0)]
     journal_bytes: Annotated[int, msgspec.Meta(gt=0)]
+    resiliency_enabled: bool = True
 
     @property
     def data_bytes(self) -> int:
@@ -220,6 +221,7 @@ class _KVCRPoolOwner:
         pool_size_bytes: int,
         journal_bytes: int,
         pool_dir: str | os.PathLike[str],
+        resiliency_enabled: bool = True,
     ) -> "_KVCRPoolOwner":
         """Create the file and reserve its data space.
 
@@ -244,6 +246,7 @@ class _KVCRPoolOwner:
                     inode=file_identity[1],
                     mapping_bytes=pool_size_bytes,
                     journal_bytes=journal_bytes,
+                    resiliency_enabled=resiliency_enabled,
                 )
                 # Dropped by the kernel on death, which is how another
                 # daemon tells a live pool from a crashed one's.

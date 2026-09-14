@@ -507,7 +507,8 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
         dangling.dead_incarnations.update(hold._dead_incarnations)
     if core._local_dram is None:
         raise ValueError("a claimed pool must give the core its local DRAM tier")
-    _attach_journal(core._local_dram, RecoveryJournal(hold._attachment), core._g3)
+    if hold._attachment._spec.resiliency_enabled:
+        _attach_journal(core._local_dram, RecoveryJournal(hold._attachment), core._g3)
     install_recovery_records(core, claimed.recovered.take_records())
     hold.hand_listener_to(claimed.adopt_listener)
 
@@ -686,6 +687,8 @@ def read_handback(
     """
     pool_names = tuple(pool.name for pool in pools)
     mirror = _RecoveryMirror(pool_names)
+    if not pool._spec.resiliency_enabled:
+        return mirror
     terms = canonical_pool_terms(compatibility_digest, pools, pool._spec)
     try:
         for frame in read_recovery_snapshot(pool, terms):
@@ -701,4 +704,5 @@ def read_handback(
 
 def clear_recovery_snapshot(pool: KVCRPoolAttachment) -> None:
     """Drop handback state once it has been installed."""
-    pool.release_snapshot_region()
+    if pool._spec.resiliency_enabled:
+        pool.release_snapshot_region()
