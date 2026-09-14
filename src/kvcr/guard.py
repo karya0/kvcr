@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from typing import Any
 
+from . import diagnostics
 from .api import KVCRBindings
 from .config import (
     KVCRBackendConfigs,
@@ -409,6 +410,7 @@ class _Guard:
         self._failure_callback = failure_callback or (lambda guard, error: None)
 
     def _fail(self, error: BaseException) -> None:
+        self._event("guard_failed", error_type=type(error).__name__)
         with self._phase_lock:
             self._failure = error
             self._phase = _Phase.FAILED
@@ -419,6 +421,17 @@ class _Guard:
         """Snapshot confirmed deaths for a replacement primary's claim."""
         with self._phase_lock:
             return tuple(sorted(self._dead_incarnations))
+
+    def _event(self, name: str, **fields) -> None:
+        if diagnostics.ENABLED:
+            diagnostics.event(
+                name,
+                role="service",
+                guard_index=self._guard_index,
+                pool_id=self._spec.pool_id,
+                pool_generation=self._spec.generation,
+                **fields,
+            )
 
     def start(self) -> None:
         """Attach the pool and begin the lifecycle thread, before any claim."""
@@ -438,7 +451,13 @@ class _Guard:
         immediately instead of queueing the claimant.
         """
         self._reserve_claim()
-        return self._submit(_Command("claim", (liveness, tier_config, bind)))
+        result = self._submit(_Command("claim", (liveness, tier_config, bind)))
+        self._event(
+            "pool_claim_granted",
+            incarnation=liveness.incarnation,
+            resiliency_enabled=self._spec.resiliency_enabled,
+        )
+        return result
 
     def release(self, lease: "_Lease") -> None:
         """End a lease. The pool keeps its Guard, and the Guard its records."""
@@ -635,6 +654,7 @@ class _Guard:
             if lease.incarnation is not None:
                 with self._phase_lock:
                     self._dead_incarnations.add(lease.incarnation)
+            self._event("primary_death_detected", incarnation=lease.incarnation)
             self._promote_for(lease)
         except BaseException as error:  # noqa: BLE001 - service-fatal
             self._fail(error)
@@ -702,6 +722,8 @@ class _Guard:
         with self._phase_lock:
             self._phase = _Phase.IDLE
 
+        self._event("pool_lease_released", incarnation=lease.incarnation)
+
     def _abort(self, lease: "_Lease") -> None:
         """Undo a grant its claimant declared unserved: resume, or release.
         Resume is safe: the claimant stopped local access for good, the mirror
@@ -720,6 +742,7 @@ class _Guard:
         """Take the pool over from the primary that just died."""
         if not self._spec.resiliency_enabled:
             self._stand_down(lease)
+            self._event("cold_reclaim", incarnation=lease.incarnation, recovered_keys=0)
             return
         try:
             self._promote()
@@ -903,6 +926,14 @@ class _Guard:
             ),
         )
         self._core = core
+        if diagnostics.ENABLED:
+            core._diagnostic_context = {
+                "role": "guard",
+                "guard_index": self._guard_index,
+                "pool_id": self._spec.pool_id,
+                "pool_generation": self._spec.generation,
+                "incarnation": core._remote_fw_dram._dangling_ops.incarnation,
+            }
         core._remote_fw_dram._dangling_ops.dead_incarnations = (
             self._dead_incarnations.copy()
         )
@@ -912,6 +943,12 @@ class _Guard:
         self._recovery.release_snapshot_region()
         core.start()
         self._serving = True
+        self._event(
+            "guard_serving_started",
+            agent_name=core.config.nixl_agent_name,
+            recovered_keys=len(records),
+        )
+        diagnostics.sample_g2(core, force=True)
 
     def _hand_back(self) -> None:
         """Stop serving, leaving this pool group's state where the next primary looks.
@@ -921,8 +958,11 @@ class _Guard:
         core = self._core
         if core is None or self._recovery.mirror is None:
             raise RecoveryMirrorError("a serving Guard has no state to hand back")
+        self._event("guard_close_started", agent_name=core.config.nixl_agent_name)
         core.close()
+        self._event("guard_close_completed", agent_name=core.config.nixl_agent_name)
         self._recovery.hand_back(core._block_record_map)
+        self._event("guard_handback_completed", agent_name=core.config.nixl_agent_name)
         self._core = None
         self._serving = False
 

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from math import ceil
 from typing import TYPE_CHECKING
 
+from . import diagnostics
 from .config import (
     KVCRBackendConfigs,
     KVCRConfig,
@@ -516,6 +517,7 @@ class _KVCRCore:
             progress_items = self._local_dram.poll_main(progress_items)
         self._remote_fw_dram.poll_main(progress_items)
         self._flush_inventory()
+        diagnostics.sample_g2(self)
         completed = self._completion_queue
         self._completion_queue = []
         return completed

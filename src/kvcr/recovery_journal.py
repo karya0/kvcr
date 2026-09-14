@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import msgspec
 
+from . import diagnostics
 from .config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
 from .core import _BlockRecord, _KVCRCore
 from .guard_protocol import KVCRClient, KVCRPoolHold, _PoolDescriptor
@@ -501,6 +502,13 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
     which is what closes it on release.
     """
     hold = claimed.hold
+    if diagnostics.ENABLED:
+        core._diagnostic_context = {
+            "role": "primary",
+            "pool_id": hold._attachment._spec.pool_id,
+            "pool_generation": hold._attachment._spec.generation,
+            "incarnation": hold._incarnation,
+        }
     if hold._incarnation is not None:
         dangling = core._remote_fw_dram._dangling_ops
         dangling.incarnation = hold._incarnation
@@ -510,6 +518,10 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
     if hold._attachment._spec.resiliency_enabled:
         _attach_journal(core._local_dram, RecoveryJournal(hold._attachment), core._g3)
     install_recovery_records(core, claimed.recovered.take_records())
+    if diagnostics.ENABLED:
+        diagnostics.core_event(
+            core, "pool_recovery_adopted", recovered_keys=len(core._block_record_map)
+        )
     hold.hand_listener_to(claimed.adopt_listener)
 
 
@@ -607,6 +619,13 @@ def write_recovery_snapshot(
         body += _pack_frame(record_type, key, payload, frame_size)
     if not body:
         pool.release_snapshot_region()
+        diagnostics.event(
+            "snapshot_empty",
+            role="service",
+            pool_id=pool._spec.pool_id,
+            pool_generation=pool._spec.generation,
+            snapshot_bytes=0,
+        )
         return
 
     digest = hashlib.sha256(terms)
@@ -623,6 +642,13 @@ def write_recovery_snapshot(
             digest.digest(), len(body)
         )
         region.flush()
+    diagnostics.event(
+        "snapshot_written",
+        role="service",
+        pool_id=pool._spec.pool_id,
+        pool_generation=pool._spec.generation,
+        snapshot_bytes=_SNAPSHOT_HEADER.size + len(body),
+    )
 
 
 def read_recovery_snapshot(

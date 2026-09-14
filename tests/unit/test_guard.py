@@ -111,7 +111,7 @@ def _frame(key: BlockKey, record: _BlockRecord) -> tuple[int, bytes, bytes]:
 def _give_serving_core(guard: _Guard) -> Mock:
     """A serving core still holding one READY G2 block."""
     records = {BlockKey(b"warm"): _recovered_record(g2=[("", 0)])}
-    core = Mock(_block_record_map=records)
+    core = Mock(_block_record_map=records, config=Mock(nixl_agent_name="guard-test"))
     guard._core = core
     guard._serving = True
     return core
@@ -279,7 +279,9 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         assert backends.remote_fw_dram.backend == "REMOTE"
         # A Guard serves G2 and holds G3 records for the returning primary.
         assert backends.g3 is None
-        core = Mock(_local_dram=Mock(), _g3=None, _block_record_map={})
+        core = Mock(_local_dram=Mock(_pools={}), _g3=None, _block_record_map={})
+        core.config = config
+        core._remote_fw_dram._dangling_ops.incarnation = "guard-test-incarnation"
 
         def adopt(records) -> None:
             core._block_record_map = records
@@ -708,7 +710,7 @@ def test_a_grant_that_never_arrived_resumes_the_guard_it_stood_down() -> None:
     guard._promote = lambda: outcomes.append("promote")
     guard._release = lambda: outcomes.append("release")
 
-    lease = Mock()
+    lease = Mock(incarnation="first")
     guard._pool_lease.current = lease
     guard._abort(lease)
     assert outcomes == ["promote"]
@@ -717,7 +719,7 @@ def test_a_grant_that_never_arrived_resumes_the_guard_it_stood_down() -> None:
     assert guard._phase is _Phase.STANDBY
 
     guard._resumable = False
-    stale = Mock()
+    stale = Mock(incarnation="stale")
     guard._pool_lease.current = stale
     guard._abort(stale)
     assert outcomes == ["promote", "release"]

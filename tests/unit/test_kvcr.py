@@ -355,7 +355,12 @@ def test_service_journal_is_attached_before_primary_start(
     claim = Mock(return_value=hold)
     local_dram = object()
     g3 = object()
-    core = Mock(_local_dram=local_dram, _g3=g3)
+    core = Mock(
+        _local_dram=local_dram,
+        _g3=g3,
+        _block_record_map={},
+        config=Mock(nixl_agent_name="target"),
+    )
     core.start.side_effect = lambda: events.append("core.start")
     core.close.side_effect = lambda: events.append("core.close")
     constructor = Mock(return_value=core)

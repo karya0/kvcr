@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 
+from . import diagnostics
 from .config import KeyAdapter, RemoteFWDramOptions
 from .core import (
     DURATION_METRIC,
@@ -562,10 +563,26 @@ class _RemoteFWDram:
         if current_hint is not None and (
             current_hint.failed or current_hint.missing_keys.issuperset(blocks)
         ):
+            diagnostics.core_event(
+                kvcr,
+                "remote_target_not_started",
+                op_handle=op_handle,
+                request_id=request_id,
+                requested_keys=len(blocks),
+                cause="hint_failed_or_all_keys_known_missing",
+            )
             kvcr._record_duration(scope, started_at, "failed")
             return False
 
         if current_hint is None or current_hint.source is None:
+            diagnostics.core_event(
+                kvcr,
+                "remote_target_not_started",
+                op_handle=op_handle,
+                request_id=request_id,
+                requested_keys=len(blocks),
+                cause="no_source_hint",
+            )
             kvcr._record_duration(scope, started_at, "failed")
             return False
         keys = tuple(key for key in blocks if key not in current_hint.missing_keys)
@@ -587,6 +604,17 @@ class _RemoteFWDram:
             request_id=request_id,
         )
         kvcr._add_block_dependencies(op, new_operation=True)
+        if diagnostics.ENABLED:
+            diagnostics.core_event(
+                kvcr,
+                "remote_target_started",
+                op_handle=op_handle,
+                request_id=request_id,
+                operation=scope,
+                source_endpoint=current_hint.source,
+                requested_keys=len(op.keys),
+                key_set_sha256=diagnostics.keyset_digest(op.keys),
+            )
         kvcr._progress.submit(op)
         return True
 
@@ -645,6 +673,27 @@ class _RemoteFWDram:
                     # KVCR-owned contents stay claimed until native quiescence.
                     pins = self._fw_pins_by_op.pop(item.op_id, None)
                     if item.state is _SourceWriteState.FINISHED:
+                        if diagnostics.ENABLED:
+                            diagnostics.core_event(
+                                self._kvcr,
+                                "remote_source_completed",
+                                op_handle=item.op_handle,
+                                target_route=list(item.route),
+                                outcome="success" if item.success else "failed",
+                                completed_keys=len(item.source_keys)
+                                if item.success
+                                else 0,
+                                completed_descriptor_bytes=sum(
+                                    descriptor.size
+                                    for row in item.src_descriptors
+                                    for descriptor in row
+                                )
+                                if item.success
+                                else 0,
+                                key_set_sha256=diagnostics.keyset_digest(
+                                    item.source_keys if item.success else ()
+                                ),
+                            )
                         self._kvcr._remove_block_dependencies(item)
                         if item.success:
                             self._kvcr._record_access(
@@ -739,6 +788,35 @@ class _RemoteFWDram:
         if op.state is not _TargetPullState.QUARANTINED:
             kvcr._remove_block_dependencies(op)
         completed_keys = op.completed_keys if op.success else set()
+        if diagnostics.ENABLED:
+            diagnostics.core_event(
+                kvcr,
+                "remote_target_completed",
+                op_handle=op.op_id[1],
+                request_id=op.request_id,
+                source_endpoint=op.remote_ctrl_ep,
+                source_incarnation=op.source_incarnation,
+                state=op.state.name,
+                operation="remote_fetch" if op.local_fill else "remote_deliver",
+                outcome=(
+                    "success"
+                    if completed_keys == op.keys
+                    else "partial"
+                    if completed_keys
+                    else "failed"
+                ),
+                requested_keys=len(op.keys),
+                completed_keys=len(completed_keys),
+                completed_descriptor_bytes=sum(
+                    descriptor.size
+                    for key, descriptors in zip(op.ordered_keys, op.dst_descriptors)
+                    if key in completed_keys
+                    for descriptor in descriptors
+                ),
+                completed_key_set_sha256=diagnostics.keyset_digest(completed_keys),
+                requested_key_set_sha256=diagnostics.keyset_digest(op.keys),
+                cause="unknown" if not op.success else None,
+            )
         if not op.success:
             self._fail_request_hint(op.request_id)
         elif (
@@ -956,6 +1034,14 @@ class _RemoteFWDram:
         # unauthenticated: a "resend it" signal on a channel already trusted to let a
         # start_write make a source write.
         self._refused_writes[("target", op_handle)] = {"success": False}
+        diagnostics.core_event(
+            self._kvcr,
+            "remote_write_refused",
+            op_handle=op_handle,
+            request_id=getattr(op, "request_id", None),
+            source_endpoint=endpoint,
+            cause="peer_refusal_reason_not_sent",
+        )
 
     def _handle_target_metadata_ack(
         self, progress: _KVCRProgress, payload: dict[str, Any]
@@ -1199,6 +1285,12 @@ class _RemoteFWDram:
             # Refusing over the control channel is the only way this operation
             # ever reaches a terminal.
             logger.warning("KVCR refusing unresolvable start_write op=%d", op_handle)
+            diagnostics.core_event(
+                self._kvcr,
+                "remote_source_unresolvable",
+                op_handle=op_handle,
+                cause="unresolvable_target_agent",
+            )
             reply_to = payload.get("sender_control_endpoint")
             reflected_self = payload.get("source_control_endpoint")
             if isinstance(reply_to, str) and isinstance(reflected_self, str):
