@@ -5,6 +5,7 @@ import functools
 import json
 import logging
 import os
+import select
 import shutil
 import signal
 import socket
@@ -290,6 +291,8 @@ def run(args):
         primary = children[1]
         pidfd = os.pidfd_open(primary.pid)
         try:
+            poller = select.poll()
+            poller.register(pidfd, select.POLLIN)
             event(
                 "signal",
                 victim_pid=primary.pid,
@@ -297,6 +300,11 @@ def run(args):
                 blocks=args.blocks,
             )
             signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            event("signal_sent", victim_pid=primary.pid)
+            observed = poller.poll(60000)
+            if not observed or not observed[0][1] & select.POLLIN:
+                raise RuntimeError(f"victim pidfd did not report exit: {observed}")
+            event("pidfd_ready", victim_pid=primary.pid)
             primary.wait(60)
             event("exit_observed", victim_pid=primary.pid)
         finally:

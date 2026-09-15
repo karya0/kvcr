@@ -158,3 +158,26 @@ experiment and is unnecessary when validating this patch.
 - Exact final branch source and packaged harness: two-GPU 1-GiB/16-block smoke
   passed; 104 ms signal to death_observed, 211 ms signal to serving. Guard and
   progress stage ordering and monotonic timestamps verified from captured logs.
+
+## Follow-up: isolate the approximately 104-ms death interval
+
+The probe controller now registers an independent pidfd poller before issuing
+SIGKILL, logs signal syscall return, blocks on pidfd readability, and then
+reaps the child. This separates signal issuance from observable exit and the
+guard actor's observation.
+
+A final two-GPU 1-GiB/16-block run passed with these same-host monotonic times:
+
+| Event | Relative to signal-start marker |
+|---|---:|
+| Signal syscall returned | 0.280 ms |
+| Controller observed pidfd POLLIN | 101.543 ms |
+| Guard logged death_observed | 102.494 ms |
+| Guard serving | 193.011 ms |
+
+The guard observed death 0.952 ms after the independent observer. Nearly all
+of this run's signal-to-death-observation interval precedes the controller's
+exit notification. GPU/native process teardown is a plausible explanation;
+individual kernel/driver teardown operations have not been traced. These are
+userspace observation timestamps, not an exact timestamp of kernel exit.
+They do not establish what occupied the original campaign's nine-second gap.
