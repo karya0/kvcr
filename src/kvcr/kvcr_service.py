@@ -56,6 +56,7 @@ _CLIENT_IDLE_TIMEOUT_SECONDS = 30.0
 _REGISTRY_TRANSITION_TIMEOUT_SECONDS = 30.0
 _STALE_SOCKET_PROBE_SECONDS = 1.0
 _DEFAULT_JOURNAL_BYTES = 100 * (1 << 20)
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 # Matches names produced by memory._pool_filename: "kvcr-<pool_id>-<32 hex>".
 _ORPHANED_POOL_NAME = re.compile(rf"{re.escape(_POOL_PREFIX)}-.+-[0-9a-f]{{32}}")
 _GB = 1 << 30
@@ -628,6 +629,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--compatibility-digest", required=True)
     parser.add_argument("--disable-resiliency", action="store_true")
+    parser.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=_LOG_LEVELS,
+        default=os.environ.get("KVCR_LOG_LEVEL", "INFO"),
+    )
     args = parser.parse_args(argv)
     if args.guard_count < 1:
         parser.error("--guard-count must be at least 1")
@@ -637,6 +644,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     """Run the standalone KVCR service daemon."""
     args = _parse_args()
+    logging.basicConfig(level=args.log_level)
 
     shutdown_signals = {signal.SIGINT, signal.SIGTERM}
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, shutdown_signals)
@@ -653,7 +661,6 @@ def main() -> None:
             resiliency_enabled=not args.disable_resiliency,
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        logging.basicConfig(level=logging.INFO)
         logger.info(
             "KVCR service ready: socket=%s guards=%d pool_sizes_bytes=%s "
             "journal_bytes=%d resiliency_enabled=%s",

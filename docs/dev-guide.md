@@ -338,6 +338,7 @@ python -m kvcr.kvcr_service \
 | `--guard-count` | *(required)* | Number of Guard-owned pool groups available by index |
 | `--pool-sizes-gb` | *(required)* | Comma-separated usable sizes of the ordered pools in every group |
 | `--compatibility-digest` | *(required)* | Exact digest every claimant must provide |
+| `--log-level` | `$KVCR_LOG_LEVEL` or `INFO` | Service and Guard logging threshold |
 
 Each Guard gets one fixed 100 MiB recovery-journal region, added on top of the
 listed usable sizes. The example therefore creates one mapping of 64 GiB plus
