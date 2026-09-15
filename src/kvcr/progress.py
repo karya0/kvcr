@@ -3,6 +3,7 @@
 """Threaded progress and NIXL transfer lifecycle for KVCR backends."""
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -309,24 +310,50 @@ class _KVCRProgress:
                 raise RuntimeError("KVCR progress thread did not stop")
         self.raise_if_failed()
 
+    def _log_startup_stage(self, stage: str) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        logger.debug(
+            "KVCR_EVENT progress_startup_stage stage=%s agent=%s pid=%d tid=%d "
+            "epoch_ns=%d monotonic_ns=%d thread_cpu_ns=%d region_bytes=%d",
+            stage,
+            self._nixl_agent_name,
+            os.getpid(),
+            threading.get_native_id(),
+            time.time_ns(),
+            time.monotonic_ns(),
+            time.thread_time_ns(),
+            sum(size for _, size in self._memory_regions),
+        )
+
     def _run(self) -> None:
         try:
             self._startup_stage = "NIXL agent initialization"
+            self._log_startup_stage("nixl_initializing")
             self._initialize_nixl()
+            self._log_startup_stage("nixl_initialized")
             # Let KVCR backends initialize NIXL resources before common
             # memory registration.
             self._startup_stage = "backend initialization"
+            self._log_startup_stage("backend_initializing")
             self._initialize(self)
+            self._log_startup_stage("backend_initialized")
             self._startup_stage = "memory registration"
+            self._log_startup_stage("memory_registering")
             self._register_memory_regions()
+            self._log_startup_stage("memory_registered")
             self._startup_stage = "agent metadata capture"
+            self._log_startup_stage("metadata_capturing")
             self._capture_agent_metadata()
+            self._log_startup_stage("metadata_captured")
             self._startup_stage = "ready"
+            self._log_startup_stage("ready")
             self._ready.set()
             while not self._stop_requested:
                 if not self._run_one_iteration():
                     time.sleep(_IDLE_WAIT_SECONDS)
         except BaseException as error:
+            self._log_startup_stage("failed:" + self._startup_stage.replace(" ", "_"))
             self._failure = error
         finally:
             self._startup_stage = "cleanup"

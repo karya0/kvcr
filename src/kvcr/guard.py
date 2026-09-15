@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from typing import Any
 
+from . import progress as _progress
 from .api import KVCRBindings
 from .config import (
     KVCRBackendConfigs,
@@ -388,6 +389,7 @@ class _Guard:
         self._configured: _TierConfig | None = None
         self._recovery = _RecoveryState(spec, compatibility_digest, pool_sizes_bytes)
         self._core = None
+        self._warm_agent = None
         self._commands: queue.Queue[_Command] = queue.Queue()
         self._ops = {
             "claim": self._claim,
@@ -584,7 +586,9 @@ class _Guard:
                 continue
             failed: BaseException | None = None
             try:
+                self._log_promotion_stage(f"command_{command.operation}_starting")
                 result = self._ops[command.operation](*command.args)
+                self._log_promotion_stage(f"command_{command.operation}_completed")
             except BaseException as error:  # noqa: BLE001 - returned to caller
                 failed = error
                 with self._phase_lock:
@@ -607,6 +611,7 @@ class _Guard:
         """Notice the current primary dying. Polled between commands on the
         actor thread, so a death and every command are totally ordered.
         """
+        started = time.monotonic_ns() if logger.isEnabledFor(logging.DEBUG) else None
         with self._phase_lock:
             if (
                 self._phase is not _Phase.PRIMARY
@@ -615,9 +620,13 @@ class _Guard:
             ):
                 return
             lease = self._pool_lease.current
+        self._log_slow_observation("death_check_lock_slow", started)
+        started = time.monotonic_ns() if logger.isEnabledFor(logging.DEBUG) else None
         flags = self._pool_lease.poll_pidfd(lease)
+        self._log_slow_observation("pidfd_poll_slow", started)
         if flags is None:
             return
+        started = time.monotonic_ns() if logger.isEnabledFor(logging.DEBUG) else None
         with self._phase_lock:
             if (
                 self._pool_lease.current is not lease
@@ -627,6 +636,7 @@ class _Guard:
                 # Interpret only while this lease is current and no transition began.
                 return
             self._reserved = _Phase.PROMOTING
+        self._log_slow_observation("promotion_lock_slow", started)
         try:
             if not flags & select.POLLIN:
                 # The process may still be alive: promoting could seat a
@@ -635,6 +645,7 @@ class _Guard:
             if lease.incarnation is not None:
                 with self._phase_lock:
                     self._dead_incarnations.add(lease.incarnation)
+            self._log_promotion_stage("death_observed")
             self._promote_for(lease)
         except BaseException as error:  # noqa: BLE001 - service-fatal
             self._fail(error)
@@ -765,6 +776,7 @@ class _Guard:
             # the claim's layout: refusing at promotion stops the service,
             # and a claimant dying in between takes everything with it.
             self._recovery.configure(tier_config.pool_layouts)
+            self._warm_transport(tier_config.remote_fw_dram_backend)
             # Last, once nothing left can refuse this claim: a pool whose handback
             # would not replay has not chosen anything, and a corrected claim can
             # still have it.
@@ -827,6 +839,7 @@ class _Guard:
         """
         if self._failure is not None:
             return False
+        started = time.monotonic_ns() if logger.isEnabledFor(logging.DEBUG) else None
         try:
             if self._serving:
                 self._core.poll_completed()
@@ -837,6 +850,8 @@ class _Guard:
             self._record_background_failure(error)
         except BaseException as error:  # noqa: BLE001 - promotion/close observes it
             self._record_background_failure(error)
+        finally:
+            self._log_slow_observation("actor_poll_slow", started)
         return False
 
     def _record_background_failure(self, error: BaseException) -> None:
@@ -858,12 +873,72 @@ class _Guard:
         except BaseException:  # noqa: BLE001 - retain the original failure
             logger.exception("Failed to notify KVCR-Service of Guard failure")
 
+    def _log_slow_observation(self, stage: str, started: int | None) -> None:
+        if started is not None:
+            elapsed = time.monotonic_ns() - started
+            if elapsed >= 100_000_000:
+                self._log_promotion_stage(stage, elapsed_ns=elapsed)
+
+    def _log_promotion_stage(
+        self,
+        stage: str,
+        recovered_blocks: int = -1,
+        agent: str = "-",
+        elapsed_ns: int = -1,
+    ) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        lease = self._pool_lease.current
+        logger.debug(
+            "KVCR_EVENT guard_promotion_stage stage=%s guard=%d pool=%s "
+            "generation=%s holder=%s agent=%s pid=%d tid=%d epoch_ns=%d "
+            "monotonic_ns=%d thread_cpu_ns=%d recovered_blocks=%d elapsed_ns=%d",
+            stage,
+            self._guard_index,
+            self._spec.pool_id,
+            self._spec.generation,
+            lease.incarnation if lease is not None else None,
+            agent,
+            os.getpid(),
+            threading.get_native_id(),
+            time.time_ns(),
+            time.monotonic_ns(),
+            time.thread_time_ns(),
+            recovered_blocks,
+            elapsed_ns,
+        )
+
+    def _warm_transport(self, backend: str) -> None:
+        # Keep UCX's process-wide cold setup off the death-to-serving path.
+        # This agent never registers pool memory or takes the control endpoint.
+        if (
+            not self._spec.resiliency_enabled
+            or backend != "UCX"
+            or self._warm_agent is not None
+        ):
+            return
+        self._log_promotion_stage("prewarm_starting")
+        self._warm_agent = _progress.nixl_agent(
+            f"KVCR-Warm-{uuid.uuid4()}",
+            _progress.nixl_agent_config(
+                num_threads=4,
+                capture_telemetry=True,
+                enable_listen_thread=True,
+                listen_port=0,
+                backends=[backend],
+            ),
+        )
+        self._log_promotion_stage("prewarm_ready")
+
     def _promote(self) -> None:
         """Take the pool over from the dead primary, warm if anything survived."""
         self._resumable = False
         if self._failure is not None:
             raise self._failure
-        self._serve(self._recovery.take_for_promotion())
+        self._log_promotion_stage("recovery_starting")
+        records = self._recovery.take_for_promotion()
+        self._log_promotion_stage("records_recovered", len(records))
+        self._serve(records)
 
     def _serve(self, records: dict[BlockKey, _BlockRecord]) -> None:
         """Answer on this pool group's endpoint, with whatever came back from it.
@@ -890,6 +965,7 @@ class _Guard:
             self._configured.remote_fw_dram_backend,
         )
         agent_name = f"KVCR-Guard-{uuid.uuid4()}"
+        self._log_promotion_stage("core_constructing", recovered_blocks, agent_name)
         core = _KVCRCore(
             KVCRConfig(
                 nixl_agent_name=agent_name,
@@ -911,16 +987,20 @@ class _Guard:
                 ),
             ),
         )
+        self._log_promotion_stage("core_constructed", recovered_blocks, agent_name)
         self._core = core
         core._remote_fw_dram._dangling_ops.dead_incarnations = (
             self._dead_incarnations.copy()
         )
         core.adopt_recovery_records(records)
+        self._log_promotion_stage("records_adopted", recovered_blocks, agent_name)
         # A previous handover describes slots this Guard is about to move, and it is
         # already in the mirror. Leaving it would map keys to overwritten bytes.
         self._recovery.release_snapshot_region()
+        self._log_promotion_stage("core_starting", recovered_blocks, agent_name)
         core.start()
         self._serving = True
+        self._log_promotion_stage("serving", recovered_blocks, agent_name)
         endpoint = self._pool_lease.bind_address
         control_endpoint = (
             "unbound" if endpoint is None else f"{endpoint[0]}:{endpoint[1]}"
@@ -962,6 +1042,7 @@ class _Guard:
                 exc_info=True,
             )
         # Every close runs regardless; the first failure is the raised one.
+        self._warm_agent = None
         failure: BaseException | None = None
         for give_back in (
             self._close_control,
