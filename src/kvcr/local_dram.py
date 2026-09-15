@@ -1099,6 +1099,25 @@ class _LocalDram:
             False,
         )
 
+    def refresh_eviction_score(self, key: BlockKey) -> None:
+        record = self._kvcr._block_record_map.get(key)
+        residency = record.local_dram if record is not None else None
+        if (
+            residency is None
+            or residency.state is not _LocalDramState.READY
+            or residency.claim_count
+        ):
+            return
+        if key in self._unscored:
+            self._make_evictable(key)
+            return
+        score = self._kvcr._policy.eviction_score(
+            self._kvcr._block_meta(key, record, self._size_bytes(residency.slots)),
+            CacheTier.LOCAL_G2,
+        )
+        if score is not None:
+            self._evictable.update_score(key, score)
+
     def _make_evictable(self, key: BlockKey) -> None:
         record = self._kvcr._block_record_map.get(key)
         if record is None:

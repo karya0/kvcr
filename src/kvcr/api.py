@@ -148,6 +148,15 @@ class KVCR:
         """Return the best currently known status and tier for each key."""
         return self._core.query(keys, request_id)
 
+    def touch(self, keys: Collection[BlockKey]) -> None:
+        """Record framework access to existing managed copies, without loading.
+
+        Missing and unready copies are ignored. Like query/deposit, call this
+        from the thread owning the framework-facing KVCR instance. This does
+        not claim blocks or confirm that a framework read completed.
+        """
+        self._core.touch(keys)
+
     def deliver(
         self,
         blocks: Mapping[BlockKey, list[MemDescriptor]],

@@ -585,6 +585,20 @@ class _G3:
             if claim.residency.claim_count == 0:
                 self._make_evictable(claim.key)
 
+    def refresh_eviction_score(self, key: BlockKey) -> None:
+        record = self._kvcr._block_record_map.get(key)
+        residency = record.g3 if record is not None else None
+        if residency is None or residency.claim_count:
+            return
+        if key in self._unscored:
+            self._make_evictable(key)
+            return
+        score = self._kvcr._policy.eviction_score(
+            self._kvcr._block_meta(key, record, self._slot_size), CacheTier.G3
+        )
+        if score is not None:
+            self._evictable.update_score(key, score)
+
     def _make_evictable(self, key: BlockKey) -> None:
         record = self._kvcr._block_record_map.get(key)
         residency = record.g3 if record is not None else None

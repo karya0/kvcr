@@ -180,6 +180,12 @@ class _EvictionQueue:
     def remove(self, key: BlockKey) -> bool:
         return self._live.pop(key, None) is not None
 
+    def update_score(self, key: BlockKey, score: float) -> None:
+        entry = self._live.get(key)
+        # A touch must not rotate FIFO or another unchanged-score policy.
+        if entry is not None and entry.score != score:
+            self.insert(key, score)
+
     def candidates(self, excluded: set[BlockKey]) -> Generator[BlockKey, None, None]:
         """Visit each key once in score order; close to restore live entries."""
         excluded = set(excluded)

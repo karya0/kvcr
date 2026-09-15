@@ -376,6 +376,22 @@ class _KVCRCore:
                 statuses.append((QueryStatus.MISS, None))
         return statuses
 
+    def touch(self, keys: Collection[BlockKey]) -> None:
+        for key in dict.fromkeys(keys):
+            record = self._block_record_map.get(key)
+            if record is None:
+                continue
+            local = record.local_dram
+            if record.g3 is None and (
+                local is None or local.state is not _LocalDramState.READY
+            ):
+                continue
+            self._record_access((key,))
+            if self._local_dram is not None:
+                self._local_dram.refresh_eviction_score(key)
+            if self._g3 is not None:
+                self._g3.refresh_eviction_score(key)
+
     # TODO: Add optional completion callbacks to movement APIs.
     def deliver(
         self,
