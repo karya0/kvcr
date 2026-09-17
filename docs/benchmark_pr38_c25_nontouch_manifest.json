@@ -1,0 +1,29 @@
+{
+  "base_image": "nvcr.io/0980761089281446/kapila-dev@sha256:36270b4f0d711316ff9290834b70441d6065c465204d2ff1cef02f5100b2daf7",
+  "branch": "karya0/kvcr:kapila/pr38-c25-nontouch",
+  "upstream_pr38": {
+    "url": "https://github.com/ai-dynamo/kvcr/pull/38",
+    "base": "95bf6e4cf2e7bf6feefc0f7c13613986c60ea939",
+    "commits": [
+      "2526ee6afc0cb307924c6d1983f5c23a405b87a8",
+      "55d0bb3cc0413fa2e215cf85e8a963ce28fe02df"
+    ]
+  },
+  "retained": [
+    "PR33 and D-prime source composition",
+    "guard prewarm and attachment population",
+    "immediate inventory reporting (10ms to 0ms)",
+    "existing diagnostics and vLLM event-batch behavior"
+  ],
+  "excluded": [
+    "KVCR paired touch commit 0e5e916fb5c4d9902d66ff012028e4d39f6a53eb",
+    "vLLM paired touch commit 2444e5a022de37af7030092d25c04b62c75ddb2e",
+    "metadata hold",
+    "receiver retention",
+    "Dynamo suffix discovery",
+    "KVCR peer refresh",
+    "new unlink revision"
+  ],
+  "unchanged_vllm_manager_sha256": "ca7b74c500ebf72f70b5ac5f6d6e792621f23b697a147cce3b43bf688a755f66",
+  "composition_head_before_manifest": "eedc5cf6640a3c52084b54ed601b34a18fc85ca1"
+}
