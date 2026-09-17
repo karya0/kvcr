@@ -138,6 +138,14 @@ class KVCRPoolAttachment:
         mapping = self._require_mapping()
         return ctypes.addressof(ctypes.c_char.from_buffer(mapping))
 
+    def populate(self) -> None:
+        """Prefault this writable mapping without changing shared cache bytes.
+
+        Linux 5.14+ is required. Python builds may omit the named constant;
+        23 is Linux's MADV_POPULATE_WRITE ABI value. Kernel errors propagate.
+        """
+        self._require_mapping().madvise(getattr(mmap, "MADV_POPULATE_WRITE", 23))
+
     @contextlib.contextmanager
     def snapshot_region(self, size: int) -> Iterator[mmap.mmap]:
         """Map `size` writable bytes past the pool, backed before they are used.

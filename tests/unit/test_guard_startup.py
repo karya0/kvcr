@@ -17,11 +17,15 @@ def test_claim_warms_once_without_serving_and_close_releases(monkeypatch):
     guard._recovery = Mock(pools=())
     agent = Mock()
     create = Mock(return_value=agent)
+    create.side_effect = lambda *args: (
+        guard._recovery.attachment.populate.assert_called_once() or agent
+    )
     monkeypatch.setattr(progress_module, "nixl_agent", create)
     first, second = Mock(), Mock()
     guard._adopt(first, _tier(16))
     guard._adopt(second, _tier(16))
     create.assert_called_once()
+    guard._recovery.attachment.populate.assert_called_once()
     assert create.call_args.args[0].startswith("KVCR-Warm-")
     assert guard._warm_agent is agent
     assert guard._core is None and not guard._serving
@@ -41,6 +45,7 @@ def test_non_ucx_and_non_resilient_claims_do_not_warm(monkeypatch, resiliency, b
     monkeypatch.setattr(progress_module, "nixl_agent", create)
     guard._adopt(Mock(), _tier(16, backend=backend))
     create.assert_not_called()
+    guard._recovery.attachment.populate.assert_not_called()
     guard._close_resources()
 
 
@@ -56,6 +61,23 @@ def test_prewarm_failure_refuses_claim_without_serving(monkeypatch):
     control.close.assert_called_once()
     assert guard._configured is None and guard._warm_agent is None
     assert guard._core is None and not guard._serving
+    guard._close_resources()
+
+
+def test_population_failure_refuses_claim_before_agent_creation(monkeypatch, caplog):
+    guard = _guard()
+    guard._recovery = Mock(pools=())
+    guard._recovery.attachment.populate.side_effect = OSError("populate failed")
+    create = Mock()
+    monkeypatch.setattr(progress_module, "nixl_agent", create)
+    control = Mock()
+    with caplog.at_level(logging.DEBUG, logger="kvcr.guard"):
+        with pytest.raises(OSError, match="populate failed"):
+            guard._adopt(control, _tier(16))
+    create.assert_not_called()
+    control.close.assert_called_once()
+    assert guard._configured is None and guard._warm_agent is None
+    assert not any("stage=mapping_populated " in r.getMessage() for r in caplog.records)
     guard._close_resources()
 
 

@@ -64,6 +64,27 @@ def test_pool_geometry_is_row_aligned_and_validated(
         assert _compute_pool_geometry(requested_bytes, block_size_bytes) == geometry
 
 
+def test_population_preserves_shared_bytes(pool_owner):
+    payload = bytes(range(256)) * (pool_owner.spec.mapping_bytes // 256)
+    Path(pool_owner.spec.path).write_bytes(payload)
+    attachment = KVCRPoolAttachment.attach(pool_owner.spec)
+    try:
+        attachment.populate()
+        assert Path(pool_owner.spec.path).read_bytes() == payload
+    finally:
+        attachment.close()
+
+
+def test_population_propagates_kernel_failure():
+    attachment = Mock(spec=KVCRPoolAttachment)
+    attachment._require_mapping.return_value.madvise.side_effect = OSError(
+        errno.EINVAL, "unsupported advice"
+    )
+    with pytest.raises(OSError, match="unsupported advice"):
+        KVCRPoolAttachment.populate(attachment)
+    attachment._require_mapping.return_value.madvise.assert_called_once_with(23)
+
+
 def test_an_allocated_pool_serves_attachments_and_only_its_owner_unlinks_it(
     tmp_path: Path,
 ) -> None:

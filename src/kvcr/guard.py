@@ -917,6 +917,9 @@ class _Guard:
             or self._warm_agent is not None
         ):
             return
+        self._log_promotion_stage("mapping_populating")
+        self._recovery.attachment.populate()
+        self._log_promotion_stage("mapping_populated")
         self._log_promotion_stage("prewarm_starting")
         self._warm_agent = _progress.nixl_agent(
             f"KVCR-Warm-{uuid.uuid4()}",
