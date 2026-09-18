@@ -406,6 +406,7 @@ class _Guard:
         self._failure: BaseException | None = None
         self._failure_callback = failure_callback or (lambda guard, error: None)
         self._last_heartbeat: float | None = None
+        self._preregister_ms = 0.0
 
     def _fail(self, error: BaseException) -> None:
         with self._phase_lock:
@@ -892,7 +893,9 @@ class _Guard:
         bound would leave hanging. G2 only, no G3: that half is kept whole for
         the replacement. A new NIXL agent name keeps peers off the dead one's.
         """
+        started = time.monotonic()
         records = self._recovery.prepare_to_serve(records)
+        prepared = time.monotonic()
         recovered_blocks = len(records)
 
         core = self._core
@@ -906,7 +909,9 @@ class _Guard:
         # A previous handover describes slots this Guard is about to move, and it is
         # already in the mirror. Leaving it would map keys to overwritten bytes.
         self._recovery.release_snapshot_region()
+        start_started = time.monotonic()
         core.start()
+        serving = time.monotonic()
         self._serving = True
         endpoint = self._pool_lease.bind_address
         control_endpoint = (
@@ -914,16 +919,23 @@ class _Guard:
         )
         logger.info(
             "KVCR_EVENT guard_promoted guard=%d pool=%s recovered_blocks=%d "
-            "agent=%s control=%s",
+            "agent=%s control=%s prepare_ms=%.3f preregister_ms=%.3f "
+            "adopt_ms=%.3f start_ms=%.3f serving_setup_ms=%.3f",
             self._guard_index,
             self._spec.pool_id,
             recovered_blocks,
             agent_name,
             control_endpoint,
+            (prepared - started) * 1000,
+            self._preregister_ms,
+            (start_started - prepared) * 1000,
+            (serving - start_started) * 1000,
+            (serving - started) * 1000,
         )
 
     def _prepare_core(self) -> None:
         """Register the Guard's pool without accepting control traffic."""
+        started = time.monotonic()
         def reject_pin(keys: object) -> int:
             raise RuntimeError("Guard has no framework-owned memory")
 
@@ -960,6 +972,7 @@ class _Guard:
         )
         self._core = core
         core.prepare()
+        self._preregister_ms = (time.monotonic() - started) * 1000
 
     def _close_core(self) -> None:
         if self._core is not None:
