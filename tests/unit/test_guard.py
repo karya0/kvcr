@@ -386,6 +386,17 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         ]
         assert len(events) == 2
         assert all("recovered_blocks=2" in event for event in events)
+        for event in events:
+            fields = dict(field.split("=", 1) for field in event.split()[2:])
+            total = float(fields["serving_setup_ms"])
+            for name in (
+                "prepare_ms",
+                "core_init_ms",
+                "adopt_ms",
+                "start_ms",
+            ):
+                assert 0 <= float(fields[name]) <= total
+            assert total >= 0
 
         guard._thread.start()
         _wait_until(lambda: cores[-1].poll_completed.call_count > 0, timeout=2)

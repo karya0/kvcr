@@ -862,7 +862,9 @@ class _Guard:
         bound would leave hanging. G2 only, no G3: that half is kept whole for
         the replacement. A new NIXL agent name keeps peers off the dead one's.
         """
+        started = time.monotonic()
         records = self._recovery.prepare_to_serve(records)
+        prepared = time.monotonic()
         recovered_blocks = len(records)
 
         def reject_pin(keys: object) -> int:
@@ -880,6 +882,7 @@ class _Guard:
             self._configured.remote_fw_dram_backend,
         )
         agent_name = f"KVCR-Guard-{uuid.uuid4()}"
+        core_started = time.monotonic()
         core = _KVCRCore(
             KVCRConfig(
                 nixl_agent_name=agent_name,
@@ -900,6 +903,7 @@ class _Guard:
                 ),
             ),
         )
+        core_ready = time.monotonic()
         self._core = core
         core._remote_fw_dram._dangling_ops.dead_incarnations = (
             self._dead_incarnations.copy()
@@ -908,7 +912,9 @@ class _Guard:
         # A previous handover describes slots this Guard is about to move, and it is
         # already in the mirror. Leaving it would map keys to overwritten bytes.
         self._recovery.release_snapshot_region()
+        start_started = time.monotonic()
         core.start()
+        serving = time.monotonic()
         self._serving = True
         endpoint = self._pool_lease.bind_address
         control_endpoint = (
@@ -916,12 +922,18 @@ class _Guard:
         )
         logger.info(
             "KVCR_EVENT guard_promoted guard=%d pool=%s recovered_blocks=%d "
-            "agent=%s control=%s",
+            "agent=%s control=%s prepare_ms=%.3f core_init_ms=%.3f "
+            "adopt_ms=%.3f start_ms=%.3f serving_setup_ms=%.3f",
             self._guard_index,
             self._spec.pool_id,
             recovered_blocks,
             agent_name,
             control_endpoint,
+            (prepared - started) * 1000,
+            (core_ready - core_started) * 1000,
+            (start_started - core_ready) * 1000,
+            (serving - start_started) * 1000,
+            (serving - started) * 1000,
         )
 
     def _hand_back(self) -> None:
