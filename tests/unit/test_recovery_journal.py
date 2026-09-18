@@ -132,6 +132,29 @@ class _Source:
         self._observer(key, record)
 
 
+@pytest.mark.parametrize("disabled", [False, True])
+def test_internal_journaling_switch(journal_and_mapping, monkeypatch, caplog, disabled):
+    journal, mapping = journal_and_mapping
+    monkeypatch.setenv("KVCR_INTERNAL_DISABLE_RESILIENCY", "1" if disabled else "0")
+    caplog.set_level("WARNING", logger="kvcr.recovery_journal")
+    for _ in range(2):
+        journal.reset()
+        reader = RecoveryJournal(_attachment(mapping, _TEST_JOURNAL_BYTES))
+        assert reader.is_invalid() is disabled
+        local_dram, g3 = _Source(), _Source()
+        _attach_journal(local_dram, journal, g3)
+        assert (local_dram._observer is None) is disabled
+        assert (g3._observer is None) is disabled
+        if disabled:
+            assert not journal.publish(_RECORD_BLOCK, b"key", b"value")
+            with pytest.raises(RecoveryJournalError, match="invalid"):
+                reader.read_next()
+        else:
+            assert journal.publish(_RECORD_BLOCK, b"key", b"value")
+            assert reader.read_next() == (_RECORD_BLOCK, b"key", b"value")
+    assert ("KVCR journaling is disabled" in caplog.text) is disabled
+
+
 def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
     journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
     caplog: pytest.LogCaptureFixture,

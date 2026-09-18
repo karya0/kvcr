@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import logging
 import mmap
+import os
 import struct
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
@@ -177,6 +178,8 @@ class RecoveryJournal:
         self._invalid.store_release(_VALID)
         self._published_local = self._consumed_local = 0
         self._invalid_local = False
+        if os.getenv("KVCR_INTERNAL_DISABLE_RESILIENCY") == "1":
+            self._invalidate("KVCR journaling is disabled for internal testing")
 
     def publish(self, record_type: int, key: bytes, payload: bytes) -> bool:
         """Publish one typed keyed frame, or permanently invalidate the journal."""
@@ -377,6 +380,9 @@ def _attach_journal(
     local_dram: _LocalDram, journal: RecoveryJournal, g3: _G3 | None = None
 ) -> None:
     """Attach stable G2/G3 residency publication to one journal."""
+    if os.getenv("KVCR_INTERNAL_DISABLE_RESILIENCY") == "1":
+        logger.warning("KVCR journaling is disabled; residency callbacks not attached")
+        return
     enabled = True
 
     def publish_frame(record_type: int, key: bytes, payload: bytes) -> None:
