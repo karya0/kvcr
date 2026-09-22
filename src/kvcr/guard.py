@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # TODO: Wake the mirror on publication rather than polling. A standby still
 # drains at roughly a fifth of the rate a primary can publish.
 _POLL_SECONDS, _POLL_BATCH = 0.001, 64
+_HEARTBEAT_TIMEOUT_SECONDS = 0.5
 _RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT)
 
 # Lease identity is the pidfd object itself: a release acts only on THIS
@@ -404,6 +405,7 @@ class _Guard:
         self._closing = False
         self._failure: BaseException | None = None
         self._failure_callback = failure_callback or (lambda guard, error: None)
+        self._last_heartbeat: float | None = None
 
     def _fail(self, error: BaseException) -> None:
         with self._phase_lock:
@@ -440,6 +442,11 @@ class _Guard:
     def release(self, lease: "_Lease") -> None:
         """End a lease. The pool keeps its Guard, and the Guard its records."""
         self._end_lease(lease, "release")
+
+    def heartbeat(self, lease: "_Lease") -> None:
+        with self._phase_lock:
+            if self._pool_lease.current is lease and not self._serving:
+                self._last_heartbeat = time.monotonic()
 
     def abort_grant(self, lease: "_Lease") -> None:
         """Roll back a lease its claimant declared it never served.
@@ -612,8 +619,13 @@ class _Guard:
             ):
                 return
             lease = self._pool_lease.current
+            heartbeat_expired = (
+                self._last_heartbeat is not None
+                and time.monotonic() - self._last_heartbeat
+                >= _HEARTBEAT_TIMEOUT_SECONDS
+            )
         flags = self._pool_lease.poll_pidfd(lease)
-        if flags is None:
+        if flags is None and not heartbeat_expired:
             return
         with self._phase_lock:
             if (
@@ -625,14 +637,23 @@ class _Guard:
                 return
             self._reserved = _Phase.PROMOTING
         try:
-            if not flags & select.POLLIN:
+            if flags is not None and not flags & select.POLLIN:
                 # The process may still be alive: promoting could seat a
                 # second server over a live mapping.
                 raise OSError(f"pidfd poll returned without POLLIN: {flags:#x}")
-            if lease.incarnation is not None:
+            if flags is None:
+                self._promote()
                 with self._phase_lock:
-                    self._dead_incarnations.add(lease.incarnation)
-            self._promote_for(lease)
+                    self._last_heartbeat = None
+                logger.warning(
+                    "KVCR Guard %d promoted after heartbeat timeout",
+                    self._guard_index,
+                )
+            else:
+                if lease.incarnation is not None:
+                    with self._phase_lock:
+                        self._dead_incarnations.add(lease.incarnation)
+                self._promote_for(lease)
         except BaseException as error:  # noqa: BLE001 - service-fatal
             self._fail(error)
         finally:
@@ -661,6 +682,7 @@ class _Guard:
             with self._phase_lock:
                 if not self._closing and not self._refusing():
                     self._pool_lease.current = liveness
+                    self._last_heartbeat = time.monotonic()
                     self._phase = _Phase.PRIMARY
                     logger.debug(
                         "KVCR_EVENT primary_attached guard=%d pool=%s control=%s:%d",
@@ -723,7 +745,8 @@ class _Guard:
     def _promote_for(self, lease: "_Lease") -> None:
         """Take the pool over from the primary that just died."""
         try:
-            self._promote()
+            if not self._serving:
+                self._promote()
         finally:
             lease.close()
             with self._phase_lock:

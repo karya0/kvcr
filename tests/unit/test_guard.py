@@ -183,6 +183,25 @@ def test_a_close_beginning_mid_poll_still_blocks_the_promotion(monkeypatch) -> N
     assert guard._phase is _Phase.PRIMARY
 
 
+def test_missed_heartbeats_promote_before_pidfd_readiness(monkeypatch) -> None:
+    guard = _configurable_guard()
+    lease = Mock(incarnation="primary")
+    guard._phase = _Phase.PRIMARY
+    guard._pool_lease.current = lease
+    guard._pool_lease.poll_pidfd = Mock(return_value=None)
+    guard._promote = Mock(side_effect=lambda: setattr(guard, "_serving", True))
+    now = [10.0]
+    monkeypatch.setattr("kvcr.guard.time.monotonic", lambda: now[0])
+
+    guard.heartbeat(lease)
+    now[0] += 0.501
+    guard._observe_holder()
+
+    guard._promote.assert_called_once_with()
+    assert guard._pool_lease.current is lease
+    assert guard._phase is _Phase.PRIMARY
+
+
 def test_a_serving_guard_reports_a_poll_failure_and_fences_its_core(caplog) -> None:
     """A mirror failure retires its journal, fences the core, and is reported."""
     error = RecoveryMirrorError("recovery record is malformed")

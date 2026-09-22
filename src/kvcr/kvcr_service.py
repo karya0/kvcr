@@ -30,12 +30,13 @@ from .control_channels import (
 from .guard import _Guard, _Lease
 from .guard_protocol import (
     _CLAIM_DECODER,
+    _HOLD_DECODER,
     _PROTOCOL_VERSION,
-    _RELEASE_DECODER,
     PidfdLiveness,
     _Claim,
     _Error,
     _Granted,
+    _Heartbeat,
     _PoolDescriptor,
     _Released,
     _TierConfig,
@@ -199,6 +200,9 @@ class _PoolRegistry:
     def release(self, guard_index: int, lease: "_Lease") -> None:
         self._guard(guard_index).release(lease)
 
+    def heartbeat(self, guard_index: int, lease: "_Lease") -> None:
+        self._guard(guard_index).heartbeat(lease)
+
     def abort_grant(self, guard_index: int, lease: "_Lease") -> None:
         """Take back a grant its claimant declared it never served."""
         self._guard(guard_index).abort_grant(lease)
@@ -319,20 +323,23 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         self._await_release(guard_index, lease)
 
     def _await_release(self, guard_index: int, lease: "_Lease") -> None:
-        """Wait for the one message a held connection may send: its release.
+        """Keep the lease alive with heartbeats until its release.
 
         The Guard actor watches the pidfd, not this thread. EOF only ends the
         connection; the lease outlives it, and a death still promotes.
         """
         while True:
             try:
-                release = self.channel.receive(_RELEASE_DECODER)
+                message = self.channel.receive(_HOLD_DECODER)
             except (EOFError, OSError):
                 return
             except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
                 self._send_error(error)
                 continue
-            if self._release_or_fail(guard_index, lease, release.activated):
+            if isinstance(message, _Heartbeat):
+                self.server.registry.heartbeat(guard_index, lease)
+                continue
+            if self._release_or_fail(guard_index, lease, message.activated):
                 with contextlib.suppress(OSError):
                     self.channel.send(_Released(_PROTOCOL_VERSION))
             return
