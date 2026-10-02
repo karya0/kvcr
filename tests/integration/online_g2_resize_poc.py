@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -224,6 +225,18 @@ def stop(process):
             process.wait(timeout=10)
 
 
+def fd_counts():
+    counts = Counter()
+    for path in Path("/proc/self/fd").iterdir():
+        try:
+            target = os.readlink(path)
+        except FileNotFoundError:
+            continue
+        kind = target.split(":", 1)[0] if ":" in target else "file"
+        counts[kind] += 1
+    return dict(counts)
+
+
 def continuous(a, a_process, b, destination, endpoint, a_path, b_path, cycles, output):
     """Keep byte-checked peer writes active across registration changes."""
     stop_event = threading.Event()
@@ -318,9 +331,11 @@ def continuous(a, a_process, b, destination, endpoint, a_path, b_path, cycles, o
                 donor = command(a_process, {"resize": donor_target})
                 assert donor["ok"]
                 resizes[-1]["donor_open_fds"] = donor["open_fds"]
+                resizes[-1]["donor_fd_types"] = donor["fd_types"]
             else:
                 assert a.resize_g2("", donor_target)
             resizes[-1]["driver_open_fds"] = len(list(Path("/proc/self/fd").iterdir()))
+            resizes[-1]["driver_fd_types"] = fd_counts()
             assert blocks(a_path) == donor_target + 8192
             assert after_bytes == target + 8192
             wait_requests(before_count + 5)
@@ -344,8 +359,11 @@ def continuous(a, a_process, b, destination, endpoint, a_path, b_path, cycles, o
         for delay in (0.1, 0.9, 2.0):
             time.sleep(delay)
             row = {"driver": len(list(Path("/proc/self/fd").iterdir()))}
+            row["driver_fd_types"] = fd_counts()
             if a_process and a_process.poll() is None:
-                row["donor"] = command(a_process, {})["open_fds"]
+                donor = command(a_process, {})
+                row["donor"] = donor["open_fds"]
+                row["donor_fd_types"] = donor["fd_types"]
             evidence["idle_fd_samples"].append(row)
         (output / "continuous.json").write_text(json.dumps(evidence, indent=2) + "\n")
     assert not thread.is_alive() and not errors, evidence
@@ -570,6 +588,7 @@ if __name__ == "__main__":
                         else True,
                         "address": read(controller),
                         "open_fds": len(list(Path("/proc/self/fd").iterdir())),
+                        "fd_types": fd_counts(),
                     }
                 )
     else:

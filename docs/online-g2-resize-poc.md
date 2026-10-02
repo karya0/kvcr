@@ -5,7 +5,7 @@ Use the stacked validation branch, which includes the online-resize implementati
 ```sh
 python tests/integration/online_g2_resize_poc.py --mode worker --output /tmp/kvcr-resize-worker
 python tests/integration/online_g2_resize_poc.py --mode service --output /tmp/kvcr-resize-service
-# Stronger diagnostic; may fail on the documented live-peer refresh defect:
+# Continuous traffic across repeated resize, with exact completion accounting:
 python tests/integration/online_g2_resize_poc.py --mode service --cycles 100 --output /tmp/kvcr-resize-stress
 ```
 
@@ -15,13 +15,13 @@ Both modes start two live instances with 32 MiB reservations, 8 MiB registration
 
 With `--cycles`, eight rolling peer writes continue across repeated donor/recipient resizes. `continuous.json` records submitted/completed/unfinished operations, byte-check failures, operation states at physical resize, backing changes, latency samples and open descriptors. Service mode keeps its source primary in another process. Active overlap is asserted, not inferred from concurrent threads. Failures preserve this evidence before teardown; a failed result is not a passing run.
 
-Repeated full metadata reloads can hit the default 1024 descriptor limit. An experiment-only higher limit isolates this from the independently observed queued-write fencing; it is not a production leak fix. The [review disposition](online-g2-resize-review.md) documents both issues.
+Repeated full metadata reloads can hit the default1024 descriptor limit in the pinned CPU UCX runtime. Tests use an experiment-only8192 limit; this is not a production leak fix. Queued-write fencing is corrected with peer drain/refresh. The [review disposition](online-g2-resize-review.md) separates verified transport behavior from the remaining backend limitation.
 
 This does not test model TTFT, cross-node RDMA, or a crash inside each transition.
 
 ## Impact experiment design
 
-Before scaling, add continuous cached-peer transfers spanning repeated resize, delayed old metadata ACKs, metadata-capture failures, and a claimed retiring tail. Require correct bytes, no stuck claims, safe refusal/retry and explicit accounting of transfer failures.
+Continuous cached-peer transfers, delayed ACKs, metadata-capture failure and claimed-tail checks now pass at small scale. Before scaling, resolve native socket retention, test crashes inside resize transitions, and integrate the backing/API with an actual engine.
 
 Then compare three arms with identical total G2 and workload: a fixed donor/recipient split (32/16 GiB), live redistribution to 16/32 GiB, and 16/32 GiB from startup. Keep the donor's working set below its final capacity; pressure the recipient's G2 while holding native CPU/GPU cache budgets constant. Make the recipient's effective working set too large for its initial G2 but small enough for its final G2. Confirm tier demand with measured residency/hits, not prompt length alone.
 
