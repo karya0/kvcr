@@ -1,9 +1,12 @@
 """Online allocator/registration contracts; physical pages tested on Linux."""
 
 import ctypes
+import hashlib
+import threading
 from contextlib import closing
 from unittest.mock import Mock
 
+import msgspec
 import pytest
 from _kvcr_test_utils import (
     FakeBytesControl,
@@ -12,6 +15,7 @@ from _kvcr_test_utils import (
     _mem_descriptor,
     _new_kvcr,
     _poll_until,
+    _router_hint,
     _wait_until,
 )
 
@@ -19,7 +23,7 @@ from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.types import BlockKey, QueryStatus
 
 
-def _controller(agent=None, chunk=32):
+def _controller(agent=None, chunk=32, percent=0, pressure=None):
     memory = ctypes.create_string_buffer(64)
     callback = Mock()
     events = []
@@ -31,9 +35,11 @@ def _controller(agent=None, chunk=32):
             nixl_agent_name="resize",
             pool_layouts=[("", 16)],
             g2_resize_granularity_bytes=chunk,
+            capacity_low_watermark_percent=percent,
         ),
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), 64)]),
         inventory_sink=events.append,
+        capacity_needed_callback=pressure,
     )
     controller._core._resize_g2_memory = callback
     return controller, memory, callback, events
@@ -144,6 +150,40 @@ def test_growth_registration_failure_keeps_old_capacity():
         assert controller.resize_g2("", 64)
 
 
+def test_growth_metadata_failure_never_admits_new_slots():
+    agent = FakeNixlAgent()
+    controller, memory, callback, _ = _controller(agent)
+    with closing(controller):
+        assert controller.resize_g2("", 32)
+        capture = agent.get_agent_metadata
+        agent.get_agent_metadata = Mock(side_effect=RuntimeError("metadata failure"))
+        with pytest.raises(RuntimeError, match="metadata failure"):
+            controller.resize_g2("", 64)
+        assert controller._core._local_dram._pools[""][1] == 32
+        assert list(controller._core._local_dram._free_slots[""]) == [0, 1]
+        callback.assert_called_with("", 64, 32)
+        agent.get_agent_metadata = capture
+        assert controller.resize_g2("", 64)
+
+
+def test_failed_physical_rollback_blocks_resize_but_keeps_serving():
+    agent = FakeNixlAgent()
+    controller, memory, callback, _ = _controller(agent)
+    with closing(controller):
+        assert controller.resize_g2("", 32)
+        register = agent.register_memory
+        agent.register_memory = Mock(side_effect=RuntimeError("registration failure"))
+        callback.side_effect = [None, RuntimeError("rollback outcome unknown")]
+        with pytest.raises(RuntimeError, match="rollback outcome unknown"):
+            controller.resize_g2("", 64)
+        agent.register_memory = register
+        callback.side_effect = None
+        with pytest.raises(RuntimeError, match="blocks further resizing"):
+            controller.resize_g2("", 64)
+        agent.state = "DONE"
+        _store(controller, memory, [BlockKey(b"still-serving")])
+
+
 def test_failed_shrink_keeps_tail_unallocatable_and_supports_retry():
     agent = FakeNixlAgent()
     controller, memory, callback, _ = _controller(agent)
@@ -178,3 +218,114 @@ def test_failed_growth_cleanup_never_releases_registered_pages():
         agent.register_memory, agent.deregister_memory = register, deregister
         agent.state = "DONE"
         _store(controller, memory, [BlockKey(b"still-serving")])
+
+
+def test_delayed_ack_cannot_suppress_resized_registration_metadata():
+    agent = FakeNixlAgent(metadata=b"old")
+    controller, _, _, _ = _controller(agent)
+    control = controller._core._remote_fw_dram._control
+    endpoint = "tcp://source:1"
+    with closing(controller):
+        controller.submit_hint(_router_hint(endpoint), "before")
+        _wait_until(lambda: bool(control.sent))
+        agent.metadata = b"new"
+        assert controller.resize_g2("", 32)
+        ack = {
+            "type": "target_metadata_ack",
+            "sender_control_endpoint": endpoint,
+            "target_metadata_digest": hashlib.sha256(b"old").digest(),
+        }
+        control.incoming.append(msgspec.msgpack.encode(ack))
+        _wait_until(lambda: not control.incoming)
+        control.sent.clear()
+        controller.submit_hint(_router_hint(endpoint), "after")
+        _wait_until(lambda: bool(control.sent))
+        message = msgspec.msgpack.decode(control.sent[-1][1])
+        assert message["target_agent_metadata"] == b"new"
+        assert message["target_metadata_digest"] == hashlib.sha256(b"new").digest()
+        ack["target_metadata_digest"] = message["target_metadata_digest"]
+        control.incoming.append(msgspec.msgpack.encode(ack))
+        _wait_until(
+            lambda: endpoint in controller._core._remote_fw_dram._metadata_acked_sources
+        )
+
+
+def test_inventory_callback_reentry_is_rejected_without_deadlock():
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    controller, memory, _, events = _controller(agent)
+    with closing(controller):
+        _store(controller, memory, [BlockKey(bytes([i])) for i in range(4)])
+
+        def callback(event):
+            try:
+                controller.resize_g2("", 32)
+            except RuntimeError as error:
+                events.append(str(error))
+
+        controller._core._inventory_sink_callback = callback
+        operator = threading.Thread(target=lambda: controller.resize_g2("", 32))
+        operator.start()
+        operator.join(timeout=1)
+        blocked = operator.is_alive()
+        if blocked:  # Release the old implementation's deadlock before teardown.
+            queued = controller._core._progress._submissions.get_nowait()
+            queued.future.set_exception(RuntimeError("test aborted deadlock"))
+            operator.join(timeout=1)
+        assert not blocked
+        assert "state lock" in events[-1]
+
+
+def test_fractional_watermark_still_requests_capacity_after_shrink():
+    pressure = []
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    controller, memory, _, _ = _controller(
+        agent, percent=50.25, pressure=pressure.append
+    )
+    with closing(controller):
+        _store(controller, memory, [BlockKey(b"held-head")], True)
+        assert controller.resize_g2("", 32)
+        assert pressure == [[("", 2)]]
+
+
+def test_caller_thread_capacity_callback_cannot_wait_with_state_lock():
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    controller, memory, _, events = _controller(agent, percent=50)
+    with closing(controller):
+        # Avoid hanging the unfixed implementation; detect whether it queues
+        # synchronous work while the real caller-side callback holds the lock.
+        controller._core._progress.call = Mock(return_value=True)
+
+        def callback(request):
+            try:
+                controller.resize_g2("", 64)
+            except RuntimeError as error:
+                events.append(str(error))
+
+        controller._core._capacity_needed_callback = callback
+        _store(controller, memory, [BlockKey(bytes([i])) for i in range(3)], True)
+        controller._core._progress.call.assert_not_called()
+        assert any(isinstance(event, str) and "state lock" in event for event in events)
+
+
+def test_shrink_metadata_failure_withholds_stale_snapshot_until_retry():
+    agent = FakeNixlAgent()
+    controller, _, callback, _ = _controller(agent)
+    with closing(controller):
+        capture = agent.get_agent_metadata
+        agent.get_agent_metadata = Mock(side_effect=RuntimeError("metadata failure"))
+        with pytest.raises(RuntimeError, match="metadata failure"):
+            controller.resize_g2("", 32)
+        assert controller._core._progress.nixl_agent_metadata is None
+        controller.submit_hint(_router_hint("tcp://new-peer:1"), "failed-refresh")
+        controller._core._progress.call(lambda: None)
+        assert not controller._core._remote_fw_dram._control.sent
+        with pytest.raises(RuntimeError, match="unfinished shrink"):
+            controller.resize_g2("", 64)
+        agent.get_agent_metadata = capture
+        assert controller.resize_g2("", 32)
+        assert controller._core._progress.nixl_agent_metadata == agent.metadata
+        assert len(agent.deregistered) == 1
+        callback.assert_called_once_with("", 64, 32)

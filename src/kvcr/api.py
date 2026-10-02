@@ -164,6 +164,10 @@ class KVCR:
         The PoC ceiling is the startup region. Worker-owned memory needs the
         resize_g2_memory binding; service-owned memory uses its held lease.
         """
+        if self._core._state_lock._is_owned():
+            raise RuntimeError(
+                "cannot resize synchronously while holding KVCR state lock"
+            )
         if self._core._local_dram is None:
             raise ValueError("resizing needs a managed local G2 pool")
         resize_memory = (

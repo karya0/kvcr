@@ -11,6 +11,7 @@ Target: hint/query -> fetch/deliver -> start_write -> write_done.
 Source: start_write -> local claim/framework pin -> write -> write_done.
 """
 
+import hashlib
 import logging
 import math
 import time
@@ -950,6 +951,9 @@ class _RemoteFWDram:
         )
         if includes_metadata:
             payload["target_agent_metadata"] = progress.nixl_agent_metadata
+            payload["target_metadata_digest"] = hashlib.sha256(
+                progress.nixl_agent_metadata
+            ).digest()
         try:
             sent = self._control.send(endpoint, msgspec.msgpack.encode(payload))
         except Exception:
@@ -1010,6 +1014,11 @@ class _RemoteFWDram:
         source_endpoint = payload.get("sender_control_endpoint")
         if not isinstance(source_endpoint, str) or not source_endpoint:
             return
+        digest = payload.get("target_metadata_digest")
+        if digest is not None or self._kvcr.config.g2_resize_granularity_bytes:
+            metadata = progress.nixl_agent_metadata
+            if metadata is None or digest != hashlib.sha256(metadata).digest():
+                return
         incarnation = payload.get("sender_incarnation")
         if isinstance(incarnation, str) and incarnation:
             self._dangling_ops.sources[source_endpoint] = incarnation
@@ -1043,6 +1052,8 @@ class _RemoteFWDram:
             "type": "target_metadata_ack",
             "sender_control_endpoint": source_control_endpoint,
         }
+        if "target_metadata_digest" in payload:
+            response["target_metadata_digest"] = payload["target_metadata_digest"]
         if payload.get("type") == "start_write":
             response["op_handle"] = payload["op_handle"]
         if not self._send_control(progress, target_control_endpoint, response):
