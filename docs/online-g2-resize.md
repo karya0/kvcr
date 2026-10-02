@@ -22,7 +22,9 @@ A small Linux same-host CPU NIXL/UCX PoC released/reallocated 16 MiB between liv
 
 Snapshot-bound ACKs, capture-before-growth-admission, callback deadlock rejection, fractional watermarks and unresolved-rollback containment now have regression coverage. Shrink capture failure withholds stale metadata until retry. See the [review disposition](online-g2-resize-review.md).
 
-Continuous rolling traffic exposed a separate blocker: changed metadata from the same process advances route generation and rejects queued writes. Full reloads also accumulate open descriptors and must not retire UCX rkeys still used by native transfers. A per-peer drain/refresh protocol is needed before arbitrary concurrent resizing. Crashes inside resize transitions remain unverified.
+Peer refresh now defers registration-bearing messages and pauses new native writes only to that peer until its existing native handles complete and release. Queued retained writes keep their generation only for the same known process incarnation and unchanged native handle; replacement/unknown peers and failed reloads remain fenced. Deferred requests retain their original deadlines. Continuous C8/100-cycle native tests pass in both ownership modes, including physical backing changes and service-owned Guard/replacement checks.
+
+Repeated full NIXL remove/reload still accumulates sockets in the pinned CPU UCX runtime, independently reproduced without KVCR or DMA. A higher test descriptor limit is a discriminator, not a production fix. Crashes inside resize transitions, large-pool performance and cross-node RDMA remain unverified.
 
 Supported scope: one pool; positive chunk-aligned sizes within the initial reservation; no automatic resizing policy; retry-based busy shrink. The ceiling is physically allocated once at bootstrap. An already-promoted Guard has no resize API. Framework integration still needs an invocation path, callback/event thread-safety validation, and a backing-memory binding for worker-owned G2. Existing routing need not change solely for resizing if eviction events are delivered correctly.
 

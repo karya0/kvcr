@@ -1056,11 +1056,12 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
     """Same peer name with new metadata re-adds the NIXL route; identical
     metadata keeps reusing the cached one."""
     agent = FakeNixlAgent()
-    progress = SimpleNamespace(nixl_agent=agent)
+    progress = SimpleNamespace(nixl_agent=agent, _in_flight_ops={})
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
         _record_progress_duration=lambda *_args: None,
         _remote_agents_by_target={},
+        _remote_incarnations={},
         _route_generation={},
     )
     payload = {"target_agent": "worker-a", "target_agent_metadata": b"gen-1"}
@@ -1085,6 +1086,210 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
     assert _RemoteFWDram._remote_agent(tier, progress, named_only) == replaced
 
 
+@pytest.mark.parametrize(
+    "incarnation,handle",
+    [
+        ("same-process", b"worker-a"),
+        ("replacement", b"worker-a"),
+        (None, b"worker-a"),
+        ("same-process", b"new-handle"),
+    ],
+)
+def test_registration_refresh_fences_only_changed_or_unknown_process(
+    incarnation,
+    handle,
+) -> None:
+    agent = FakeNixlAgent()
+    agent.add_remote_agent = lambda metadata: b"worker-a"
+    agent.remove_remote_agent = Mock()
+    tier = SimpleNamespace(
+        _kvcr=SimpleNamespace(_timer=time.monotonic),
+        _record_progress_duration=lambda *_args: None,
+        _remote_agents_by_target={},
+        _remote_incarnations={},
+        _route_generation={},
+    )
+    progress = SimpleNamespace(nixl_agent=agent, _in_flight_ops={})
+    payload = {
+        "target_agent": "worker-a",
+        "target_agent_metadata": b"small",
+        "sender_incarnation": "same-process",
+    }
+    first = _RemoteFWDram._remote_agent(tier, progress, payload)
+    agent.add_remote_agent = lambda metadata: handle
+    refreshed = _RemoteFWDram._remote_agent(
+        tier,
+        progress,
+        dict(payload, target_agent_metadata=b"larger", sender_incarnation=incarnation),
+    )
+    assert refreshed == (first[0], handle)
+    agent.remove_remote_agent.assert_called_once_with(first[1])
+    assert tier._route_generation.get("worker-a", 0) == (
+        incarnation != "same-process" or handle != first[1]
+    )
+
+
+def test_changed_incarnation_cannot_reuse_identical_metadata() -> None:
+    agent = FakeNixlAgent()
+    tier = SimpleNamespace(
+        _kvcr=SimpleNamespace(_timer=time.monotonic),
+        _record_progress_duration=lambda *_args: None,
+        _remote_agents_by_target={},
+        _remote_incarnations={},
+        _route_generation={},
+    )
+    progress = SimpleNamespace(nixl_agent=agent, _in_flight_ops={})
+    payload = {
+        "target_agent": "worker-a",
+        "target_agent_metadata": b"same",
+        "sender_incarnation": "old",
+    }
+    _RemoteFWDram._remote_agent(tier, progress, payload)
+    _RemoteFWDram._remote_agent(tier, progress, dict(payload, sender_incarnation="new"))
+    assert agent.remote_agents == [b"same", b"same"]
+    assert tier._route_generation["worker-a"] == 1
+
+
+def test_failed_same_process_reload_fences_queued_route() -> None:
+    agent = FakeNixlAgent()
+    tier = SimpleNamespace(
+        _kvcr=SimpleNamespace(_timer=time.monotonic),
+        _record_progress_duration=lambda *_args: None,
+        _remote_agents_by_target={},
+        _remote_incarnations={},
+        _route_generation={},
+    )
+    progress = SimpleNamespace(nixl_agent=agent, _in_flight_ops={})
+    payload = {
+        "target_agent": "worker-a",
+        "target_agent_metadata": b"small",
+        "sender_incarnation": "same",
+    }
+    _RemoteFWDram._remote_agent(tier, progress, payload)
+    agent.add_remote_agent = Mock(side_effect=RuntimeError("reload failed"))
+    with pytest.raises(RuntimeError, match="reload failed"):
+        _RemoteFWDram._remote_agent(
+            tier, progress, dict(payload, target_agent_metadata=b"larger")
+        )
+    assert "worker-a" not in tier._remote_agents_by_target
+    assert tier._route_generation["worker-a"] == 1
+
+
+def test_registration_refresh_drains_native_writes_before_resuming_queue() -> None:
+    class Agent(FakeNixlAgent):
+        allow_release = True
+
+        def add_remote_agent(self, metadata):
+            self.remote_agents.append(metadata)
+            return b"other" if metadata == b"other-md" else b"target"
+
+        def remove_remote_agent(self, handle):
+            assert len(self.released_xfers) == len(self.xfers)
+
+        def release_xfer_handle(self, handle):
+            if not self.allow_release:
+                return False
+            super().release_xfer_handle(handle)
+
+    agent, control = Agent(), FakeBytesControl()
+    memory = ctypes.create_string_buffer(16)
+    source = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(
+            nixl_agent_name="source",
+            pool_layouts=[("", 16)],
+            operation_timeout_ms=5000,
+            abandon_timeout_ms=10000,
+        ),
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+    )
+    key = BlockKey(b"local")
+    core, progress = source._core, source._core._progress
+    now = time.monotonic()
+    core._clock = lambda: now
+    tier = core._remote_fw_dram
+    request = msgspec.msgpack.decode(
+        _start_write_message(1, key, target_agent="target")
+    )
+    request["sender_incarnation"] = "same-process"
+    request["remaining_timeout_ms"] = 5000
+    request["sender_control_endpoint"] = "tcp://target:1"
+    request["source_control_endpoint"] = "tcp://source:1"
+    try:
+        agent.state = "DONE"
+        deposit = source.deposit({key: [_mem_descriptor(ctypes.addressof(memory))]})
+        assert _poll_until(source, bool) == [(deposit, _op_entries({key: True}))]
+        agent.state = "PROC"
+        progress.call(lambda: tier._handle_start_write(progress, request))
+        _wait_until(lambda: len(agent.xfers) == 2)
+
+        def queue_then_refresh():
+            tier._handle_start_write(progress, dict(request, op_handle=2))
+            control.incoming.append(
+                msgspec.msgpack.encode(
+                    dict(
+                        request, type="target_metadata", target_agent_metadata=b"larger"
+                    )
+                )
+            )
+            control.incoming.append(
+                msgspec.msgpack.encode(
+                    dict(
+                        request,
+                        op_handle=3,
+                        target_agent_metadata=b"larger",
+                        remaining_timeout_ms=1000,
+                    )
+                )
+            )
+            tier._process_control_messages(progress)
+
+        progress.call(queue_then_refresh)
+        assert agent.remote_agents == [b"target-md"]
+        assert len(agent.xfers) == 2
+        progress.call(
+            lambda: tier._handle_start_write(
+                progress,
+                dict(
+                    request,
+                    op_handle=4,
+                    target_agent="other",
+                    target_agent_metadata=b"other-md",
+                ),
+            )
+        )
+        _wait_until(lambda: len(agent.xfers) == 3)
+        assert (
+            agent.xfers[-1][4] == b"other"
+        )  # Another peer can submit while this one drains.
+        now += 1.1
+        progress.call(lambda: tier._process_control_messages(progress))
+        assert any(
+            payload.get("type") == "write_refused" and payload.get("op_handle") == 3
+            for _, raw in control.sent
+            for payload in [msgspec.msgpack.decode(raw)]
+        )  # Deferral does not grant request 3 a new deadline.
+        agent.allow_release = False
+        agent.state = "DONE"
+        progress.call(lambda: None)
+        assert agent.remote_agents == [b"target-md", b"other-md"]
+        assert len(agent.xfers) == 3  # DONE alone is not enough; release must succeed.
+        agent.allow_release = True
+        _poll_until(
+            source,
+            lambda _: len(agent.xfers) == 4 and not _has_outstanding_operations(source),
+        )
+        assert agent.remote_agents == [b"target-md", b"other-md", b"larger"]
+        assert len(agent.released_xfers) == 4
+        assert tier._route_generation.get("target", 0) == 0
+        assert not agent.sent_notifs  # No failure notification for the queued write.
+    finally:
+        agent.state = "DONE"
+        source.close()
+
+
 def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
     """NIXL must drop the dead route before the name is reused -- and a route
     it will not drop stays cached so the unload is retried, not forgotten."""
@@ -1098,11 +1303,12 @@ def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
             self.removed.append(handle)
 
     agent = RemovingAgent()
-    progress = SimpleNamespace(nixl_agent=agent)
+    progress = SimpleNamespace(nixl_agent=agent, _in_flight_ops={})
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
         _record_progress_duration=lambda *_args: None,
         _remote_agents_by_target={},
+        _remote_incarnations={},
         _route_generation={},
     )
     _, first = _RemoteFWDram._remote_agent(
@@ -1122,7 +1328,7 @@ def test_a_replaced_route_unloads_its_predecessor_or_keeps_it_visibly() -> None:
             raise RuntimeError("route busy")
 
     sticky = StickyAgent()
-    progress = SimpleNamespace(nixl_agent=sticky)
+    progress = SimpleNamespace(nixl_agent=sticky, _in_flight_ops={})
     tier._remote_agents_by_target = {}
     tier._route_generation = {}
     _, kept = _RemoteFWDram._remote_agent(
