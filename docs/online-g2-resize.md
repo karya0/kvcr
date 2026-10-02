@@ -72,4 +72,4 @@ Repeated full NIXL remove/reload still accumulates sockets in the pinned CPU UCX
 
 Supported scope: one pool; positive chunk-aligned sizes within the initial reservation; no automatic resizing policy; retry-based busy shrink. The ceiling is physically allocated once at bootstrap. An already-promoted Guard has no resize API. Framework integration still needs an invocation path, callback/event thread-safety validation, and a backing-memory binding for worker-owned G2. Existing routing need not change solely for resizing if eviction events are delivered correctly.
 
-Unit tests cover allocator/registration ordering and selected failures. A separate stacked validation branch supplies the small native Linux PoC; neither is a production engine integration.
+Unit tests cover allocator/registration ordering and selected failures. This branch also includes the [small native Linux PoC](online-g2-resize-poc.md); it is not a production engine integration.

@@ -1,6 +1,6 @@
 # Small native online-resize validation
 
-Use the stacked validation branch, which includes the online-resize implementation and a standalone Linux test. Prerequisites: Python with KVCR dependencies including NIXL 1.3.2, a working CPU UCX backend, and at least 256 MiB free tmpfs under `/dev/shm`. No GPUs or model weights are required. Run from the repository root using that environment:
+Use `poc/online-g2-resize`, which includes the implementation, unit tests, usage guide and standalone Linux test. The old `poc/online-g2-resize-validation` branch is retained for existing links, not separate development. Prerequisites: Python with KVCR dependencies including NIXL 1.3.2, a working CPU UCX backend, and at least 256 MiB free tmpfs under `/dev/shm`. No GPUs or model weights are required. Run from the repository root using that environment:
 
 ```sh
 python tests/integration/online_g2_resize_poc.py --mode worker --output /tmp/kvcr-resize-worker
