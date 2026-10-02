@@ -291,6 +291,8 @@ class _KVCRProgress:
 
     def call(self, callback: Callable[[], Any]) -> Any:
         """Run an operator command on the NIXL-owning thread."""
+        if threading.current_thread() is self._thread:
+            raise RuntimeError("cannot synchronously call from KVCR progress thread")
         self.raise_if_failed()
         if not self._thread.is_alive():
             raise RuntimeError("KVCR progress is stopped")

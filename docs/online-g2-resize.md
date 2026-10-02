@@ -20,7 +20,9 @@ A small Linux same-host CPU NIXL/UCX PoC released/reallocated 16 MiB between liv
 
 ## Review blockers and limits
 
-Independent review found that delayed pre-resize metadata ACKs can mark an obsolete registration snapshot current after the ACK cache was cleared, suppressing refresh. Growth also admits slots before capturing updated metadata; a capture exception can leave enlarged capacity serving with old metadata. A callback that synchronously calls resize again can deadlock the progress thread waiting on itself. Fractional pressure-watermark rounding and failed service rollback also need correction/reconciliation. See the [review disposition](online-g2-resize-review.md). These need targeted fixes and regression coverage before expanding use. Changed-metadata remote-agent reload during an ongoing transfer and crashes inside resize transitions remain unverified.
+Snapshot-bound ACKs, capture-before-growth-admission, callback deadlock rejection, fractional watermarks and unresolved-rollback containment now have regression coverage. Shrink capture failure withholds stale metadata until retry. See the [review disposition](online-g2-resize-review.md).
+
+Continuous rolling traffic exposed a separate blocker: changed metadata from the same process advances route generation and rejects queued writes. Full reloads also accumulate open descriptors and must not retire UCX rkeys still used by native transfers. A per-peer drain/refresh protocol is needed before arbitrary concurrent resizing. Crashes inside resize transitions remain unverified.
 
 Supported scope: one pool; positive chunk-aligned sizes within the initial reservation; no automatic resizing policy; retry-based busy shrink. The ceiling is physically allocated once at bootstrap. An already-promoted Guard has no resize API. Framework integration still needs an invocation path, callback/event thread-safety validation, and a backing-memory binding for worker-owned G2. Existing routing need not change solely for resizing if eviction events are delivered correctly.
 

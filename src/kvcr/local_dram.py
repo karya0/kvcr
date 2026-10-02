@@ -8,6 +8,7 @@ from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from math import ceil
 from typing import TYPE_CHECKING, cast
 
 from .config import LocalDramOptions
@@ -229,9 +230,7 @@ class _LocalDram:
             )
         with kvcr._state_lock:
             if self._resize_quarantined:
-                raise RuntimeError(
-                    "failed registration cleanup blocks further resizing"
-                )
+                raise RuntimeError("unresolved resize blocks further resizing")
             pending = self._resize_pending.get(name)
             if pending is not None and size != pending[1]:
                 raise RuntimeError("retry the unfinished shrink before another resize")
@@ -251,17 +250,23 @@ class _LocalDram:
                     return False
                 victims.append((key, record, residency))
             if size > old_size:
-                resize_memory(name, old_size, size)
+                try:
+                    resize_memory(name, old_size, size)
+                except Exception:
+                    self._resize_quarantined = True
+                    raise
                 try:
                     kvcr._progress.register_extent(address + old_size, size - old_size)
+                    kvcr._progress._capture_agent_metadata()
                 except Exception:
-                    if any(
-                        address + old_size <= start < address + size
-                        for start, _ in kvcr._progress._region_registrations
-                    ):
+                    try:
+                        kvcr._progress.deregister_extent(
+                            address + old_size, size - old_size
+                        )
+                        resize_memory(name, size, old_size)
+                    except Exception:
                         self._resize_quarantined = True
                         raise
-                    resize_memory(name, size, old_size)
                     raise
                 self._free_slots[name].extend(
                     range(old_size // block_size, size // block_size)
@@ -284,13 +289,19 @@ class _LocalDram:
                     [key for key, _, _ in victims], CacheTier.LOCAL_G2, removed=True
                 )
                 physical_old, _ = self._resize_pending[name]
-                kvcr._progress.deregister_extent(address + size, physical_old - size)
-                resize_memory(name, physical_old, size)
-                del self._resize_pending[name]
-            kvcr._capacity_low_watermarks[name] = (
-                size // block_size * kvcr.config.capacity_low_watermark_percent + 99
-            ) // 100
-            kvcr._progress._capture_agent_metadata()
+                kvcr._progress._nixl_agent_metadata = None
+                if physical_old > size:
+                    kvcr._progress.deregister_extent(
+                        address + size, physical_old - size
+                    )
+                    resize_memory(name, physical_old, size)
+                    self._resize_pending[name] = (size, size)
+            kvcr._capacity_low_watermarks[name] = ceil(
+                size // block_size * kvcr.config.capacity_low_watermark_percent / 100
+            )
+            if size <= old_size:
+                kvcr._progress._capture_agent_metadata()
+            self._resize_pending.pop(name, None)
             kvcr._remote_fw_dram._metadata_acked_sources.clear()
             kvcr._remote_fw_dram._metadata_retry_after.clear()
             self._update_capacity_pressure()
