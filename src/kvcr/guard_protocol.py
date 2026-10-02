@@ -112,6 +112,12 @@ class _Release(msgspec.Struct, frozen=True, tag="release"):
     activated: bool = True
 
 
+class _Resize(msgspec.Struct, frozen=True, tag="resize"):
+    pool_name: str
+    size_bytes: Annotated[int, msgspec.Meta(gt=0)]
+    version: ProtocolVersion
+
+
 class _Granted(msgspec.Struct, frozen=True, tag="granted"):
     guard_index: int
     spec: KVCRPoolSpec
@@ -119,9 +125,14 @@ class _Granted(msgspec.Struct, frozen=True, tag="granted"):
     pools: tuple[_PoolDescriptor, ...]
     version: ProtocolVersion
     dead_incarnations: tuple[str, ...] = ()
+    reserved_tail_bytes: Annotated[int, msgspec.Meta(ge=0)] = 0
 
 
 class _Released(msgspec.Struct, frozen=True, tag="released"):
+    version: ProtocolVersion
+
+
+class _Resized(msgspec.Struct, frozen=True, tag="resized"):
     version: ProtocolVersion
 
 
@@ -132,6 +143,8 @@ class _Error(msgspec.Struct, frozen=True, tag="error"):
 
 _CLAIM_DECODER = msgspec.msgpack.Decoder(_Claim)
 _RELEASE_DECODER = msgspec.msgpack.Decoder(_Release)
+_LEASE_DECODER = msgspec.msgpack.Decoder(_Release | _Resize)
+_RESIZE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Resized | _Error)
 _CLAIM_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Granted | _Error)
 _RELEASE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Released | _Error)
 
@@ -225,6 +238,18 @@ class KVCRPoolHold:
     _incarnation: str | None = None
     _dead_incarnations: tuple[str, ...] = ()
     _release_attempted: bool = field(default=False, init=False, repr=False)
+
+    def resize_g2(self, name: str, old_size: int, size: int) -> None:
+        self._connection.send(_Resize(name, size, _PROTOCOL_VERSION))
+        response = self._connection.receive(_RESIZE_RESPONSE_DECODER)
+        if isinstance(response, _Error):
+            raise KVCRServiceError(response.message)
+        self._pools = tuple(
+            _PoolDescriptor(pool.name, size, pool.block_size_bytes, pool.offset_bytes)
+            if pool.name == name
+            else pool
+            for pool in self._pools
+        )
 
     def hand_listener_to(self, adopt: Callable[[int], None]) -> None:
         """Adopt-then-disown: a failed adoption leaves this hold owning the fd,
@@ -401,7 +426,7 @@ def _grant_layout(
         ):
             raise KVCRGuardProtocolError(f"claim pool {index} layout mismatch")
         expected_offset += pool.size_bytes
-    if expected_offset != response.spec.mapping_bytes:
+    if expected_offset + response.reserved_tail_bytes != response.spec.mapping_bytes:
         raise KVCRGuardProtocolError("claim pool sizes do not fill the allocation")
     return response.spec, pools
 

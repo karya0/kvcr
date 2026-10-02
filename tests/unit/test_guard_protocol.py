@@ -189,6 +189,20 @@ def _grant(
     )
 
 
+def test_resized_grant_must_account_for_the_reserved_tail():
+    reply = _grant(mapping_bytes=_MAPPING_BYTES + mmap.PAGESIZE)
+    with pytest.raises(KVCRGuardProtocolError, match="do not fill"):
+        protocol_module._grant_layout(reply, _GUARD_INDEX, _TIER_CONFIG)
+    reply = msgspec.structs.replace(reply, reserved_tail_bytes=mmap.PAGESIZE)
+    assert (
+        protocol_module._grant_layout(reply, _GUARD_INDEX, _TIER_CONFIG)[1]
+        == _WIRE_POOLS
+    )
+    reply = msgspec.structs.replace(reply, reserved_tail_bytes=2 * mmap.PAGESIZE)
+    with pytest.raises(KVCRGuardProtocolError, match="do not fill"):
+        protocol_module._grant_layout(reply, _GUARD_INDEX, _TIER_CONFIG)
+
+
 def _grant_with_pool(index: int = 0, **changes) -> _Granted:
     pools = list(_WIRE_POOLS)
     pools[index] = msgspec.structs.replace(pools[index], **changes)

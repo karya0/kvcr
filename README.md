@@ -111,6 +111,9 @@ for source installation and verification.
 For local development, API lifecycle guidance, validation, integration, and
 KVCR guard service usage, see the [developer guide](docs/dev-guide.md).
 
+This research branch also contains an [online G2 resize prototype](docs/online-g2-resize.md),
+with known review blockers; it is not a production-ready feature.
+
 ## License
 
 KVCR is released under the Apache License 2.0. The full license text is in

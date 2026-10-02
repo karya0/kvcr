@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Threaded progress and NIXL transfer lifecycle for KVCR backends."""
 
+import concurrent.futures
 import logging
 import queue
 import sys
@@ -65,6 +66,12 @@ _Flush = Callable[[], list[object]]
 _Close = Callable[[], None]
 
 
+@dataclass
+class _Call:
+    callback: Callable[[], Any]
+    future: concurrent.futures.Future
+
+
 class _KVCRProgress:
     """Run backend progress on one exclusively owning thread."""
 
@@ -80,9 +87,15 @@ class _KVCRProgress:
         nixl_agent_name: str | None = None,
         nixl_listen_port: int | None = None,
         memory_regions: tuple[tuple[int, int], ...] = (),
+        memory_registration_granularity: int = 0,
     ) -> None:
         if batch_size < 0:
             raise ValueError("batch_size must be non-negative")
+        if (
+            type(memory_registration_granularity) is not int
+            or memory_registration_granularity < 0
+        ):
+            raise ValueError("registration granularity must be a non-negative integer")
         self._initialize = initialize
         self._poll = poll
         self._flush = flush
@@ -95,6 +108,8 @@ class _KVCRProgress:
         self._nixl_listen_port = nixl_listen_port
         self._dram_backends = dram_backends
         self._memory_regions = memory_regions
+        self._registration_granularity = memory_registration_granularity
+        self._region_registrations: dict[tuple[int, int], Any] = {}
         self._memory_registrations: list[Any] = []
         self._nixl_agent_metadata: bytes | None = None
         self._submissions: queue.SimpleQueue[object] = queue.SimpleQueue()
@@ -274,6 +289,23 @@ class _KVCRProgress:
         self.raise_if_failed()
         self._submissions.put(item)
 
+    def call(self, callback: Callable[[], Any]) -> Any:
+        """Run an operator command on the NIXL-owning thread."""
+        self.raise_if_failed()
+        if not self._thread.is_alive():
+            raise RuntimeError("KVCR progress is stopped")
+        future = concurrent.futures.Future()
+        self._submissions.put(_Call(callback, future))
+        while True:
+            try:
+                return future.result(timeout=0.1)
+            except concurrent.futures.TimeoutError:
+                if future.done():
+                    return future.result()
+                self.raise_if_failed()
+                if not self._thread.is_alive():
+                    raise RuntimeError("KVCR progress stopped during operator command")
+
     def take_completed(self) -> list[object]:
         completed: list[object] = []
         while len(completed) < self._batch_size:
@@ -380,7 +412,12 @@ class _KVCRProgress:
 
         backend_items: list[object] = []
         for item in submissions:
-            if isinstance(item, _ProgressOp):
+            if isinstance(item, _Call):
+                try:
+                    item.future.set_result(item.callback())
+                except Exception as error:
+                    item.future.set_exception(error)
+            elif isinstance(item, _ProgressOp):
                 self._in_flight_ops[item.op_id] = item
             else:
                 backend_items.append(item)
@@ -424,12 +461,43 @@ class _KVCRProgress:
     def _register_memory_regions(self) -> None:
         if self._nixl_agent is None or not self._memory_regions:
             return
+        if self._registration_granularity:
+            for address, size in self._memory_regions:
+                self.register_extent(address, size)
+            return
         self._memory_registrations.append(
             self._nixl_agent.register_memory(
                 [(address, size, 0, "") for address, size in self._memory_regions],
                 mem_type="DRAM",
             )
         )
+
+    def register_extent(self, address: int, size: int) -> None:
+        granularity = self._registration_granularity
+        if granularity <= 0:
+            raise ValueError("resizing requires chunked registration")
+        added = []
+        try:
+            for offset in range(0, size, granularity):
+                region = (address + offset, min(granularity, size - offset))
+                registration = self.nixl_agent.register_memory(
+                    [(region[0], region[1], 0, "")], mem_type="DRAM"
+                )
+                self._region_registrations[region] = registration
+                self._memory_registrations.append(registration)
+                added.append(region)
+        except Exception:
+            for region in reversed(added):
+                self.deregister_extent(*region)
+            raise
+
+    def deregister_extent(self, address: int, size: int) -> None:
+        for region, registration in list(self._region_registrations.items()):
+            if address <= region[0] and region[0] + region[1] <= address + size:
+                if self.nixl_agent.deregister_memory(registration) is False:
+                    raise RuntimeError("NIXL refused retiring registration")
+                del self._region_registrations[region]
+                self._memory_registrations.remove(registration)
 
     def _capture_agent_metadata(self) -> None:
         get_agent_metadata = getattr(self._nixl_agent, "get_agent_metadata", None)
@@ -457,6 +525,7 @@ class _KVCRProgress:
                     pending_registrations.append(registration)
         self._memory_registrations = list(reversed(pending_registrations))
         if not self._memory_registrations:
+            self._region_registrations.clear()
             self._nixl_agent_metadata = None
             self._nixl_agent = None
         if failure is not None:

@@ -75,6 +75,7 @@ class KVCRBindings:
 
     # Resilience failures and transfer lifecycle events; defaults to logging.
     on_resilience_event: Callable[[Exception], None] | None = None
+    resize_g2_memory: Callable[[str, int, int], None] | None = None
 
 
 class KVCR:
@@ -156,6 +157,25 @@ class KVCR:
     ) -> None:
         """Record sequence positions and align recency for ready managed keys."""
         self._core.align_sequence(ordered_keys, use_current_time)
+
+    def resize_g2(self, pool_name: str, size_bytes: int) -> bool:
+        """Resize a chunk-aligned G2 extent; False means its tail is busy.
+
+        The PoC ceiling is the startup region. Worker-owned memory needs the
+        resize_g2_memory binding; service-owned memory uses its held lease.
+        """
+        if self._core._local_dram is None:
+            raise ValueError("resizing needs a managed local G2 pool")
+        resize_memory = (
+            self._pool_hold.resize_g2
+            if self._pool_hold is not None
+            else self._core._resize_g2_memory
+        )
+        if resize_memory is None:
+            raise ValueError("worker-owned resize needs a physical memory binding")
+        return self._core._progress.call(
+            lambda: self._core._local_dram.resize(pool_name, size_bytes, resize_memory)
+        )
 
     def deliver(
         self,

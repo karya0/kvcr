@@ -30,14 +30,16 @@ from .control_channels import (
 from .guard import _Guard, _Lease
 from .guard_protocol import (
     _CLAIM_DECODER,
+    _LEASE_DECODER,
     _PROTOCOL_VERSION,
-    _RELEASE_DECODER,
     PidfdLiveness,
     _Claim,
     _Error,
     _Granted,
     _PoolDescriptor,
     _Released,
+    _Resize,
+    _Resized,
     _TierConfig,
 )
 from .memory import (
@@ -326,11 +328,20 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         """
         while True:
             try:
-                release = self.channel.receive(_RELEASE_DECODER)
+                release = self.channel.receive(_LEASE_DECODER)
             except (EOFError, OSError):
                 return
             except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
                 self._send_error(error)
+                continue
+            if isinstance(release, _Resize):
+                try:
+                    self.server.registry._guard(guard_index).resize(
+                        lease, release.pool_name, release.size_bytes
+                    )
+                    self.channel.send(_Resized(_PROTOCOL_VERSION))
+                except Exception as error:
+                    self._send_error(error)
                 continue
             if self._release_or_fail(guard_index, lease, release.activated):
                 with contextlib.suppress(OSError):
@@ -425,6 +436,8 @@ class _ThreadingUnixServer(
                 pools,
                 _PROTOCOL_VERSION,
                 dead_incarnations=guard.dead_incarnations,
+                reserved_tail_bytes=spec.data_bytes
+                - sum(pool.size_bytes for pool in pools),
             ),
             (request.guard_index, listener_fd, lease),
         )

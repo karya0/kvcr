@@ -192,6 +192,11 @@ class _LocalDram:
         ] = {}
         self._next_copy_id = 1
         self._next_release_handle = 1
+        self._reservation_lengths = {
+            name: length for name, (_, length, _) in self._pools.items()
+        }
+        self._resize_pending: dict[str, tuple[int, int]] = {}
+        self._resize_quarantined = False
         # A no-op until something attaches: the tiers publish residency
         # changes unconditionally, and only recovery cares to hear them.
         self._residency_observer: Callable[[BlockKey, "_BlockRecord"], None] = (
@@ -201,6 +206,95 @@ class _LocalDram:
     @property
     def memory_regions(self) -> tuple[tuple[int, int], ...]:
         return tuple((address, length) for address, length, _ in self._pools.values())
+
+    def resize(
+        self, name: str, size: int, resize_memory: Callable[[str, int, int], None]
+    ) -> bool:
+        """PoC: stable-address, one-pool growth/shrink on the progress thread."""
+        kvcr = self._kvcr
+        chunk = kvcr.config.g2_resize_granularity_bytes
+        if len(self._pools) != 1 or chunk <= 0:
+            raise ValueError("resize PoC requires one pool and chunked registration")
+        address, old_size, block_size = self._pools[name]
+        if (
+            type(size) is not int
+            or size <= 0
+            or size > self._reservation_lengths[name]
+            or size % chunk
+            or old_size % chunk
+            or chunk % block_size
+        ):
+            raise ValueError(
+                "resize must fit the reservation and complete chunks/blocks"
+            )
+        with kvcr._state_lock:
+            if self._resize_quarantined:
+                raise RuntimeError(
+                    "failed registration cleanup blocks further resizing"
+                )
+            pending = self._resize_pending.get(name)
+            if pending is not None and size != pending[1]:
+                raise RuntimeError("retry the unfinished shrink before another resize")
+            victims = []
+            for key, record in kvcr._block_record_map.items():
+                residency = record.local_dram
+                if residency is None or not any(
+                    pool == name and slot >= size // block_size
+                    for pool, slot in residency.slots
+                ):
+                    continue
+                if (
+                    residency.state is not _LocalDramState.READY
+                    or residency.claim_count
+                    or record.in_flight_ops
+                ):
+                    return False
+                victims.append((key, record, residency))
+            if size > old_size:
+                resize_memory(name, old_size, size)
+                try:
+                    kvcr._progress.register_extent(address + old_size, size - old_size)
+                except Exception:
+                    if any(
+                        address + old_size <= start < address + size
+                        for start, _ in kvcr._progress._region_registrations
+                    ):
+                        self._resize_quarantined = True
+                        raise
+                    resize_memory(name, size, old_size)
+                    raise
+                self._free_slots[name].extend(
+                    range(old_size // block_size, size // block_size)
+                )
+                self._pools[name] = (address, size, block_size)
+            elif size < old_size or pending is not None:
+                self._resize_pending[name] = pending or (old_size, size)
+                for key, record, residency in victims:
+                    self._remove_evictable(key, residency)
+                    record.local_dram = None
+                    self._residency_observer(key, record)
+                    self._free(residency.slots)
+                    kvcr._on_remove(kvcr._block_meta(key, record, block_size))
+                    kvcr._prune_block_record(key)
+                self._free_slots[name] = deque(
+                    slot for slot in self._free_slots[name] if slot < size // block_size
+                )
+                self._pools[name] = (address, size, block_size)
+                kvcr._publish_inventory(
+                    [key for key, _, _ in victims], CacheTier.LOCAL_G2, removed=True
+                )
+                physical_old, _ = self._resize_pending[name]
+                kvcr._progress.deregister_extent(address + size, physical_old - size)
+                resize_memory(name, physical_old, size)
+                del self._resize_pending[name]
+            kvcr._capacity_low_watermarks[name] = (
+                size // block_size * kvcr.config.capacity_low_watermark_percent + 99
+            ) // 100
+            kvcr._progress._capture_agent_metadata()
+            kvcr._remote_fw_dram._metadata_acked_sources.clear()
+            kvcr._remote_fw_dram._metadata_retry_after.clear()
+            self._update_capacity_pressure()
+            return True
 
     def observe_residency(
         self, observer: Callable[[BlockKey, "_BlockRecord"], None]

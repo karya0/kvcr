@@ -488,11 +488,16 @@ def claimed_core(
     fail runs against it: a startup that released the pool without closing the
     core would leave it mapping bytes the next claimant is given.
     """
-    return _KVCRCore(
+    core = _KVCRCore(
         config,
         bindings,
         replace(backend_configs, local_dram=claimed.hold.local_dram),
     )
+    if config.g2_resize_granularity_bytes and len(core.pool_layouts) == 1:
+        core._local_dram._reservation_lengths[core.pool_layouts[0][0]] = (
+            claimed.hold._attachment._spec.data_bytes
+        )
+    return core
 
 
 def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:

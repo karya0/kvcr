@@ -139,6 +139,7 @@ class _KVCRCore:
         self.framework_control = bindings.framework_control
         self._inventory_sink_callback = bindings.inventory_sink
         self._capacity_needed_callback = bindings.capacity_needed_callback
+        self._resize_g2_memory = bindings.resize_g2_memory
         self._stats_factory = bindings.stats_factory
         local_dram_config = backend_configs.local_dram
         g3_config = backend_configs.g3
@@ -277,6 +278,7 @@ class _KVCRCore:
             nixl_listen_port=self.config.nixl_listen_port,
             dram_backends=list(dram_backends),
             memory_regions=tuple(memory_regions),
+            memory_registration_granularity=config.g2_resize_granularity_bytes,
         )
 
     def start(self) -> None:

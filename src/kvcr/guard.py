@@ -389,6 +389,7 @@ class _Guard:
         self._core = None
         self._commands: queue.Queue[_Command] = queue.Queue()
         self._ops = {
+            "resize": self._resize,
             "claim": self._claim,
             "release": self._stand_down,
             "abort": self._abort,
@@ -442,6 +443,26 @@ class _Guard:
     def release(self, lease: "_Lease") -> None:
         """End a lease. The pool keeps its Guard, and the Guard its records."""
         self._end_lease(lease, "release")
+
+    def resize(self, lease: "_Lease", name: str, size: int) -> None:
+        self._submit(_Command("resize", (lease, name, size)))
+
+    def _resize(self, lease: "_Lease", name: str, size: int) -> None:
+        if self._phase is not _Phase.PRIMARY or self._pool_lease.current is not lease:
+            raise KVCRServiceError("resize requires the current primary lease")
+        pools = self._recovery.pools
+        if len(pools) != 1 or pools[0].name != name:
+            raise KVCRServiceError("resize PoC requires one matching pool")
+        pool = pools[0]
+        if size % pool.block_size_bytes or size <= 0:
+            raise KVCRServiceError("resize must contain complete blocks")
+        while self._recovery.poll():
+            pass
+        self._recovery.attachment.resize_data(pool.offset_bytes, pool.size_bytes, size)
+        self._recovery._pool_sizes_bytes = (size,)
+        self._recovery.pools = (
+            _PoolDescriptor(name, size, pool.block_size_bytes, pool.offset_bytes),
+        )
 
     def abort_grant(self, lease: "_Lease") -> None:
         """Roll back a lease its claimant declared it never served.

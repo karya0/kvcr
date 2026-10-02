@@ -20,6 +20,28 @@ _POOL_MODE = 0o600
 _POOL_PREFIX = "kvcr"
 
 
+def _resize_file_data(fd: int, offset: int, old_size: int, size: int) -> None:
+    """Back/release pages without moving any mapping or changing file length."""
+    if (offset | old_size | size) % mmap.PAGESIZE:
+        raise ValueError("physical resize must be page aligned")
+    if size > old_size:
+        _populate_pages(fd, offset + old_size, size - old_size)
+    elif size < old_size:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fallocate = libc.fallocate
+        fallocate.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_longlong,
+            ctypes.c_longlong,
+        ]
+        fallocate.restype = ctypes.c_int
+        # PUNCH_HOLE | KEEP_SIZE: release physical pages, preserve mapped extent.
+        if fallocate(fd, 3, offset + size, old_size - size):
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
+
 def _snapshot_offset(mapping_bytes: int) -> int:
     """Where a pool's handback region starts, past everything it was granted."""
     granularity = mmap.ALLOCATIONGRANULARITY
@@ -182,6 +204,14 @@ class KVCRPoolAttachment:
         claimant at a time.
         """
         os.ftruncate(self._file_descriptor, _snapshot_offset(self._spec.mapping_bytes))
+
+    def resize_data(self, offset: int, old_size: int, size: int) -> None:
+        if (
+            offset < self._spec.journal_bytes
+            or offset + max(old_size, size) > self._spec.mapping_bytes
+        ):
+            raise ValueError("resize exceeds service reservation")
+        _resize_file_data(self._file_descriptor, offset, old_size, size)
 
     def close(self) -> None:
         """Unmap the pool without unlinking the server-owned file."""
