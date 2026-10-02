@@ -3,12 +3,14 @@
 import argparse
 import ctypes
 import json
+import logging
 import os
 import selectors
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import ExitStack
 from pathlib import Path
@@ -26,6 +28,7 @@ from kvcr.config import (
 from kvcr.control_channels import ZmqPeerControlChannel
 from kvcr.kvcr_service import _KVCRService
 from kvcr.memory import KVCRPoolAttachment, _KVCRPoolOwner
+from kvcr.remote_fw_dram import _SourceWriteOp
 from kvcr.types import BlockKey, MemDescriptor
 
 MiB = 1 << 20
@@ -33,6 +36,27 @@ MAX = 32 * MiB
 CHUNK = 8 * MiB
 ROOT = BlockKey(b"root")
 DIGEST = "online-g2-resize-poc-v1"
+
+# Research-only discriminator: an unchanged process must not fence a retained
+# destination merely because its registration snapshot changed during resize.
+_source_progress = _SourceWriteOp.progress
+
+
+def traced_source_progress(operation, progress, event):
+    name, generation = operation.route
+    current = operation._backend._route_generation.get(name, 0)
+    if operation.transfer_id is None and name and generation != current:
+        logging.warning(
+            "RESIZE_ROUTE_FENCE op=%s target=%s queued=%s current=%s",
+            operation.op_id,
+            name,
+            generation,
+            current,
+        )
+    return _source_progress(operation, progress, event)
+
+
+_SourceWriteOp.progress = traced_source_progress
 
 
 class RootKeys:
@@ -82,8 +106,10 @@ def make(stack, directory, rank, service=False, bind_port=None):
         attachment = KVCRPoolAttachment.attach(owner.spec)
         stack.callback(attachment.close)
         local = LocalDramOptions([("", attachment.data_address, MAX)])
+
         def callback(name, old, new):
             attachment.resize_data(8192, old, new)
+
     controller = KVCR(
         KVCRConfig(
             nixl_agent_name=f"resize-{os.getpid()}-{rank}-{time.monotonic_ns()}",
@@ -198,7 +224,138 @@ def stop(process):
             process.wait(timeout=10)
 
 
-def run(mode, output):
+def continuous(a, a_process, b, destination, endpoint, a_path, b_path, cycles, output):
+    """Keep byte-checked peer writes active across registration changes."""
+    stop_event = threading.Event()
+    samples, errors, overlaps, states, resizes = [], [], [], [], []
+    accounting = {"submitted": 0, "unfinished": []}
+    owner = b._pool_hold if b._pool_hold is not None else b._core
+    attribute = "resize_g2" if b._pool_hold is not None else "_resize_g2_memory"
+    original = getattr(owner, attribute)
+
+    def backing(name, old, new):
+        overlaps.append(len(b._core._progress._in_flight_ops))
+        states.append(
+            [
+                getattr(op.state, "name", str(op.state))
+                for op in b._core._progress._in_flight_ops.values()
+            ]
+        )
+        original(name, old, new)
+
+    setattr(owner, attribute, backing)
+
+    def traffic():
+        pending = {}
+        try:
+            free_slots = list(range(8))
+            while pending or not stop_event.is_set():
+                while free_slots and not stop_event.is_set():
+                    slot = free_slots.pop()
+                    request = f"continuous-{accounting['submitted']}"
+                    hint(b, endpoint, request)
+                    address = ctypes.addressof(destination) + slot * MiB
+                    ctypes.memset(address, 0, MiB)
+                    operation = b.deliver(
+                        {
+                            ROOT: [
+                                MemDescriptor(
+                                    b.config.nixl_agent_name, "DRAM", address, MiB, 0
+                                )
+                            ]
+                        },
+                        request,
+                    )
+                    accounting["submitted"] += 1
+                    pending[operation] = (slot, address, time.monotonic())
+                for operation, entries in b.poll_completed():
+                    slot, address, stamp = pending.pop(operation)
+                    assert all(result.success for result in entries.values()), entries
+                    assert ctypes.string_at(address, MiB) == b"a" * MiB
+                    samples.append(
+                        (time.monotonic(), (time.monotonic() - stamp) * 1000)
+                    )
+                    free_slots.append(slot)
+                if any(time.monotonic() - item[2] > 30 for item in pending.values()):
+                    raise TimeoutError(f"continuous transfers stuck: {list(pending)}")
+                time.sleep(0.001)
+        except Exception as error:
+            errors.append(repr(error))
+            stop_event.set()
+        finally:
+            accounting["unfinished"] = list(pending)
+
+    def wait_requests(count):
+        deadline = time.monotonic() + 30
+        while len(samples) < count:
+            assert not errors, errors
+            if time.monotonic() > deadline:
+                raise TimeoutError("continuous traffic made no progress")
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=traffic)
+    thread.start()
+    baseline = 20
+    try:
+        wait_requests(baseline)
+        for cycle in range(cycles):
+            before_count = len(samples)
+            target = (8 if cycle % 2 == 0 else 24) * MiB
+            before_bytes = blocks(b_path)
+            stamp = time.monotonic()
+            assert b.resize_g2("", target)
+            after_bytes = blocks(b_path)
+            resizes.append(
+                {
+                    "target_bytes": target,
+                    "backed_bytes": after_bytes,
+                    "delta_bytes": after_bytes - before_bytes,
+                    "latency_ms": (time.monotonic() - stamp) * 1000,
+                }
+            )
+            donor_target = (32 if cycle % 2 == 0 else 16) * MiB
+            if a_process:
+                donor = command(a_process, {"resize": donor_target})
+                assert donor["ok"]
+                resizes[-1]["donor_open_fds"] = donor["open_fds"]
+            else:
+                assert a.resize_g2("", donor_target)
+            resizes[-1]["driver_open_fds"] = len(list(Path("/proc/self/fd").iterdir()))
+            assert blocks(a_path) == donor_target + 8192
+            assert after_bytes == target + 8192
+            wait_requests(before_count + 5)
+    finally:
+        stop_event.set()
+        thread.join(timeout=35)
+        setattr(owner, attribute, original)
+        evidence = {
+            "case": "continuous-cached-peer",
+            "cycles": cycles,
+            "completed": len(samples),
+            **accounting,
+            "errors": errors,
+            "thread_stopped": not thread.is_alive(),
+            "live_ops_at_backing_change": overlaps,
+            "live_op_states_at_backing_change": states,
+            "requests": samples,
+            "resizes": resizes,
+        }
+        evidence["idle_fd_samples"] = []
+        for delay in (0.1, 0.9, 2.0):
+            time.sleep(delay)
+            row = {"driver": len(list(Path("/proc/self/fd").iterdir()))}
+            if a_process and a_process.poll() is None:
+                row["donor"] = command(a_process, {})["open_fds"]
+            evidence["idle_fd_samples"].append(row)
+        (output / "continuous.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    assert not thread.is_alive() and not errors, evidence
+    assert len(samples) >= baseline + cycles * 5
+    assert accounting["submitted"] == len(samples) and not accounting["unfinished"]
+    assert any(overlaps), "no active peer operation observed during resizing"
+    return evidence
+
+
+def run(mode, output, cycles=0):
     started = time.monotonic()
     output.mkdir(parents=True, exist_ok=True)
     records = []
@@ -285,6 +442,20 @@ def run(mode, output):
                 "remote_read_into_grown_chunk": True,
             }
         )
+        if cycles:
+            records.append(
+                continuous(
+                    a if not a_process else None,
+                    a_process,
+                    b,
+                    b_source,
+                    source_endpoint,
+                    a_path,
+                    b_path,
+                    cycles,
+                    output,
+                )
+            )
         if a_process:
             a_process.kill()
             a_process.wait(timeout=10)
@@ -367,6 +538,7 @@ if __name__ == "__main__":
     parser.add_argument("--primary", type=Path)
     parser.add_argument("--mode", choices=["worker", "service"], default="worker")
     parser.add_argument("--output", type=Path, default=Path("results"))
+    parser.add_argument("--cycles", type=int, default=0)
     args = parser.parse_args()
     if args.service:
         service = _KVCRService(
@@ -393,9 +565,12 @@ if __name__ == "__main__":
                 payload = json.loads(line)
                 emit(
                     {
-                        "ok": controller.resize_g2("", payload["resize"]),
+                        "ok": controller.resize_g2("", payload["resize"])
+                        if "resize" in payload
+                        else True,
                         "address": read(controller),
+                        "open_fds": len(list(Path("/proc/self/fd").iterdir())),
                     }
                 )
     else:
-        run(args.mode, args.output)
+        run(args.mode, args.output, args.cycles)

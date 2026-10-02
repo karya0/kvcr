@@ -5,13 +5,19 @@ Use the stacked validation branch, which includes the online-resize implementati
 ```sh
 python tests/integration/online_g2_resize_poc.py --mode worker --output /tmp/kvcr-resize-worker
 python tests/integration/online_g2_resize_poc.py --mode service --output /tmp/kvcr-resize-service
+# Stronger diagnostic; may fail on the documented live-peer refresh defect:
+python tests/integration/online_g2_resize_poc.py --mode service --cycles 100 --output /tmp/kvcr-resize-stress
 ```
 
 Choose unused output directories for each run; preserve prior evidence. The script imports this checkout's source, creates its own temporary pool directory and processes, and cleans them up on normal exit. It saves operation results in `result.json`; service mode also saves service/primary logs. Failure is an assertion, exception or nonzero exit, not a successful result.
 
 Both modes start two live instances with 32 MiB reservations, 8 MiB registration chunks and 1 MiB synthetic blocks. They shrink A from 32 to 16 MiB and grow B from 8 to 24 MiB. Checks include actual 16 MiB backing-page release and reallocation (`st_blocks * 512`), unchanged retained addresses/bytes, remote reading into grown chunks, and filling the new capacity. Service mode subsequently kills the resized primary, verifies Guard remote delivery into a zeroed destination, then claims a replacement at 16 MiB and regrows it to 32 MiB.
 
-This does not test model TTFT, cross-node RDMA, sustained concurrent resize, or a crash inside each transition. In particular, the metadata ACK/capture blockers in the [prototype summary](online-g2-resize.md) are not disproved by this sequential success case.
+With `--cycles`, eight rolling peer writes continue across repeated donor/recipient resizes. `continuous.json` records submitted/completed/unfinished operations, byte-check failures, operation states at physical resize, backing changes, latency samples and open descriptors. Service mode keeps its source primary in another process. Active overlap is asserted, not inferred from concurrent threads. Failures preserve this evidence before teardown; a failed result is not a passing run.
+
+Repeated full metadata reloads can hit the default 1024 descriptor limit. An experiment-only higher limit isolates this from the independently observed queued-write fencing; it is not a production leak fix. The [review disposition](online-g2-resize-review.md) documents both issues.
+
+This does not test model TTFT, cross-node RDMA, or a crash inside each transition.
 
 ## Impact experiment design
 
