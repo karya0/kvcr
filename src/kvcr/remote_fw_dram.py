@@ -51,6 +51,10 @@ if TYPE_CHECKING:
 _MEM_DESCRIPTOR_LISTS_TYPE = tuple[tuple[MemDescriptor, ...], ...]
 
 
+class _PeerRefreshPending(Exception):
+    """A registration snapshot must wait for native writes to drain."""
+
+
 @dataclass(slots=True)
 class _FwMemResidency:
     descriptors: list[MemDescriptor]
@@ -336,6 +340,8 @@ class _SourceWriteOp(_RemoteOp):
                 # refusal instead of receiving the dead generation's bytes.
                 self.state = _SourceWriteState.NOTIFY_FAILURE
                 return False, True
+            if route_name in backend._refreshing_targets:
+                return False, False
             if not self.src_descriptors:
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, True
@@ -517,6 +523,9 @@ class _RemoteFWDram:
         self._progress_metrics: list[tuple[str, str, int | float, tuple[str, ...]]] = []
         self._telemetry_enabled = kvcr.config.enable_telemetry
         self._remote_agents_by_target: dict[str, tuple[bytes, bytes]] = {}
+        self._remote_incarnations: dict[str, str | None] = {}
+        self._refreshing_targets: set[str] = set()
+        self._deferred_control: list[tuple[dict[str, Any], float]] = []
         # Bumped whenever a name's route is replaced: NIXL hands the same
         # handle back for a reused name, so queued operations from the dead
         # generation must be fenced by number, not by handle.
@@ -890,7 +899,9 @@ class _RemoteFWDram:
         except Exception:
             logger.warning("KVCR control receive failed", exc_info=True)
             return False
-        handled = False
+        pending = self._deferred_control
+        self._deferred_control = []
+        self._refreshing_targets.clear()
         for message in messages:
             try:
                 payload = msgspec.msgpack.decode(message)
@@ -898,23 +909,30 @@ class _RemoteFWDram:
                 continue
             if not isinstance(payload, dict):
                 continue
+            pending.append((payload, self._kvcr._clock()))
+        handled = False
+        for payload, received_at in pending:
             message_type = payload.get("type")
             if not isinstance(message_type, str):
                 continue
             handled_at = self._kvcr._timer()
-            if message_type == "target_metadata":
-                self._handle_target_metadata(progress, payload)
-            elif message_type == "target_metadata_ack":
-                self._handle_target_metadata_ack(progress, payload)
-            elif message_type == "write_refused":
-                self._handle_write_refused(progress, payload)
-            elif message_type == "write_probe":
-                self._dangling_ops.handle_probe(progress, payload)
-            elif message_type == "write_probe_ack":
-                self._dangling_ops.handle_probe_ack(progress, payload)
-            elif message_type == "start_write":
-                self._handle_start_write(progress, payload)
-            else:
+            try:
+                if message_type == "target_metadata":
+                    self._handle_target_metadata(progress, payload)
+                elif message_type == "target_metadata_ack":
+                    self._handle_target_metadata_ack(progress, payload)
+                elif message_type == "write_refused":
+                    self._handle_write_refused(progress, payload)
+                elif message_type == "write_probe":
+                    self._dangling_ops.handle_probe(progress, payload)
+                elif message_type == "write_probe_ack":
+                    self._dangling_ops.handle_probe_ack(progress, payload)
+                elif message_type == "start_write":
+                    self._handle_start_write(progress, payload, received_at=received_at)
+                else:
+                    continue
+            except _PeerRefreshPending:
+                self._deferred_control.append((payload, received_at))
                 continue
             handled = True
             self._record_progress_duration(
@@ -981,6 +999,8 @@ class _RemoteFWDram:
         try:
             target_agent, _ = self._remote_agent(progress, payload)
             self._ack_target_metadata(progress, payload, target_agent)
+        except _PeerRefreshPending:
+            raise
         except Exception:
             return
 
@@ -1069,10 +1089,15 @@ class _RemoteFWDram:
     # -------------------------------------------------------------------------
 
     def _handle_start_write(
-        self, progress: _KVCRProgress, payload: dict[str, Any]
+        self,
+        progress: _KVCRProgress,
+        payload: dict[str, Any],
+        *,
+        received_at: float | None = None,
     ) -> None:
         started_at = self._kvcr._timer()
-        received_at = self._kvcr._clock()
+        if received_at is None:
+            received_at = self._kvcr._clock()
         op_handle = payload.get("op_handle")
         if type(op_handle) is not int:
             logger.warning("KVCR malformed start_write: invalid op_handle")
@@ -1107,12 +1132,17 @@ class _RemoteFWDram:
             self._kvcr.config.operation_timeout_ms,
         )
         deadline = received_at + remaining_timeout_ms / 1000
+        if self._kvcr._clock() >= deadline:
+            self._notify_start_write_failure(progress, payload, op_handle)
+            return
         try:
             fallback_target = dst_descriptors[0][0].end_point_name
             target_agent, remote_agent = self._remote_agent(
                 progress, payload, fallback_target=fallback_target
             )
             self._ack_target_metadata(progress, payload, target_agent)
+        except _PeerRefreshPending:
+            raise
         except Exception:
             logger.warning(
                 "KVCR start_write setup failed for op=%d", op_handle, exc_info=True
@@ -1733,26 +1763,44 @@ class _RemoteFWDram:
         if not isinstance(target_agent, str) or not target_agent:
             raise TypeError("missing target agent")
         target_metadata = payload.get("target_agent_metadata")
+        incarnation = payload.get("sender_incarnation")
+        incarnation = (
+            incarnation if isinstance(incarnation, str) and incarnation else None
+        )
+        same_process = incarnation is not None and (
+            self._remote_incarnations.get(target_agent) == incarnation
+        )
         cached = self._remote_agents_by_target.get(target_agent)
         if cached is not None:
             cached_metadata, remote_agent = cached
-            if not isinstance(target_metadata, bytes) or (
-                target_metadata == cached_metadata
+            changed_process = incarnation is not None and (
+                self._remote_incarnations.get(target_agent) not in (None, incarnation)
+            )
+            if not changed_process and (
+                not isinstance(target_metadata, bytes)
+                or target_metadata == cached_metadata
             ):
                 reused_at = kvcr._timer()
                 self._record_progress_duration("peer_setup", reused_at, "reused")
                 return target_agent, remote_agent
-            # Same name, new metadata: the process behind the name was replaced,
-            # and the cached route still points at the dead one. A route that
-            # cannot be unloaded propagates: the retained entry retries next
-            # time instead of silently keeping the dead destination.
+            if not isinstance(target_metadata, bytes):
+                raise TypeError("missing replacement agent metadata")
+            if any(
+                isinstance(op, _SourceWriteOp)
+                and op.route[0] == target_agent
+                and op.transfer_id in progress._active_transfers
+                for op in progress._in_flight_ops.values()
+            ):
+                self._refreshing_targets.add(target_agent)
+                raise _PeerRefreshPending
             remove = getattr(agent, "remove_remote_agent", None)
             if remove is not None:
                 remove(remote_agent)
             self._remote_agents_by_target.pop(target_agent, None)
-            self._route_generation[target_agent] = (
-                self._route_generation.get(target_agent, 0) + 1
-            )
+            if not same_process:
+                self._route_generation[target_agent] = (
+                    self._route_generation.get(target_agent, 0) + 1
+                )
         started_at = kvcr._timer()
         try:
             if not isinstance(target_metadata, bytes):
@@ -1761,10 +1809,19 @@ class _RemoteFWDram:
             if not isinstance(remote_agent, bytes) or not remote_agent:
                 raise RuntimeError("add_remote_agent returned no agent name")
         except Exception:
+            if cached is not None and same_process:
+                self._route_generation[target_agent] = (
+                    self._route_generation.get(target_agent, 0) + 1
+                )
             self._record_progress_duration("peer_setup", started_at, "failed")
             raise
+        if cached is not None and same_process and remote_agent != cached[1]:
+            self._route_generation[target_agent] = (
+                self._route_generation.get(target_agent, 0) + 1
+            )
         self._record_progress_duration("peer_setup", started_at, "connected")
         self._remote_agents_by_target[target_agent] = (target_metadata, remote_agent)
+        self._remote_incarnations[target_agent] = incarnation
         return target_agent, remote_agent
 
     # Progress notifications, telemetry, and resource cleanup.

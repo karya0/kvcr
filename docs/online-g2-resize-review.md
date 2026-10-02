@@ -12,11 +12,11 @@ Corrected with focused regressions:
 
 The stale-content claim from cached **source** registration metadata was not established: transfers acquire current key residency/claims before constructing their source descriptors. This is distinct from stale **destination** registration metadata after growth.
 
-Follow-up verification passed 384 Linux unit tests. Small native worker/service checks passed repeated resize with overlapping peer transfers, physical RAM release/reallocation, and completed-resize Guard/replacement recovery. Stronger rolling-concurrency stress exposed remaining defects:
+Follow-up small native worker/service checks passed overlapping peer transfers, physical RAM release/reallocation, and completed-resize Guard/replacement recovery. Stronger rolling-concurrency stress exposed defects, followed by a reviewed transport correction:
 
-- Same live target, new registration snapshot: route generation changes from 31 to 32 and fences queued source writes. A service-mode run failed delivery after 32 resize cycles, despite sufficient file descriptors.
-- Full NIXL remove/reload also retires UCX remote rkeys. Preserving queued-operation generation alone is unsafe while native transfers still reference them. A per-peer drain/refresh transition must preserve deadlines and keep progress polling.
-- Repeated full reloads accumulate open descriptors. A 100-cycle worker run grew from 188 to 1119 open descriptors; the default 1024 limit caused an earlier stress failure. Raising the experiment limit to 8192 isolates this from the queued-write failure; it does not fix descriptor retention.
+- Corrected: same-process refresh preserves queued generations only for a known unchanged incarnation/handle. Real or unknown replacement and reload failure fence prior queued writes.
+- Corrected: registration refresh waits for native DONE and successful handle release while progress continues; new writes to that peer pause and other peers continue. Deferred requests keep original deadlines. Focused tests cover release failure, expiry and peer isolation. Two consecutive C8/100-cycle CPU native passes completed all deliveries in both ownership modes.
+- Remaining: repeated full reloads accumulate sockets. A standalone NIXL test without KVCR, resizing or DMA grew sockets70→870 across100 remove/reload cycles, while registration-only and peer-reuse controls stayed flat. Raising the test limit to8192 is not a production fix.
 
 The native test uses CPU UCX on one host, not model serving or cross-node RDMA. Do not infer production readiness or model TTFT/throughput improvements. Crash-at-each-transition behavior remains unverified.
 
