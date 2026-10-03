@@ -204,9 +204,13 @@ class KVCR:
                         else max(current - chunk, size_bytes)
                     )
                 )
-                if not self._core._progress.call(
-                    lambda: dram.resize(pool_name, target, resize_memory)
-                ):
+                queued = time.monotonic()
+
+                def resize_step():
+                    self._core._record_duration("resize_queue", queued, "success")
+                    return dram.resize(pool_name, target, resize_memory)
+
+                if not self._core._progress.call(resize_step):
                     result = "busy"
                     return False
                 steps += 1

@@ -27,7 +27,9 @@ from kvcr.recovery_journal import install_recovery_records
 from kvcr.types import BlockKey, QueryStatus
 
 
-def _controller(agent=None, chunk=32, percent=0, pressure=None, initial=64):
+def _controller(
+    agent=None, chunk=32, percent=0, pressure=None, initial=64, telemetry=False
+):
     memory = ctypes.create_string_buffer(64)
     callback = Mock()
     events = []
@@ -40,6 +42,7 @@ def _controller(agent=None, chunk=32, percent=0, pressure=None, initial=64):
             pool_layouts=[("", 16)],
             g2_resize_granularity_bytes=chunk,
             capacity_low_watermark_percent=percent,
+            enable_telemetry=telemetry,
         ),
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), initial)]),
         inventory_sink=events.append,
@@ -66,7 +69,7 @@ def _store(controller, memory, keys, no_evict=False):
 def test_shrink_grow_retains_address_inventory_and_default_progress():
     agent = FakeNixlAgent()
     agent.state = "DONE"
-    controller, memory, callback, events = _controller(agent)
+    controller, memory, callback, events = _controller(agent, telemetry=True)
     keys = [BlockKey(bytes([i])) for i in range(4)]
     with closing(controller):
         _store(controller, memory, keys)
@@ -83,6 +86,12 @@ def test_shrink_grow_retains_address_inventory_and_default_progress():
         _store(controller, memory, [BlockKey(b"new")])
         assert controller.resize_g2("", 32)
         assert controller.query([BlockKey(b"new")])[0][0] is QueryStatus.MISS
+        waits = [
+            value for kind, name, value, labels in controller.get_stats().records
+            if kind == "histogram" and name == "kvcr_duration_seconds"
+            and labels == ("resize_queue", "success")
+        ]
+        assert len(waits) == 3 and all(value >= 0 for value in waits)
 
 
 def test_resize_tracks_recovered_slots():
