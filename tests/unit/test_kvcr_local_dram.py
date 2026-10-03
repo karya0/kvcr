@@ -26,6 +26,7 @@ from _kvcr_test_utils import (
 )
 
 from kvcr import core as core_module
+from kvcr import local_dram as local_dram_module
 from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.core import _BlockRecord
 from kvcr.local_dram import _LocalDramResidency, _LocalDramState
@@ -65,6 +66,72 @@ def _two_pool_kvcr(agent, pools, config=None, capacity_needed_callback=None):
         ),
         capacity_needed_callback=capacity_needed_callback,
     )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_completion_timing_is_opt_in(monkeypatch, caplog, enabled):
+    monkeypatch.setenv("KVCR_COMPLETION_TIMING", "1" if enabled else "0")
+    agent = FakeNixlAgent()
+    local = ctypes.create_string_buffer(16)
+    source = ctypes.create_string_buffer(b"a" * 16)
+    kvcr = _new_local_kvcr(agent, local, 1)
+    core = kvcr._core
+    observer = Mock()
+    core._local_dram.observe_residency(observer)
+    if not enabled:
+        assert core._completion_timing is None
+        assert core._local_dram._residency_observer is observer
+
+        def forbidden():
+            pytest.fail("disabled completion timing read a diagnostic clock")
+
+        monkeypatch.setattr(core_module, "time", SimpleNamespace(monotonic=forbidden))
+        monkeypatch.setattr(
+            local_dram_module, "time", SimpleNamespace(monotonic=forbidden)
+        )
+    operation = kvcr.deposit(
+        {BlockKey(b"k"): [_mem_descriptor(ctypes.addressof(source))]}
+    )
+    _wait_until(lambda: len(agent.transfers) == 1)
+    agent.state = "DONE"
+    completed = _poll_until(kvcr, lambda results: bool(results))
+    assert completed[0][0] == operation
+    assert observer.call_count == 1
+    destination = ctypes.create_string_buffer(16)
+    delivery = kvcr.deliver(
+        {BlockKey(b"k"): [_mem_descriptor(ctypes.addressof(destination))]}
+    )
+    completed = _poll_until(kvcr, lambda results: bool(results))
+    assert completed[0][0] == delivery
+    assert destination.raw == source.raw[:16]
+    assert not any(
+        "KVCR_COMPLETION_TIMING" in record.message for record in caplog.records
+    )
+    if enabled:
+        timing = core._completion_timing
+        assert timing["fill_completions"] == 1
+        assert timing["deliver_completions"] == 1
+        assert timing["residency_callbacks"] == 1
+        assert timing["fill_progress_reaped_to_main_seconds"] >= 0
+        assert timing["deliver_progress_reaped_to_main_seconds"] >= 0
+        assert timing["residency_seconds"] >= 0
+        core._completion_timing_last = 0
+        local_logger = Mock()
+        monkeypatch.setattr(core_module, "logger", local_logger)
+
+        def log_outside_lock(*args):
+            assert not core._state_lock._is_owned()
+
+        local_logger.warning.side_effect = log_outside_lock
+        kvcr.poll_completed()
+        local_logger.warning.assert_called_once()
+        report = local_logger.warning.call_args.args[1]
+        assert report["fill_completions"] == 1
+        assert report["poll_batches"] > 0
+        assert report["lock_wait_seconds"] >= 0
+        assert report["lock_held_seconds"] >= report["residency_seconds"]
+        kvcr.poll_completed()
+        local_logger.warning.assert_called_once()
 
 
 @pytest.mark.parametrize("history", [False, True])

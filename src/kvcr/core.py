@@ -8,7 +8,7 @@ import logging
 import os
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from itertools import islice
@@ -182,6 +182,12 @@ class _KVCRCore:
             raise ValueError("G3 requires configured local DRAM")
         # Serialize caller metadata transactions with progress-side source claims.
         self._state_lock = threading.RLock()
+        self._completion_timing: Counter[str] | None = (
+            Counter() if os.getenv("KVCR_COMPLETION_TIMING") == "1" else None
+        )
+        self._completion_timing_last = (
+            time.monotonic() if self._completion_timing is not None else 0
+        )
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
         self._capacity_pressure_pools: set[str] = set()
         self._closed = False
@@ -591,12 +597,30 @@ class _KVCRCore:
         self._notify_transfer_errors(self._progress.take_completed())
         progress_items = self._pending_progress_items
         self._pending_progress_items = []
+        timing = self._completion_timing
+        report = None
+        if timing is not None:
+            wait_started = time.monotonic()
         with self._state_lock:
+            if timing is not None:
+                acquired = time.monotonic()
+                timing["lock_wait_seconds"] += acquired - wait_started
+                timing["poll_batches"] += 1
+                timing["progress_items"] += len(progress_items)
             if self._g3 is not None:
                 progress_items = self._g3.poll_main(progress_items)
             if self._local_dram is not None:
                 progress_items = self._local_dram.poll_main(progress_items)
             self._remote_fw_dram.poll_main(progress_items)
+            if timing is not None:
+                now = time.monotonic()
+                timing["lock_held_seconds"] += now - acquired
+                if now - self._completion_timing_last >= 10:
+                    report = dict(timing)
+                    timing.clear()
+                    self._completion_timing_last = now
+        if report is not None:
+            logger.warning("KVCR_COMPLETION_TIMING %s", report)
         completed = self._completion_queue
         self._completion_queue = []
         return completed

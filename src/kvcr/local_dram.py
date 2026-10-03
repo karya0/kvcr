@@ -3,6 +3,7 @@
 """KVCR-owned local DRAM slots, claims, and transfers."""
 
 import logging
+import time
 from collections import Counter, deque
 from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
@@ -91,6 +92,8 @@ class _LocalCopyOp(_ProgressOp):
     transfer_id: int | None = None
     success: bool = False
     cancellation_requested: bool = False
+    capture_completion: bool = False
+    completed_at: float | None = None
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -130,6 +133,8 @@ class _LocalCopyOp(_ProgressOp):
             return False, observed_work
         self.transfer_id = None
         self.success, _ = result
+        if self.capture_completion:
+            self.completed_at = time.monotonic()
         return True, True
 
     def close(self, progress: _KVCRProgress) -> bool:
@@ -205,7 +210,20 @@ class _LocalDram:
     def observe_residency(
         self, observer: Callable[[BlockKey, "_BlockRecord"], None]
     ) -> None:
-        self._residency_observer = observer
+        timing = self._kvcr._completion_timing
+        if timing is None:
+            self._residency_observer = observer
+        else:
+
+            def timed_observer(key: BlockKey, record: "_BlockRecord") -> None:
+                started = time.monotonic()
+                try:
+                    observer(key, record)
+                finally:
+                    timing["residency_callbacks"] += 1
+                    timing["residency_seconds"] += time.monotonic() - started
+
+            self._residency_observer = timed_observer
 
     def adopt_recovery_slots(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
         """Take the rows already-recovered records name, before the core starts.
@@ -356,6 +374,7 @@ class _LocalDram:
                     backend=self._backend,
                     clock=self._kvcr._clock,
                     started_at=self._kvcr._timer(),
+                    capture_completion=self._kvcr._completion_timing is not None,
                 )
             )
             self._next_copy_id += 1
@@ -582,6 +601,17 @@ class _LocalDram:
         return unhandled
 
     def _finish_copy(self, copy: _LocalCopyOp) -> None:
+        if copy.completed_at is not None:
+            timing = self._kvcr._completion_timing
+            operation = "deliver" if copy.deliver_op_id is not None else "fill"
+            timing[f"{operation}_completions"] += 1
+            timing[f"{operation}_progress_reaped_to_main_seconds"] += (
+                time.monotonic() - copy.completed_at
+            )
+            if copy.started_at is not None:
+                timing[f"{operation}_enqueue_to_progress_reaped_seconds"] += (
+                    copy.completed_at - copy.started_at
+                )
         byte_count = sum(descriptor.size for descriptor in copy.src_descriptors)
         self._kvcr._record_transfer(
             "local_deliver" if copy.deliver_op_id is not None else "local_fill",
@@ -794,6 +824,7 @@ class _LocalDram:
                     backend=self._backend,
                     clock=self._kvcr._clock,
                     started_at=self._kvcr._timer(),
+                    capture_completion=self._kvcr._completion_timing is not None,
                 )
             )
             self._next_copy_id += 1
@@ -976,6 +1007,9 @@ class _LocalDram:
                             backend=self._backend,
                             clock=self._kvcr._clock,
                             started_at=self._kvcr._timer(),
+                            capture_completion=(
+                                self._kvcr._completion_timing is not None
+                            ),
                         )
                     )
                     self._next_copy_id += 1
