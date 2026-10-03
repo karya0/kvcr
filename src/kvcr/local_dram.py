@@ -3,9 +3,10 @@
 """KVCR-owned local DRAM slots, claims, and transfers."""
 
 import logging
+import time
 from collections import Counter, deque
 from collections.abc import Callable, Collection, Mapping
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from math import ceil
@@ -30,6 +31,28 @@ if TYPE_CHECKING:
     from .core import _BlockRecord, _KVCRCore
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _resize_stage(kvcr, stage: str, name: str, old_size: int, size: int):
+    started = time.monotonic()
+    result = "failed"
+    try:
+        yield
+        result = "success"
+    finally:
+        kvcr._record_duration("resize_" + stage, started, result)
+        logger.info(
+            "G2 resize stage=%s pool=%s old_bytes=%s target_bytes=%s "
+            "result=%s elapsed_ms=%.3f",
+            stage,
+            name,
+            old_size,
+            size,
+            result,
+            (time.monotonic() - started) * 1000,
+        )
+
 
 _Clock = Callable[[], float]
 
@@ -208,10 +231,7 @@ class _LocalDram:
     def memory_regions(self) -> tuple[tuple[int, int], ...]:
         return tuple((address, length) for address, length, _ in self._pools.values())
 
-    def resize(
-        self, name: str, size: int, resize_memory: Callable[[str, int, int], None]
-    ) -> bool:
-        """PoC: stable-address, one-pool growth/shrink on the progress thread."""
+    def validate_resize(self, name: str, size: int) -> int:
         kvcr = self._kvcr
         chunk = kvcr.config.g2_resize_granularity_bytes
         if len(self._pools) != 1 or chunk <= 0:
@@ -228,79 +248,103 @@ class _LocalDram:
             raise ValueError(
                 "resize must fit the reservation and complete chunks/blocks"
             )
+        if self._resize_quarantined:
+            raise RuntimeError("unresolved resize blocks further resizing")
+        pending = self._resize_pending.get(name)
+        if pending is not None and size > pending[1]:
+            raise RuntimeError("retry the unfinished shrink before another resize")
+        return old_size
+
+    def resize(
+        self, name: str, size: int, resize_memory: Callable[[str, int, int], None]
+    ) -> bool:
+        """Stable-address, single-quantum transition on the progress thread."""
+        self.validate_resize(name, size)
+        kvcr = self._kvcr
+        address, old_size, block_size = self._pools[name]
         with kvcr._state_lock:
-            if self._resize_quarantined:
-                raise RuntimeError("unresolved resize blocks further resizing")
             pending = self._resize_pending.get(name)
-            if pending is not None and size != pending[1]:
-                raise RuntimeError("retry the unfinished shrink before another resize")
-            victims = []
-            for key, record in kvcr._block_record_map.items():
-                residency = record.local_dram
-                if residency is None or not any(
-                    pool == name and slot >= size // block_size
-                    for pool, slot in residency.slots
-                ):
-                    continue
-                if (
-                    residency.state is not _LocalDramState.READY
-                    or residency.claim_count
-                    or record.in_flight_ops
-                ):
-                    return False
-                victims.append((key, record, residency))
+            with _resize_stage(kvcr, "scan", name, old_size, size):
+                victims = []
+                for key, record in kvcr._block_record_map.items():
+                    residency = record.local_dram
+                    if residency is None or not any(
+                        pool == name and slot >= size // block_size
+                        for pool, slot in residency.slots
+                    ):
+                        continue
+                    if (
+                        residency.state is not _LocalDramState.READY
+                        or residency.claim_count
+                        or record.in_flight_ops
+                    ):
+                        return False
+                    victims.append((key, record, residency))
             if size > old_size:
                 try:
-                    resize_memory(name, old_size, size)
+                    with _resize_stage(kvcr, "backing", name, old_size, size):
+                        resize_memory(name, old_size, size)
                 except Exception:
                     self._resize_quarantined = True
                     raise
                 try:
-                    kvcr._progress.register_extent(address + old_size, size - old_size)
-                    kvcr._progress._capture_agent_metadata()
-                except Exception:
-                    try:
-                        kvcr._progress.deregister_extent(
+                    with _resize_stage(kvcr, "register", name, old_size, size):
+                        kvcr._progress.register_extent(
                             address + old_size, size - old_size
                         )
-                        resize_memory(name, size, old_size)
+                    with _resize_stage(kvcr, "metadata", name, old_size, size):
+                        kvcr._progress._capture_agent_metadata()
+                except Exception:
+                    try:
+                        with _resize_stage(kvcr, "rollback", name, old_size, size):
+                            kvcr._progress.deregister_extent(
+                                address + old_size, size - old_size
+                            )
+                            resize_memory(name, size, old_size)
                     except Exception:
                         self._resize_quarantined = True
                         raise
                     raise
-                self._free_slots[name].extend(
-                    range(old_size // block_size, size // block_size)
-                )
-                self._pools[name] = (address, size, block_size)
+                with _resize_stage(kvcr, "admit", name, old_size, size):
+                    self._free_slots[name].extend(
+                        range(old_size // block_size, size // block_size)
+                    )
+                    self._pools[name] = (address, size, block_size)
             elif size < old_size or pending is not None:
                 self._resize_pending[name] = pending or (old_size, size)
-                for key, record, residency in victims:
-                    self._remove_evictable(key, residency)
-                    record.local_dram = None
-                    self._residency_observer(key, record)
-                    self._free(residency.slots)
-                    kvcr._on_remove(kvcr._block_meta(key, record, block_size))
-                    kvcr._prune_block_record(key)
-                self._free_slots[name] = deque(
-                    slot for slot in self._free_slots[name] if slot < size // block_size
-                )
-                self._pools[name] = (address, size, block_size)
-                kvcr._publish_inventory(
-                    [key for key, _, _ in victims], CacheTier.LOCAL_G2, removed=True
-                )
+                with _resize_stage(kvcr, "evict_publish", name, old_size, size):
+                    for key, record, residency in victims:
+                        self._remove_evictable(key, residency)
+                        record.local_dram = None
+                        self._residency_observer(key, record)
+                        self._free(residency.slots)
+                        kvcr._on_remove(kvcr._block_meta(key, record, block_size))
+                        kvcr._prune_block_record(key)
+                    self._free_slots[name] = deque(
+                        slot
+                        for slot in self._free_slots[name]
+                        if slot < size // block_size
+                    )
+                    self._pools[name] = (address, size, block_size)
+                    kvcr._publish_inventory(
+                        [key for key, _, _ in victims], CacheTier.LOCAL_G2, removed=True
+                    )
                 physical_old, _ = self._resize_pending[name]
                 kvcr._progress._nixl_agent_metadata = None
                 if physical_old > size:
-                    kvcr._progress.deregister_extent(
-                        address + size, physical_old - size
-                    )
-                    resize_memory(name, physical_old, size)
+                    with _resize_stage(kvcr, "deregister", name, old_size, size):
+                        kvcr._progress.deregister_extent(
+                            address + size, physical_old - size
+                        )
+                    with _resize_stage(kvcr, "backing", name, old_size, size):
+                        resize_memory(name, physical_old, size)
                     self._resize_pending[name] = (size, size)
             kvcr._capacity_low_watermarks[name] = ceil(
                 size // block_size * kvcr.config.capacity_low_watermark_percent / 100
             )
             if size <= old_size:
-                kvcr._progress._capture_agent_metadata()
+                with _resize_stage(kvcr, "metadata", name, old_size, size):
+                    kvcr._progress._capture_agent_metadata()
             self._resize_pending.pop(name, None)
             kvcr._remote_fw_dram._metadata_acked_sources.clear()
             kvcr._remote_fw_dram._metadata_retry_after.clear()

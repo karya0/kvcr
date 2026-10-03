@@ -4,7 +4,7 @@ This branch explores explicit physical resizing of KVCR-managed G2 while keeping
 
 ```python
 GiB = 1 << 30
-# Add g2_resize_granularity_bytes=GiB to the existing KVCRConfig at construction.
+# Add g2_resize_granularity_bytes=64 << 20 to KVCRConfig at construction.
 done = kvcr.resize_g2("", 30 * GiB)
 # False: a retiring block is filling, claimed, or in flight; retry later.
 ```
@@ -13,10 +13,18 @@ Worker-owned G2 provides `KVCRBindings.resize_g2_memory(name, old_bytes, new_byt
 
 ## Short usage guide
 
-1. At construction, enable `g2_resize_granularity_bytes=1 << 30` for large pools. Targets are positive multiples of 1 GiB (1,073,741,824 bytes), within the startup reservation; each registration chunk must contain whole KV blocks. Verify the model's measured block geometry first. The smaller native tests intentionally retain 8 MiB chunks; the global default stays disabled (`0`).
+1. At construction, enable `g2_resize_granularity_bytes=64 << 20`. This single **64 MiB (67,108,864-byte)** quantum governs requested-capacity alignment, physical work and registration. Reject nonaligned targets rather than rounding; remain within the startup reservation and require whole KV blocks per chunk. Worker backing also requires page-aligned geometry. Existing GiB targets remain valid; historical small tests retain smaller units. The global default stays disabled (`0`).
 2. Supply the worker-owned physical-memory binding above, or use the service-owned held lease. Call from the operator/framework thread, not a state-locked callback or the NIXL progress thread. There is no vLLM CLI/operator endpoint yet; the examples assume constructed KVCR objects and an integrated backing allocator.
 3. For a 100 GiB combined budget, reserve at least 70 GiB per instance, then initially shrink each to 50 GiB. This prototype physically allocates ceilings at bootstrap: allow 140 GiB plus framework buffers, journals, registration and process headroom before reducing to the steady 100 GiB budget.
-4. Shrink the donor, confirm physical release, then grow the recipient. `False` means a busy tail: retry later and do not grow the recipient yet. Exceptions are failures, not successful resize. `True` is local completion, not proof that every peer has refreshed or that new capacity is warm.
+4. Shrink the donor, confirm physical release, then grow the recipient. `False` means a busy tail: retry later and do not grow the recipient yet. Exceptions are failures, not successful resize. Completed steps remain committed when a later step is busy/fails; summary logs report effective capacity. Retry the original target to finish an interrupted shrink. `True` is local completion, not proof that every peer has refreshed or that new capacity is warm.
+
+The vLLM integration candidate uses its existing deferred utility response:
+
+```python
+done = await engine.engine_core.call_utility_async("resize_kvcr_g2", 30 * GiB)
+```
+
+The operator awaits completion, but the scheduler does not wait on that thread. This utility requires exactly one KVCR tier on an OffloadingConnector; it is not an HTTP endpoint. The [vLLM companion branch](https://github.com/karya0/vllm/tree/poc/online-g2-resize-engine) is maintained separately from this KVCR repository and still needs full model-serving validation.
 
 ```python
 # A and B are live KVCR instances already serving at 50 GiB each.
@@ -40,14 +48,17 @@ flowchart TD
     B -->|Yes| C[NIXL progress owner executes resize]
     C --> D{Shrink or grow?}
     D -->|Shrink| E{Retiring tail busy?}
-    E -->|Yes| R[Return false; keep backing; retry later]
+    E -->|Yes| R[Return false; keep completed steps; retry later]
     E -->|No| F[Remove tail inventory and journal entries]
     F --> G[Deregister tail; release physical pages]
     D -->|Grow| H[Back pages; register chunks; capture metadata]
     H --> I[Admit new slots only after successful preparation]
     G --> J[Capture updated metadata; invalidate old ACKs]
-    I --> K[Local resize complete]
-    J --> K
+    I --> P[Yield to normal control and transfer progress]
+    J --> P
+    P --> Q{Requested capacity reached?}
+    Q -->|No| D
+    Q -->|Yes| K[Local resize complete]
     K --> L[Peers drain active writes and refresh registration]
     L --> M[New requests reuse retained KV; added capacity warms]
 ```
@@ -58,7 +69,9 @@ Peer refresh can overlap later traffic; it is not an additional synchronous step
 
 The intended benefit is to redistribute spare host RAM to a pressured cache, retaining its existing KV and potentially reducing evictions/recomputation. This model-serving benefit is not yet measured.
 
-Resize runs synchronously on the NIXL progress thread under the state lock. Scanning cache records, evictions, service RPCs, page allocation/release, registration and metadata capture can temporarily delay serving and consume transfer deadlines. Shrink scans tracked records and rebuilds its free-slot deque. Growth and unchanged-size requests also scan records. Smaller chunks increase startup registration count and metadata size; the current chunk setting also applies to registered framework DRAM, not only G2. Cache removed during shrink may have to be recomputed. Large removal bursts may pressure the recovery journal.
+Each quantum runs on the NIXL progress thread under the state lock; normal polling runs between steps. Scanning cache records, evictions, service RPCs, page allocation/release, registration and metadata capture can still delay a single step. Shrink scans tracked records and rebuilds its free-slot deque; growth and unchanged-size requests also scan records. This work is not strictly time-bounded by byte count. Stage logs report `scan`, `evict_publish` (including journal callbacks), `backing`, `register`, `deregister`, `metadata`, `admit` and exceptional `rollback` costs; the existing duration histogram also records `resize_<stage>` when telemetry is enabled. Summary logs report requested/effective bytes, completed steps, outcome and total elapsed time. The default source-stall watchdog remains unchanged: a single step longer than its timeout can still disable source writes, so measure maximum step costs before scaling.
+
+Smaller chunks increase startup registration count and metadata size; the current chunk setting also applies to registered framework DRAM, not only G2. Cache removed during shrink may have to be recomputed. Large removal bursts may pressure the recovery journal. Concurrent resize commands on one instance are rejected; cross-instance redistribution is not atomic.
 
 A small Linux same-host CPU NIXL/UCX PoC released/reallocated 16 MiB between live instances. One initial pass measured roughly 5.3 ms shrink and 10.9 ms growth. Retained addresses/bytes, remote reads into grown chunks, and service-owned Guard delivery after a completed-resize primary crash passed. These are small operation timings, not TTFT/throughput results or predictions for large pools/RDMA. Independent repeat timings varied, particularly growth.
 

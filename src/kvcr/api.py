@@ -4,6 +4,8 @@
 
 import contextlib
 import logging
+import threading
+import time
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -127,6 +129,7 @@ class KVCR:
             raise
         self._core = core
         self._pool_hold = pool_hold
+        self._resize_lock = threading.Lock()
 
     @property
     def config(self) -> KVCRConfig:
@@ -163,6 +166,7 @@ class KVCR:
 
         The PoC ceiling is the startup region. Worker-owned memory needs the
         resize_g2_memory binding; service-owned memory uses its held lease.
+        Steps commit independently; a later busy/failure can leave partial progress.
         """
         if self._core._state_lock._is_owned():
             raise RuntimeError(
@@ -177,9 +181,54 @@ class KVCR:
         )
         if resize_memory is None:
             raise ValueError("worker-owned resize needs a physical memory binding")
-        return self._core._progress.call(
-            lambda: self._core._local_dram.resize(pool_name, size_bytes, resize_memory)
-        )
+        if not self._resize_lock.acquire(blocking=False):
+            raise RuntimeError("G2 resize already in progress")
+        started = time.monotonic()
+        result = "failed"
+        steps = 0
+        dram = self._core._local_dram
+        try:
+            current = self._core._progress.call(
+                lambda: dram.validate_resize(pool_name, size_bytes)
+            )
+            chunk = self.config.g2_resize_granularity_bytes
+            while True:
+                with self._core._state_lock:
+                    pending = dram._resize_pending.get(pool_name)
+                target = (
+                    pending[1]
+                    if pending
+                    else (
+                        min(current + chunk, size_bytes)
+                        if size_bytes > current
+                        else max(current - chunk, size_bytes)
+                    )
+                )
+                if not self._core._progress.call(
+                    lambda: dram.resize(pool_name, target, resize_memory)
+                ):
+                    result = "busy"
+                    return False
+                steps += 1
+                current = target
+                if current == size_bytes:
+                    result = "success"
+                    return True
+        finally:
+            with self._core._state_lock:
+                pool = dram._pools.get(pool_name)
+                effective = pool[1] if pool else None
+            logger.info(
+                "G2 resize pool=%s requested_bytes=%s effective_bytes=%s "
+                "steps=%s result=%s elapsed_ms=%.3f",
+                pool_name,
+                size_bytes,
+                effective,
+                steps,
+                result,
+                (time.monotonic() - started) * 1000,
+            )
+            self._resize_lock.release()
 
     def deliver(
         self,

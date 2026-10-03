@@ -3,6 +3,7 @@
 import ctypes
 import hashlib
 import threading
+import time
 from contextlib import closing
 from unittest.mock import Mock
 
@@ -77,6 +78,35 @@ def test_shrink_grow_retains_address_inventory_and_default_progress():
         assert controller.resize_g2("", 64)
         assert list(controller._core._local_dram._free_slots[""]) == [2, 3]
         _store(controller, memory, [BlockKey(b"new")])
+
+
+def test_resize_advances_one_quantum_and_polls_between_steps():
+    controller, _, callback, _ = _controller(chunk=16)
+    observed_polls = []
+    with closing(controller):
+        poll = controller._core._progress._poll
+
+        def tracked_poll(*args):
+            observed_polls.append(True)
+            return poll(*args)
+
+        controller._core._progress._poll = tracked_poll
+        polls_at_steps = []
+        callback.side_effect = lambda *args: polls_at_steps.append(len(observed_polls))
+        assert controller.resize_g2("", 16)
+        assert [call.args for call in callback.call_args_list] == [
+            ("", 64, 48),
+            ("", 48, 32),
+            ("", 32, 16),
+        ]
+        assert all(b > a for a, b in zip(polls_at_steps, polls_at_steps[1:]))
+        callback.reset_mock()
+        assert controller.resize_g2("", 64)
+        assert [call.args for call in callback.call_args_list] == [
+            ("", 16, 32),
+            ("", 32, 48),
+            ("", 48, 64),
+        ]
 
 
 def test_claimed_tail_refuses_shrink_then_retries():
@@ -206,18 +236,68 @@ def test_failed_growth_cleanup_never_releases_registered_pages():
     controller, memory, callback, _ = _controller(agent, chunk=16)
     with closing(controller):
         assert controller.resize_g2("", 16)
-        register, deregister = agent.register_memory, agent.deregister_memory
-        agent.register_memory = Mock(side_effect=[99, RuntimeError("register failed")])
+        capture, deregister = agent.get_agent_metadata, agent.deregister_memory
+        agent.get_agent_metadata = Mock(side_effect=RuntimeError("metadata failed"))
         agent.deregister_memory = Mock(return_value=False)
         with pytest.raises(RuntimeError, match="retiring registration"):
             controller.resize_g2("", 64)
-        callback.assert_called_with("", 16, 64)  # No unsafe physical rollback.
+        callback.assert_called_with("", 16, 32)  # No unsafe physical rollback.
         assert controller._core._local_dram._pools[""][1] == 16
         with pytest.raises(RuntimeError, match="blocks further resizing"):
             controller.resize_g2("", 64)
-        agent.register_memory, agent.deregister_memory = register, deregister
+        agent.get_agent_metadata, agent.deregister_memory = capture, deregister
         agent.state = "DONE"
         _store(controller, memory, [BlockKey(b"still-serving")])
+
+
+def test_multistep_resize_does_not_trip_watchdog_and_logs_stage_costs(caplog):
+    controller, _, callback, _ = _controller(chunk=16)
+    callback.side_effect = lambda *args: time.sleep(0.4)
+    with closing(controller), caplog.at_level("INFO", logger="kvcr"):
+        started = time.monotonic()
+        assert controller.resize_g2("", 16)
+        assert time.monotonic() - started >= 1.2
+        assert controller._core._progress.call(
+            controller._core._remote_fw_dram._dangling_ops.check_source_progress
+        )
+        assert "stage=backing" in caplog.text
+        assert "stage=deregister" in caplog.text
+        assert "steps=3 result=success" in caplog.text
+
+
+def test_later_busy_chunk_reports_partial_capacity_and_allows_retry():
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    controller, memory, callback, _ = _controller(agent, chunk=16)
+    with closing(controller):
+        keys = [BlockKey(bytes([i])) for i in range(4)]
+        results = _store(controller, memory, keys, True)
+        controller.release([results[keys[3]].release_handle])
+        assert not controller.resize_g2("", 16)
+        assert controller._core._local_dram._pools[""][1] == 48
+        callback.assert_called_once_with("", 64, 48)
+        controller.release([results[key].release_handle for key in keys[:3]])
+        assert controller.resize_g2("", 16)
+
+
+def test_failed_intermediate_shrink_retries_original_requested_capacity():
+    controller, _, callback, _ = _controller(chunk=16)
+    with closing(controller):
+        callback.side_effect = [None, OSError("release failed")]
+        with pytest.raises(OSError, match="release failed"):
+            controller.resize_g2("", 16)
+        callback.side_effect = None
+        assert controller.resize_g2("", 16)
+        assert callback.call_args_list[-2].args == ("", 48, 32)
+        assert callback.call_args_list[-1].args == ("", 32, 16)
+
+
+def test_invalid_pool_does_not_leave_resize_command_locked():
+    controller, _, _, _ = _controller()
+    with closing(controller):
+        with pytest.raises((KeyError, ValueError)):
+            controller.resize_g2("unknown", 32)
+        assert controller.resize_g2("", 32)
 
 
 def test_delayed_ack_cannot_suppress_resized_registration_metadata():
