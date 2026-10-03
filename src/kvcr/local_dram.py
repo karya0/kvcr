@@ -219,6 +219,14 @@ class _LocalDram:
         self._reservation_lengths = {
             name: length for name, (_, length, _) in self._pools.items()
         }
+        self._resize_slot_keys: dict[str, list[BlockKey | None]] = (
+            {
+                name: [None] * (length // block_size)
+                for name, (_, length, block_size) in self._pools.items()
+            }
+            if kvcr.config.g2_resize_granularity_bytes
+            else {}
+        )
         self._resize_pending: dict[str, tuple[int, int]] = {}
         self._resize_quarantined = False
         # A no-op until something attaches: the tiers publish residency
@@ -266,15 +274,16 @@ class _LocalDram:
             pending = self._resize_pending.get(name)
             with _resize_stage(kvcr, "scan", name, old_size, size):
                 victims = []
-                for key, record in kvcr._block_record_map.items():
+                for key in dict.fromkeys(
+                    self._resize_slot_keys[name][
+                        size // block_size : old_size // block_size
+                    ]
+                ):
+                    if key is None:
+                        continue
+                    record = kvcr._block_record_map[key]
                     residency = record.local_dram
-                    if residency is None:
-                        continue
-                    for pool, slot in residency.slots:
-                        if pool == name and slot >= size // block_size:
-                            break
-                    else:
-                        continue
+                    assert residency is not None
                     if (
                         residency.state is not _LocalDramState.READY
                         or residency.claim_count
@@ -308,6 +317,8 @@ class _LocalDram:
                         raise
                     raise
                 with _resize_stage(kvcr, "admit", name, old_size, size):
+                    slots = self._resize_slot_keys[name]
+                    slots.extend([None] * max(0, size // block_size - len(slots)))
                     self._free_slots[name].extend(
                         range(old_size // block_size, size // block_size)
                     )
@@ -391,6 +402,9 @@ class _LocalDram:
             )
             for pool_name, (_, length, slot_size) in self._pools.items()
         }
+        for key, record in records.items():
+            if record.local_dram is not None:
+                self._track_slots(key, record.local_dram.slots)
 
     def rank_recovered(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
         """Make recovered rows evictable, once the policy can score them.
@@ -483,8 +497,8 @@ class _LocalDram:
                 else:
                     op.results[key] = OpEntryResult(OpEntryStatus.FAILED)
                 continue
-            self._kvcr._block_record(key).local_dram = _LocalDramResidency(
-                locations, _LocalDramState.FILLING
+            self._kvcr._block_record(key).local_dram = self._new_residency(
+                key, locations
             )
             copy_keys.append(key)
             slots.append(tuple(locations))
@@ -888,8 +902,8 @@ class _LocalDram:
                 if waiting:
                     eviction_pending.add(key)
                 continue
-            self._kvcr._block_record(key).local_dram = _LocalDramResidency(
-                locations, _LocalDramState.FILLING
+            self._kvcr._block_record(key).local_dram = self._new_residency(
+                key, locations
             )
             destinations[key] = self._descriptors(locations)
         self._update_capacity_pressure()
@@ -1100,9 +1114,7 @@ class _LocalDram:
 
                 self._capacity_waiters.popleft()
                 op.capacity_waiters.remove(waiter.key)
-                record.local_dram = _LocalDramResidency(
-                    locations, _LocalDramState.FILLING
-                )
+                record.local_dram = self._new_residency(waiter.key, locations)
                 if isinstance(waiter.source, CacheTier):
                     op.remote_fill_keys.add(waiter.key)
                     self._kvcr._start_local_fill(
@@ -1302,8 +1314,23 @@ class _LocalDram:
             info=pool_name,
         )
 
+    def _track_slots(
+        self, key: BlockKey, locations: Collection[tuple[str, int]]
+    ) -> None:
+        if self._resize_slot_keys:
+            for name, slot in locations:
+                self._resize_slot_keys[name][slot] = key
+
+    def _new_residency(
+        self, key: BlockKey, locations: list[tuple[str, int]]
+    ) -> _LocalDramResidency:
+        self._track_slots(key, locations)
+        return _LocalDramResidency(locations, _LocalDramState.FILLING)
+
     def _free(self, locations: Collection[tuple[str, int]]) -> None:
         for pool_name, slot in locations:
+            if self._resize_slot_keys:
+                self._resize_slot_keys[pool_name][slot] = None
             self._free_slots[pool_name].append(slot)
 
     def _size_bytes(self, locations: Collection[tuple[str, int]]) -> int:

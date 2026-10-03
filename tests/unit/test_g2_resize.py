@@ -21,10 +21,13 @@ from _kvcr_test_utils import (
 )
 
 from kvcr.config import KVCRConfig, LocalDramOptions
+from kvcr.core import _BlockRecord
+from kvcr.local_dram import _LocalDramResidency, _LocalDramState
+from kvcr.recovery_journal import install_recovery_records
 from kvcr.types import BlockKey, QueryStatus
 
 
-def _controller(agent=None, chunk=32, percent=0, pressure=None):
+def _controller(agent=None, chunk=32, percent=0, pressure=None, initial=64):
     memory = ctypes.create_string_buffer(64)
     callback = Mock()
     events = []
@@ -38,7 +41,7 @@ def _controller(agent=None, chunk=32, percent=0, pressure=None):
             g2_resize_granularity_bytes=chunk,
             capacity_low_watermark_percent=percent,
         ),
-        local_dram=LocalDramOptions([("", ctypes.addressof(memory), 64)]),
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), initial)]),
         inventory_sink=events.append,
         capacity_needed_callback=pressure,
     )
@@ -78,6 +81,41 @@ def test_shrink_grow_retains_address_inventory_and_default_progress():
         assert controller.resize_g2("", 64)
         assert list(controller._core._local_dram._free_slots[""]) == [2, 3]
         _store(controller, memory, [BlockKey(b"new")])
+        assert controller.resize_g2("", 32)
+        assert controller.query([BlockKey(b"new")])[0][0] is QueryStatus.MISS
+
+
+def test_resize_tracks_recovered_slots():
+    controller, _, callback, _ = _controller()
+    keys = [BlockKey(b"head"), BlockKey(b"tail")]
+    with closing(controller):
+        install_recovery_records(
+            controller._core,
+            {
+                key: _BlockRecord(
+                    local_dram=_LocalDramResidency([("", slot)], _LocalDramState.READY)
+                )
+                for key, slot in zip(keys, (0, 3))
+            },
+        )
+        assert controller.resize_g2("", 32)
+        assert [status for status, _ in controller.query(keys)] == [
+            QueryStatus.HIT,
+            QueryStatus.MISS,
+        ]
+        callback.assert_called_once_with("", 64, 32)
+
+
+def test_replacement_can_regrow_a_smaller_attached_pool():
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    controller, memory, _, _ = _controller(agent, initial=32)
+    with closing(controller):
+        # Service attachment restores the reservation ceiling, not active size.
+        controller._core._local_dram._reservation_lengths[""] = 64
+        assert controller.resize_g2("", 64)
+        _store(controller, memory, [BlockKey(bytes([i])) for i in range(4)])
+        assert controller.resize_g2("", 32)
 
 
 def test_resize_advances_one_quantum_and_polls_between_steps():
