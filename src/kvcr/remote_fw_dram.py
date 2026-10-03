@@ -1793,7 +1793,13 @@ class _RemoteFWDram:
             ):
                 self._refreshing_targets.add(target_agent)
                 raise _PeerRefreshPending
-            remove = getattr(agent, "remove_remote_agent", None)
+            remove = (
+                getattr(agent, "invalidate_remote_memory", None)
+                if same_process
+                else None
+            )
+            if remove is None:
+                remove = getattr(agent, "remove_remote_agent", None)
             if remove is not None:
                 remove(remote_agent)
             self._remote_agents_by_target.pop(target_agent, None)

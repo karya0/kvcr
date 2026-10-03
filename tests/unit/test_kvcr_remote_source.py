@@ -1095,13 +1095,17 @@ def test_a_replacement_reusing_its_predecessors_name_refreshes_the_route() -> No
         ("same-process", b"new-handle"),
     ],
 )
+@pytest.mark.parametrize("memory_only", [False, True])
 def test_registration_refresh_fences_only_changed_or_unknown_process(
     incarnation,
     handle,
+    memory_only,
 ) -> None:
     agent = FakeNixlAgent()
     agent.add_remote_agent = lambda metadata: b"worker-a"
     agent.remove_remote_agent = Mock()
+    if memory_only:
+        agent.invalidate_remote_memory = Mock()
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
         _record_progress_duration=lambda *_args: None,
@@ -1123,7 +1127,11 @@ def test_registration_refresh_fences_only_changed_or_unknown_process(
         dict(payload, target_agent_metadata=b"larger", sender_incarnation=incarnation),
     )
     assert refreshed == (first[0], handle)
-    agent.remove_remote_agent.assert_called_once_with(first[1])
+    if memory_only and incarnation == "same-process":
+        agent.invalidate_remote_memory.assert_called_once_with(first[1])
+        agent.remove_remote_agent.assert_not_called()
+    else:
+        agent.remove_remote_agent.assert_called_once_with(first[1])
     assert tier._route_generation.get("worker-a", 0) == (
         incarnation != "same-process" or handle != first[1]
     )
@@ -1150,8 +1158,11 @@ def test_changed_incarnation_cannot_reuse_identical_metadata() -> None:
     assert tier._route_generation["worker-a"] == 1
 
 
-def test_failed_same_process_reload_fences_queued_route() -> None:
+@pytest.mark.parametrize("memory_only", [False, True])
+def test_failed_same_process_reload_fences_queued_route(memory_only) -> None:
     agent = FakeNixlAgent()
+    if memory_only:
+        agent.invalidate_remote_memory = Mock()
     tier = SimpleNamespace(
         _kvcr=SimpleNamespace(_timer=time.monotonic),
         _record_progress_duration=lambda *_args: None,
@@ -1175,7 +1186,10 @@ def test_failed_same_process_reload_fences_queued_route() -> None:
     assert tier._route_generation["worker-a"] == 1
 
 
-def test_registration_refresh_drains_native_writes_before_resuming_queue() -> None:
+@pytest.mark.parametrize("memory_only", [False, True])
+def test_registration_refresh_drains_native_writes_before_resuming_queue(
+    memory_only,
+) -> None:
     class Agent(FakeNixlAgent):
         allow_release = True
 
@@ -1192,6 +1206,8 @@ def test_registration_refresh_drains_native_writes_before_resuming_queue() -> No
             super().release_xfer_handle(handle)
 
     agent, control = Agent(), FakeBytesControl()
+    if memory_only:
+        agent.invalidate_remote_memory = agent.remove_remote_agent
     memory = ctypes.create_string_buffer(16)
     source = _new_kvcr(
         agent,
