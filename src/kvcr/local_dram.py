@@ -268,10 +268,12 @@ class _LocalDram:
                 victims = []
                 for key, record in kvcr._block_record_map.items():
                     residency = record.local_dram
-                    if residency is None or not any(
-                        pool == name and slot >= size // block_size
-                        for pool, slot in residency.slots
-                    ):
+                    if residency is None:
+                        continue
+                    for pool, slot in residency.slots:
+                        if pool == name and slot >= size // block_size:
+                            break
+                    else:
                         continue
                     if (
                         residency.state is not _LocalDramState.READY
@@ -279,7 +281,7 @@ class _LocalDram:
                         or record.in_flight_ops
                     ):
                         return False
-                    victims.append((key, record, residency))
+                    victims.append(key)
             if size > old_size:
                 try:
                     with _resize_stage(kvcr, "backing", name, old_size, size):
@@ -313,7 +315,10 @@ class _LocalDram:
             elif size < old_size or pending is not None:
                 self._resize_pending[name] = pending or (old_size, size)
                 with _resize_stage(kvcr, "evict_publish", name, old_size, size):
-                    for key, record, residency in victims:
+                    for key in victims:
+                        record = kvcr._block_record_map[key]
+                        residency = record.local_dram
+                        assert residency is not None
                         self._remove_evictable(key, residency)
                         record.local_dram = None
                         self._residency_observer(key, record)
@@ -326,9 +331,7 @@ class _LocalDram:
                         if slot < size // block_size
                     )
                     self._pools[name] = (address, size, block_size)
-                    kvcr._publish_inventory(
-                        [key for key, _, _ in victims], CacheTier.LOCAL_G2, removed=True
-                    )
+                    kvcr._publish_inventory(victims, CacheTier.LOCAL_G2, removed=True)
                 physical_old, _ = self._resize_pending[name]
                 kvcr._progress._nixl_agent_metadata = None
                 if physical_old > size:
