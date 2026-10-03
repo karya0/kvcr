@@ -47,17 +47,26 @@ def test_resize_local_copy_yields_before_status_check(resizing):
     agent = _TransferAgent()
     progress = _transfer_progress(agent)
     progress._nixl_agent_name = agent.name
-    progress._registration_granularity = 64 if resizing else 0
+    progress._registration_granularity = 256 if resizing else 0
     operation = _LocalCopyOp(op_id=("copy", 1), keys=set(), deliver_op_id=None,
                              ordered_keys=(), local_slots=(),
-                             src_descriptors=(_mem(128),),
-                             dst_descriptors=(_mem(256),), deadline=10, backend="UCX",
+                             src_descriptors=tuple(_mem(128 * i) for i in range(3)),
+                             dst_descriptors=tuple(
+                                 _mem(1024 + 128 * i) for i in range(3)),
+                             deadline=10, backend="UCX",
                              clock=lambda: 0, started_at=None)
     done, worked = operation.progress(progress, None)
     assert done is (not resizing) and worked
     assert ("check:1" in agent.events) is (not resizing)
     if resizing:
         assert operation.transfer_id is not None
+        agent.release_failures = 1
+        assert operation.progress(progress, None) == (False, False)
+        assert operation._descriptor_index == 0 and operation.transfer_id is not None
+        assert operation.progress(progress, None) == (False, True)
+        assert not operation.success and operation.transfer_id is None
+        assert operation._descriptor_index == 2
+        assert operation.progress(progress, None) == (False, True)
         assert operation.progress(progress, None) == (True, True)
     assert operation.success and operation.transfer_id is None
 

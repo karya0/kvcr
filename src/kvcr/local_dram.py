@@ -115,6 +115,8 @@ class _LocalCopyOp(_ProgressOp):
     transfer_id: int | None = None
     success: bool = False
     cancellation_requested: bool = False
+    _descriptor_index: int = 0
+    _descriptor_end: int = 0
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -126,14 +128,33 @@ class _LocalCopyOp(_ProgressOp):
             if self.clock() >= self.deadline:
                 return True, True
             try:
+                end = len(self.src_descriptors)
+                quantum = progress._registration_granularity
+                if quantum:
+                    if not self._descriptor_index and (
+                        len(self.src_descriptors) != len(self.dst_descriptors)
+                        or any(s.size != d.size or s.size > quantum for s, d in
+                               zip(self.src_descriptors, self.dst_descriptors))
+                    ):
+                        raise ValueError(
+                            "resizable copy descriptors must align and fit the quantum"
+                        )
+                    end, size = self._descriptor_index, 0
+                    while (
+                        end < len(self.src_descriptors)
+                        and size + self.src_descriptors[end].size <= quantum
+                    ):
+                        size += self.src_descriptors[end].size
+                        end += 1
                 transfer_id, submitted = progress.submit_transfer(
                     "WRITE",
-                    self.src_descriptors,
-                    self.dst_descriptors,
+                    self.src_descriptors[self._descriptor_index:end],
+                    self.dst_descriptors[self._descriptor_index:end],
                     remote_side_agent=progress.nixl_agent_name,
                     backend=self.backend,
                 )
                 self.transfer_id = transfer_id
+                self._descriptor_end = end
                 self.cancellation_requested = not submitted
                 observed_work = True
                 if progress._registration_granularity:
@@ -155,6 +176,9 @@ class _LocalCopyOp(_ProgressOp):
         if result is None:
             return False, observed_work
         self.transfer_id = None
+        if result[0] and self._descriptor_end < len(self.src_descriptors):
+            self._descriptor_index = self._descriptor_end
+            return False, True
         self.success, _ = result
         return True, True
 
