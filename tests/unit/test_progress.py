@@ -49,7 +49,8 @@ def test_resize_local_copy_yields_before_status_check(resizing):
     progress._nixl_agent_name = agent.name
     progress._registration_granularity = 256 if resizing else 0
     operation = _LocalCopyOp(op_id=("copy", 1), keys=set(), deliver_op_id=None,
-                             ordered_keys=(), local_slots=(),
+                             ordered_keys=(b"first", b"second"),
+                             local_slots=((("", 0),), (("", 1), ("", 2))),
                              src_descriptors=tuple(_mem(128 * i) for i in range(3)),
                              dst_descriptors=tuple(
                                  _mem(1024 + 128 * i) for i in range(3)),
@@ -63,12 +64,15 @@ def test_resize_local_copy_yields_before_status_check(resizing):
         agent.release_failures = 1
         assert operation.progress(progress, None) == (False, False)
         assert operation._descriptor_index == 0 and operation.transfer_id is not None
+        assert operation.copied_key_count() == 0
         assert operation.progress(progress, None) == (False, True)
         assert not operation.success and operation.transfer_id is None
         assert operation._descriptor_index == 2
+        assert operation.copied_key_count() == 1, "Never credit a partial key"
         assert operation.progress(progress, None) == (False, True)
         assert operation.progress(progress, None) == (True, True)
     assert operation.success and operation.transfer_id is None
+    assert operation.copied_key_count() == 2
 
 
 class _TransferAgent:

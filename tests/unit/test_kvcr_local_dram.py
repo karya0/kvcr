@@ -136,6 +136,60 @@ def test_local_deposit_deduplicates_and_evicts_fifo() -> None:
     ]
 
 
+@pytest.mark.parametrize("delivery", [False, True])
+@pytest.mark.parametrize("failure", ["native", "deadline"])
+@pytest.mark.parametrize("discard_prefix", [False, True])
+def test_partial_copy_preserves_completed_keys(
+    delivery, failure, discard_prefix,
+) -> None:
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    source, local, target = (ctypes.create_string_buffer(32) for _ in range(3))
+    source.raw = b"a" * 16 + b"b" * 16
+    kvcr = _new_local_kvcr(agent, local, 2)
+    keys = (BlockKey(b"first"), BlockKey(b"second"))
+    blocks = {key: [_mem_descriptor(ctypes.addressof(source) + index * 16)]
+              for index, key in enumerate(keys)}
+    if delivery:
+        stored = kvcr.deposit(blocks)
+        _poll_until(kvcr, lambda done: stored in dict(done))
+    kvcr._core._progress._registration_granularity = 16
+    clock = [0.0]
+    kvcr._core._clock = lambda: clock[0]
+    first_piece = len(agent.xfers) + 1
+    def complete_piece(handle):
+        if handle != first_piece:
+            return "ERR"
+        if discard_prefix:
+            with kvcr._core._state_lock:
+                local_dram = kvcr._core._local_dram
+                if delivery:
+                    local_dram.retire_sources(keys[:1])
+                else:
+                    local_dram.discard_fill(keys[:1])
+        if failure == "deadline":
+            clock[0] = 2.0
+        return "DONE"
+    agent.check_xfer_state = complete_piece
+    operation = (
+        kvcr.deliver({key: [_mem_descriptor(ctypes.addressof(target) + i * 16)]
+                      for i, key in enumerate(keys)})
+        if delivery else kvcr.deposit(blocks)
+    )
+    result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))[operation]
+    assert result[keys[0]].success is (delivery or not discard_prefix)
+    assert not result[keys[1]].success
+    if delivery:
+        assert target.raw[:16] == source.raw[:16]
+        assert all(r.local_dram.claim_count == 0
+                   for r in kvcr._core._block_record_map.values())
+    else:
+        assert local.raw[:16] == source.raw[:16]
+        assert kvcr.query(keys) == [(QueryStatus.MISS, None) if discard_prefix else
+                                   (QueryStatus.HIT, CacheTier.LOCAL_G2),
+                                   (QueryStatus.MISS, None)]
+
+
 def test_local_dram_rejects_overlapping_pools() -> None:
     memory = ctypes.create_string_buffer(16)
     address = ctypes.addressof(memory)

@@ -118,6 +118,17 @@ class _LocalCopyOp(_ProgressOp):
     _descriptor_index: int = 0
     _descriptor_end: int = 0
 
+    def copied_key_count(self) -> int:
+        if self.success:
+            return len(self.ordered_keys)
+        remaining, count = self._descriptor_index, 0
+        for slots in self.local_slots:
+            remaining -= len(slots)
+            if remaining < 0:
+                break
+            count += 1
+        return count
+
     def progress(
         self, progress: _KVCRProgress, event: object | None
     ) -> tuple[bool, bool]:
@@ -786,12 +797,14 @@ class _LocalDram:
             self._finish_delivery_copy(copy)
             return
 
-        self._apply_fill_result(
-            copy.ordered_keys,
-            copy.local_slots,
-            copy.success,
-            CacheTier.FW_G2,
-        )
+        copied = copy.copied_key_count()
+        for start, end, success in ((0, copied, True),
+                                    (copied, len(copy.ordered_keys), False)):
+            if start < end:
+                self._apply_fill_result(
+                    copy.ordered_keys[start:end], copy.local_slots[start:end],
+                    success, CacheTier.FW_G2,
+                )
 
     def _apply_fill_result(
         self,
@@ -992,7 +1005,8 @@ class _LocalDram:
         if copy.deliver_op_id is None:
             raise RuntimeError("local delivery has no owning operation")
         op = self._pending_deliver_ops[copy.deliver_op_id]
-        for key, slots in zip(copy.ordered_keys, copy.local_slots):
+        copied = copy.copied_key_count()
+        for index, (key, slots) in enumerate(zip(copy.ordered_keys, copy.local_slots)):
             record = self._kvcr._block_record_map.get(key)
             residency = record.local_dram if record is not None else None
             if (
@@ -1001,12 +1015,13 @@ class _LocalDram:
                 or residency.state is not _LocalDramState.READY
             ):
                 raise RuntimeError(f"local DRAM delivery state lost for {key!r}")
-            if copy.success:
+            success = index < copied
+            if success:
                 self._kvcr._record_access((key,))
             self._release_claim(key, residency)
             op.active_keys.discard(key)
             op.results[key] = OpEntryResult(
-                OpEntryStatus.SUCCESS if copy.success else OpEntryStatus.FAILED
+                OpEntryStatus.SUCCESS if success else OpEntryStatus.FAILED
             )
         self._update_capacity_pressure()
         self._finish_deliver_if_ready(op)
