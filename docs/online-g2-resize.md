@@ -75,6 +75,8 @@ Smaller chunks increase startup registration count and metadata size; the curren
 
 Telemetry adds `resize_queue` for time waiting to execute each progress command, separate from physical stages. In one 20 GiB model-loaded growth, queue wait was approximately 53 of 65 seconds, backing 9 seconds, registration below 0.1 seconds. A Qwen source watchdog tripped just after growth despite successful local requests; new remote source writes were then disabled. The default timeout is unchanged. Treat model-source serving as unqualified until that stall is explained, not as a reason to disable its safety check.
 
+A no-resize diagnostic reproduced a 1.12-second source gap from back-to-back native copy calls. Resize-enabled progress now yields between local submission and status checking, and rotates unfinished operations after a 100 ms cumulative work slice. Received events are handled without dropping them. This preserves native handles, claims and original deadlines; static scheduling is unchanged. The slice cannot preempt a native call, and event handling or backend polling can still exceed the watchdog. Actual-engine qualification of this mitigation remains pending.
+
 A small Linux same-host CPU NIXL/UCX PoC released/reallocated 16 MiB between live instances. One initial pass measured roughly 5.3 ms shrink and 10.9 ms growth. Retained addresses/bytes, remote reads into grown chunks, and service-owned Guard delivery after a completed-resize primary crash passed. These are small operation timings, not TTFT/throughput results or predictions for large pools/RDMA. Independent repeat timings varied, particularly growth.
 
 ## Review blockers and limits

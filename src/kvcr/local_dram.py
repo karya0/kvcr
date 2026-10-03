@@ -136,6 +136,8 @@ class _LocalCopyOp(_ProgressOp):
                 self.transfer_id = transfer_id
                 self.cancellation_requested = not submitted
                 observed_work = True
+                if progress._registration_granularity:
+                    return False, True
             except Exception:
                 logger.warning("KVCR local transfer submission failed", exc_info=True)
                 return True, True

@@ -10,6 +10,58 @@ from kvcr.progress import _KVCRProgress, _ProgressOp
 from kvcr.types import MemDescriptor
 
 
+@pytest.mark.parametrize("resizing", [False, True])
+def test_resize_progress_yields_fairly_without_losing_events(monkeypatch, resizing):
+    clock, steps = [0.0], []
+    monkeypatch.setattr("kvcr.progress.time.monotonic", lambda: clock[0])
+
+    class Operation(_ProgressOp):
+        def progress(self, progress, event):
+            steps.append((self.op_id, event))
+            clock[0] += .2
+            return event is not None, True
+
+    polls = []
+    def poll(progress, items):
+        polls.append(1)
+        return ({("test", 2): "terminal"} if len(polls) == 1 else {}), False
+    progress = _KVCRProgress(lambda _: None, poll, list, lambda: None,
+                             memory_registration_granularity=64 if resizing else 0)
+    for number in range(3):
+        operation = Operation(op_id=("test", number), keys=set())
+        progress._in_flight_ops[operation.op_id] = operation
+    progress._run_one_iteration()
+    expected = [(("test", 0), None), (("test", 2), "terminal")]
+    if not resizing:
+        expected.insert(1, (("test", 1), None))
+    assert steps == expected
+    assert ("test", 2) not in progress._in_flight_ops
+    if resizing:
+        progress._run_one_iteration()
+        assert steps[-1] == (("test", 1), None), "Skipped work must not starve"
+
+
+@pytest.mark.parametrize("resizing", [False, True])
+def test_resize_local_copy_yields_before_status_check(resizing):
+    from kvcr.local_dram import _LocalCopyOp
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent)
+    progress._nixl_agent_name = agent.name
+    progress._registration_granularity = 64 if resizing else 0
+    operation = _LocalCopyOp(op_id=("copy", 1), keys=set(), deliver_op_id=None,
+                             ordered_keys=(), local_slots=(),
+                             src_descriptors=(_mem(128),),
+                             dst_descriptors=(_mem(256),), deadline=10, backend="UCX",
+                             clock=lambda: 0, started_at=None)
+    done, worked = operation.progress(progress, None)
+    assert done is (not resizing) and worked
+    assert ("check:1" in agent.events) is (not resizing)
+    if resizing:
+        assert operation.transfer_id is not None
+        assert operation.progress(progress, None) == (True, True)
+    assert operation.success and operation.transfer_id is None
+
+
 class _TransferAgent:
     name = "transfer-test"
 

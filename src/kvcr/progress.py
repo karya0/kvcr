@@ -426,12 +426,26 @@ class _KVCRProgress:
 
         events, backend_work = self._poll(self, backend_items)
         completed_ops: list[object] = []
+        stepped_at = time.monotonic()
         for op_id, op in list(self._in_flight_ops.items()):
+            # Bound cumulative copy work, not individual native-call duration.
+            if (
+                self._registration_granularity
+                and op_id not in events
+                and time.monotonic() - stepped_at >= 0.1
+            ):
+                continue
             done, op_work = op.progress(self, events.pop(op_id, None))
             backend_work |= op_work
             if done and self._in_flight_ops.get(op_id) is op:
                 self._in_flight_ops.pop(op_id)
                 completed_ops.append(op)
+            elif (
+                self._registration_granularity
+                and self._in_flight_ops.get(op_id) is op
+            ):
+                self._in_flight_ops.pop(op_id)
+                self._in_flight_ops[op_id] = op
         completed = self._flush()
         completed.extend(completed_ops)
         self._completed_backlog.extend(completed)
