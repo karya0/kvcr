@@ -73,6 +73,29 @@ def test_framework_pin_rejection_diagnostic(
         argument.__str__.assert_not_called()
 
 
+@pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])
+@pytest.mark.parametrize("result", ["success", "failed", "timeout", "cancelled"])
+def test_framework_pin_result_diagnostic(result, level, caplog):
+    caplog.set_level(level, logger="kvcr.core")
+    remote = Mock()
+    wait = SimpleNamespace(
+        request=7, op_ids={("source", 3)}, keys=(b"key",), started_at=None
+    )
+    _RemoteFWDram._record_pending_pin_wait(remote, wait, result)
+    remote._kvcr._record_duration.assert_called_once_with(
+        "framework_pin_wait", None, result
+    )
+    remote._kvcr._timer.assert_not_called()
+    assert caplog.messages == (
+        [
+            f"KVCR_EVENT framework_pin_result pin_request=7 source_ops=[('source', 3)] "
+            f"requested_keys=1 result={result}"
+        ]
+        if level == logging.DEBUG
+        else []
+    )
+
+
 def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
     return msgspec.msgpack.encode(
         {
