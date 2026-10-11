@@ -1117,6 +1117,8 @@ class _Guard:
                 pool_layouts=self._configured.pool_layouts,
                 nixl_listen_port=0,
                 startup_timeout_seconds=self._startup_timeout,
+                operation_timeout_ms=self._configured.operation_timeout_ms,
+                abandon_timeout_ms=self._configured.abandon_timeout_ms,
             ),
             KVCRBindings(
                 reject_pin,
@@ -1133,6 +1135,11 @@ class _Guard:
             ),
         )
         self._core = core
+        logger.info(
+            "KVCR Guard core configured operation_timeout_ms=%d abandon_timeout_ms=%d",
+            self._configured.operation_timeout_ms,
+            self._configured.abandon_timeout_ms,
+        )
         self._log_promotion_stage("core_init_done")
         # Registration can take long; promotion's start() waits for it.
         core._progress.prepare(wait=False)

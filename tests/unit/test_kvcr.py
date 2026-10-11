@@ -435,7 +435,12 @@ def test_service_journal_is_attached_before_primary_start(
         remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
     )
     controller = KVCR(
-        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", mmap.PAGESIZE)]),
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("", mmap.PAGESIZE)],
+            operation_timeout_ms=5000,
+            abandon_timeout_ms=10000,
+        ),
         KVCRBindings(Mock(), Mock(), Mock(), framework_control=primary_control),
         backend_configs,
         KVCRGuardConfig(
@@ -452,7 +457,9 @@ def test_service_journal_is_attached_before_primary_start(
         ("127.0.0.1", 5555),
         g3_config,
         "REMOTE",
-        "path",
+        attach_mode="path",
+        operation_timeout_ms=5000,
+        abandon_timeout_ms=10000,
     )
     assert constructor.call_args.args[1].framework_control is primary_control
     assert constructor.call_args.args[2].g3 is g3_config
@@ -471,6 +478,47 @@ def test_service_journal_is_attached_before_primary_start(
     controller.close()
     assert events[-2:] == ["core.close", "hold.release"]
     assert controller._pool_hold is None
+
+
+@pytest.mark.parametrize("attach_mode", ["path", "fd"])
+@pytest.mark.parametrize("budgets", [None, (5000, 10000)])
+def test_claim_carries_the_primary_budgets_in_either_attach_mode(
+    monkeypatch, attach_mode, budgets
+) -> None:
+    """Set budgets reach the claim in both modes; unset ones stay the defaults."""
+    claim = Mock(side_effect=RuntimeError("stop after claim"))
+    monkeypatch.setattr(
+        kvcr_recovery, "KVCRClient", Mock(return_value=Mock(claim=claim))
+    )
+    control: Any = Mock()
+    control.control_bind_address.return_value = ("127.0.0.1", 5555)
+    set_budgets = (
+        {}
+        if budgets is None
+        else {"operation_timeout_ms": budgets[0], "abandon_timeout_ms": budgets[1]}
+    )
+    config = KVCRConfig(
+        nixl_agent_name="target", pool_layouts=[("", mmap.PAGESIZE)], **set_budgets
+    )
+
+    with pytest.raises(RuntimeError, match="stop after claim"):
+        kvcr_recovery.claim_guarded_pool(
+            config,
+            KVCRGuardConfig(
+                kvcr_service_socket_path="/tmp/kvcr.sock",
+                guard_index=3,
+                compatibility_digest="d",
+                attach_mode=attach_mode,
+            ),
+            KVCRBindings(Mock(), Mock(), Mock(), framework_control=control),
+            KVCRBackendConfigs(),
+        )
+
+    kwargs = claim.call_args.kwargs
+    assert kwargs["attach_mode"] == attach_mode
+    assert (kwargs["operation_timeout_ms"], kwargs["abandon_timeout_ms"]) == (
+        budgets or (1000, 5000)
+    )
 
 
 def test_service_dram_rejects_explicit_local_dram_before_claim(monkeypatch) -> None:

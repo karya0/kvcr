@@ -279,12 +279,22 @@ def test_g3_config_validates_paths_and_tier_capacity() -> None:
     )
 
 
+@pytest.mark.parametrize("budgets", [(1000, 5000), (5000, 10000)])
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
+    budgets,
 ) -> None:
     """A claim/release round-trips typed wire messages, geometry, and ownership."""
     events: list[str] = []
     grant = msgspec.structs.replace(_grant(), dead_incarnations=("dead-primary",))
+    grant = msgspec.structs.replace(
+        grant,
+        tier_config=msgspec.structs.replace(
+            grant.tier_config,
+            operation_timeout_ms=budgets[0],
+            abandon_timeout_ms=budgets[1],
+        ),
+    )
     decoded = protocol_module._CLAIM_RESPONSE_DECODER.decode(
         msgspec.msgpack.encode(grant)
     )
@@ -295,7 +305,12 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
 
     hold = KVCRClient("/unused").claim(
-        _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
+        _GUARD_INDEX,
+        _POOL_LAYOUTS,
+        _DIGEST,
+        ("127.0.0.1", 5555),
+        operation_timeout_ms=budgets[0],
+        abandon_timeout_ms=budgets[1],
     )
 
     assert hold._incarnation
@@ -308,6 +323,8 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
             "pool_layouts": _POOL_LAYOUTS,
             "g3": None,
             "remote_fw_dram_backend": "UCX",
+            "operation_timeout_ms": budgets[0],
+            "abandon_timeout_ms": budgets[1],
         },
         "control_host": "127.0.0.1",
         "control_port": 5555,
@@ -324,6 +341,8 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "pool_layouts": _POOL_LAYOUTS,
         "g3": None,
         "remote_fw_dram_backend": "UCX",
+        "operation_timeout_ms": budgets[0],
+        "abandon_timeout_ms": budgets[1],
     }
     assert grant_wire["pools"] == msgspec.to_builtins(_WIRE_POOLS)
     attach.assert_called_once_with(grant.spec)
@@ -536,6 +555,45 @@ def test_fd_claim_round_trips_and_hands_both_descriptors_over(monkeypatch) -> No
     attach_fd.assert_called_once_with(pool_fd, _grant().spec)
     assert hold._control_listener_fd == listener_fd
     hold.release()
+
+
+def test_fd_claim_sends_the_primary_budgets(monkeypatch) -> None:
+    tier = msgspec.structs.replace(
+        _grant().tier_config, operation_timeout_ms=5000, abandon_timeout_ms=10000
+    )
+    connection, _attach_fd = _fd_claim(
+        monkeypatch, _fd_grant(tier_config=tier), fd_count=2
+    )
+
+    KVCRClient("/unused").claim(
+        _GUARD_INDEX,
+        _POOL_LAYOUTS,
+        _DIGEST,
+        ("127.0.0.1", 5555),
+        attach_mode="fd",
+        operation_timeout_ms=5000,
+        abandon_timeout_ms=10000,
+    ).release()
+
+    assert connection.sent[0].tier_config == tier
+
+
+def test_a_v1_tier_config_without_budgets_decodes_to_the_defaults() -> None:
+    tier = msgspec.to_builtins(_TIER_CONFIG)
+    v1_tier = {
+        k: v
+        for k, v in tier.items()
+        if k not in ("operation_timeout_ms", "abandon_timeout_ms")
+    }
+
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(v1_tier), type=_TierConfig)
+
+    assert (decoded.operation_timeout_ms, decoded.abandon_timeout_ms) == (1000, 5000)
+    for field in ("operation_timeout_ms", "abandon_timeout_ms"):
+        with pytest.raises(msgspec.ValidationError):
+            msgspec.msgpack.decode(
+                msgspec.msgpack.encode({**tier, field: 0}), type=_TierConfig
+            )
 
 
 def test_each_response_states_the_descriptor_count_it_carries() -> None:
