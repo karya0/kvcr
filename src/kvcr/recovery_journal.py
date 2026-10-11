@@ -462,6 +462,8 @@ def claim_guarded_pool(
         bind_address(),
         backend_configs.g3,
         backend_configs.remote_fw_dram.backend,
+        operation_timeout_ms=config.operation_timeout_ms,
+        abandon_timeout_ms=config.abandon_timeout_ms,
     )
     # The lease is live from here, and the caller cannot release what it has not
     # been handed yet: anything that fails before this returns has to give the pool

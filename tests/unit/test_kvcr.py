@@ -411,7 +411,12 @@ def test_service_journal_is_attached_before_primary_start(
         remote_fw_dram=RemoteFWDramOptions(backend="REMOTE"),
     )
     controller = KVCR(
-        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", mmap.PAGESIZE)]),
+        KVCRConfig(
+            nixl_agent_name="target",
+            pool_layouts=[("", mmap.PAGESIZE)],
+            operation_timeout_ms=5000,
+            abandon_timeout_ms=10000,
+        ),
         KVCRBindings(Mock(), Mock(), Mock(), framework_control=primary_control),
         backend_configs,
         KVCRGuardConfig(
@@ -428,6 +433,8 @@ def test_service_journal_is_attached_before_primary_start(
         ("127.0.0.1", 5555),
         g3_config,
         "REMOTE",
+        operation_timeout_ms=5000,
+        abandon_timeout_ms=10000,
     )
     assert constructor.call_args.args[1].framework_control is primary_control
     assert constructor.call_args.args[2].g3 is g3_config

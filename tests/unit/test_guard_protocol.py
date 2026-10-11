@@ -253,12 +253,22 @@ def test_g3_config_keeps_its_intrinsic_path_checks() -> None:
         )
 
 
+@pytest.mark.parametrize("budgets", [(1000, 5000), (5000, 10000)])
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
+    budgets,
 ) -> None:
     """A claim/release round-trips typed wire messages, geometry, and ownership."""
     events: list[str] = []
     grant = msgspec.structs.replace(_grant(), dead_incarnations=("dead-primary",))
+    grant = msgspec.structs.replace(
+        grant,
+        tier_config=msgspec.structs.replace(
+            grant.tier_config,
+            operation_timeout_ms=budgets[0],
+            abandon_timeout_ms=budgets[1],
+        ),
+    )
     decoded = protocol_module._CLAIM_RESPONSE_DECODER.decode(
         msgspec.msgpack.encode(grant)
     )
@@ -269,7 +279,12 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
 
     hold = KVCRClient("/unused").claim(
-        _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
+        _GUARD_INDEX,
+        _POOL_LAYOUTS,
+        _DIGEST,
+        ("127.0.0.1", 5555),
+        operation_timeout_ms=budgets[0],
+        abandon_timeout_ms=budgets[1],
     )
 
     assert hold._incarnation
@@ -282,6 +297,8 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
             "pool_layouts": _POOL_LAYOUTS,
             "g3": None,
             "remote_fw_dram_backend": "UCX",
+            "operation_timeout_ms": budgets[0],
+            "abandon_timeout_ms": budgets[1],
         },
         "control_host": "127.0.0.1",
         "control_port": 5555,
@@ -297,6 +314,8 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "pool_layouts": _POOL_LAYOUTS,
         "g3": None,
         "remote_fw_dram_backend": "UCX",
+        "operation_timeout_ms": budgets[0],
+        "abandon_timeout_ms": budgets[1],
     }
     assert grant_wire["pools"] == msgspec.to_builtins(_WIRE_POOLS)
     attach.assert_called_once_with(grant.spec)
