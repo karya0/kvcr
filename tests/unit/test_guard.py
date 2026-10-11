@@ -148,6 +148,22 @@ def test_guard_rejects_too_short_heartbeat_timeout() -> None:
         _configurable_guard(heartbeat_timeout_seconds=0.01)
 
 
+@pytest.mark.parametrize("budgets", [(1000, 5000), (5000, 10000)])
+def test_guard_core_uses_claimed_timeouts(monkeypatch, budgets):
+    guard = _configurable_guard()
+    guard._configured = msgspec.structs.replace(
+        _tier(16), operation_timeout_ms=budgets[0], abandon_timeout_ms=budgets[1]
+    )
+    guard._recovery.attachment = _fake_attachment()
+    guard._recovery.pools = ()
+    constructor = Mock()
+    monkeypatch.setattr(guard_module, "_KVCRCore", constructor)
+    guard._prepare_core()
+    config = constructor.call_args.args[0]
+    assert (config.operation_timeout_ms, config.abandon_timeout_ms) == budgets
+    constructor.return_value._progress.prepare.assert_called_once_with()
+
+
 def test_a_wait_timeout_racing_the_answer_returns_the_answer() -> None:
     """A slow command's success must never be reported back as a timeout."""
     guard = object.__new__(_Guard)

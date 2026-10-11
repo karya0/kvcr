@@ -72,6 +72,8 @@ class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     pool_layouts: PoolBlockLayouts
     g3: _G3Config | None
     remote_fw_dram_backend: Annotated[str, msgspec.Meta(min_length=1)] = "UCX"
+    operation_timeout_ms: Annotated[int, msgspec.Meta(gt=0)] = 1000
+    abandon_timeout_ms: Annotated[int, msgspec.Meta(gt=0)] = 5000
 
     def __post_init__(self) -> None:
         _validate_pool_layouts(self.pool_layouts)
@@ -304,6 +306,8 @@ class KVCRClient:
         control_bind: tuple[str, int],
         g3: G3Options | None = None,
         remote_fw_dram_backend: str = "UCX",
+        operation_timeout_ms: int = 1000,
+        abandon_timeout_ms: int = 5000,
     ) -> KVCRPoolHold:
         """Claim and map one Guard-owned pool group."""
         g3_config = g3 and {
@@ -322,6 +326,8 @@ class KVCRClient:
                     "pool_layouts": pool_layouts,
                     "g3": g3_config,
                     "remote_fw_dram_backend": remote_fw_dram_backend,
+                    "operation_timeout_ms": operation_timeout_ms,
+                    "abandon_timeout_ms": abandon_timeout_ms,
                 },
                 "control_host": control_bind[0],
                 "control_port": control_bind[1],
