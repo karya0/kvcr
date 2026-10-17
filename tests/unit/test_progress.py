@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import json
 import logging
 import threading
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import pytest
 from nixl import nixlNotFoundError, nixlRemoteDisconnectError
 
 from kvcr import progress as progress_module
+from kvcr.local_dram import _LocalCopyOp
 from kvcr.progress import _KVCRProgress, _MemDescriptor, _ProgressOp, _TransferRef
 from kvcr.types import RegionDescriptor
 
@@ -151,6 +153,113 @@ def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRP
         for name in ("", agent.name, "remote-agent"):
             progress.prepare_memory(name, regions)
     return progress
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_native_geometry_exact_metadata_and_caps(level, caplog, monkeypatch):
+    caplog.set_level(level, logger="kvcr.progress")
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent, prepare=False)
+    # Deliberately invalid addresses: diagnostics must never access payload memory.
+    label = "long" * 40
+    regions = (
+        {label: RegionDescriptor(addr=1, size=7, count=80, stride=11, label=label)},
+        {"pool": RegionDescriptor(addr=2, size=13, count=80, label="pool")},
+    )
+    for name in ("", agent.name):
+        progress.prepare_memory(name, regions)
+    refs = [_mem(i, label=label) for i in range(64, -1, -1)] + [
+        _mem(2, label="pool", framework=False)
+    ]
+    describe = Mock(wraps=progress._transfer_geometry)
+    monkeypatch.setattr(progress, "_transfer_geometry", describe)
+    for _ in range(9):
+        agent._next = 0  # Reused public pointer is not the transfer identity.
+        progress.submit_transfer("WRITE", refs, refs, remote_side_agent=agent.name)
+    messages = [m for m in caplog.messages if "native_post " in m]
+    if level == logging.INFO:
+        assert not messages and describe.call_count == 0
+        return
+    assert describe.call_count == 16  # Both lists, first eight admissions only.
+    assert [int(m.split("transfer=")[1].split()[0]) for m in messages] == list(
+        range(1, 10)
+    )
+    assert messages[-1].endswith("geometry=None")
+    geometry = json.loads(messages[0].split(" geometry=", 1)[1])
+    for side in ("local", "remote"):
+        row = geometry[side]
+        assert isinstance(row["catalog"], int)
+        assert row["count"] == 66 and row["bytes"] == 65 * 7 + 13
+        assert row["omitted"] == 2 and row["labels_truncated"] is True
+        assert len(row["selectors"]) == 64
+        assert [s[0] for s in row["selectors"]] == list(range(64, 0, -1))
+        assert all(
+            s[1:] == [True, label[:128], label[:128], s[0], "DRAM", 7, 11, 80]
+            for s in row["selectors"]
+        )
+    assert all(e.startswith(("make:", "submit:")) for e in agent.events)
+
+
+@pytest.mark.parametrize("failure", ["geometry", "post_log", "join_log"])
+@pytest.mark.parametrize("post", ["PROC", "DONE", "ambiguous"])
+def test_local_native_diagnostic_failure_preserves_admitted_transfer(
+    failure, post, monkeypatch, caplog
+):
+    caplog.set_level(logging.DEBUG, logger="kvcr.progress")
+    agent = _TransferAgent()
+    agent.state = "PROC"
+    agent.transfer_result = "DONE" if post == "DONE" else "PROC"
+    agent.submit_exception = post == "ambiguous"
+    progress = _transfer_progress(agent)
+    copy = _LocalCopyOp(
+        op_id=("local_copy", -7),
+        keys=frozenset(),
+        deliver_op_id=None,
+        ordered_keys=(),
+        local_slots=(),
+        src_descriptors=(_mem(0),),
+        dst_descriptors=(_mem(1),),
+        deadline=10,
+        abandon_deadline=20,
+        backend="UCX",
+        clock=lambda: 0,
+        started_at=None,
+    )
+    original = progress_module.logger.debug
+
+    def diagnostic(message, *args, **kwargs):
+        if (
+            failure == "post_log"
+            and "native_post " in message
+            or failure == "join_log"
+            and "native_join " in message
+        ):
+            raise RuntimeError("diagnostic sink failed")
+        return original(message, *args, **kwargs)
+
+    monkeypatch.setattr(progress_module.logger, "debug", diagnostic)
+    if failure == "geometry":
+
+        def broken(*args):
+            assert not any(e.startswith("submit:") for e in agent.events)
+            raise RuntimeError("diagnostic metadata failed")
+
+        monkeypatch.setattr(progress, "_transfer_geometry", broken)
+    done, _ = copy.progress(progress, None)
+    assert done is (post == "DONE")
+    assert copy.failure_latched is (post == "ambiguous")
+    assert agent.events.count("submit:1") == 1
+    if post == "DONE":
+        assert copy.transfer_id is None and copy.success
+        assert not progress._active_transfers
+    else:
+        assert copy.transfer_id == 1 and 1 in progress._active_transfers
+        assert copy.close(progress) is False
+        assert "release-transfer:1" not in agent.events
+        copy.progress(progress, None)
+        assert agent.events.count("submit:1") == 1
+    if failure != "join_log":
+        assert "op=('local_copy', -7) transfer=1" in caplog.text
 
 
 @pytest.mark.parametrize("fail_post", [False, True])

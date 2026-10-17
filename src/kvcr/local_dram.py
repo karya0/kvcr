@@ -23,6 +23,9 @@ from .progress import (
     _ProgressOp,
     _TransferRef,
 )
+from .progress import (
+    logger as progress_logger,
+)
 from .types import (
     BlockKey,
     CacheTier,
@@ -176,6 +179,20 @@ class _LocalCopyOp(_ProgressOp):
                 )
                 self.transfer_id = transfer_id
                 self.failure_latched = not submitted
+                try:
+                    if transfer_id <= 8 and progress_logger.isEnabledFor(logging.DEBUG):
+                        progress_logger.debug(
+                            "KVCR_EVENT native_join agent=%.128s op=%s transfer=%d "
+                            "peer=%.128s submitted=%s kind=local_copy",
+                            progress.nixl_agent_name,
+                            self.op_id,
+                            transfer_id,
+                            progress.nixl_agent_name,
+                            submitted,
+                        )
+                except Exception:
+                    # Missing diagnostics must not complete a still-active copy.
+                    pass
                 if not submitted:
                     logger.debug(
                         "KVCR_EVENT local_copy_submit_failed op=%s", self.op_id

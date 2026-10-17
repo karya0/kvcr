@@ -29,6 +29,8 @@ _OP_CLEANUP_TIMEOUT_SECONDS = 5.0
 _JOIN_TIMEOUT_SECONDS = 10.0
 _STARTUP_TIMEOUT_SECONDS = 30.0
 _RELEASE_LOG_INTERVAL_SECONDS = 1.0
+_GEOMETRY_TRANSFER_LIMIT = 8
+_GEOMETRY_SELECTOR_LIMIT = 64
 _STOP = object()
 _OpId = tuple[str, Any]
 _RegionMaps = tuple[dict[str, RegionDescriptor], dict[str, RegionDescriptor]]
@@ -278,6 +280,8 @@ class _KVCRProgress:
         if not isinstance(remote_side_agent, str) or not remote_side_agent:
             raise ValueError("NIXL remote-side agent must be non-empty")
         agent = self.nixl_agent
+        local = remote = None
+        local_indices = remote_indices = None
         if any(
             isinstance(descriptors[0], _MemDescriptor)
             and descriptors[0].mem_type == "FILE"
@@ -311,6 +315,28 @@ class _KVCRProgress:
         transfer_id = self._next_transfer_id
         state = _TransferState(handle, remote_side_agent, capture_telemetry)
         self._active_transfers[transfer_id] = state
+        geometry = None
+        try:
+            if transfer_id <= _GEOMETRY_TRANSFER_LIMIT and logger.isEnabledFor(
+                logging.DEBUG
+            ):
+                geometry = msgspec.json.encode(
+                    {
+                        "operation": operation,
+                        "local": self._transfer_geometry(
+                            "", local_descriptors, local, local_indices
+                        ),
+                        "remote": self._transfer_geometry(
+                            remote_side_agent,
+                            remote_descriptors,
+                            remote,
+                            remote_indices,
+                        ),
+                    }
+                ).decode()
+        except Exception:
+            # Diagnostics must not change admission or ownership, even if incomplete.
+            pass
         submitted = True
         try:
             post_state = agent.transfer(handle)
@@ -329,19 +355,63 @@ class _KVCRProgress:
                 self._disconnected_remote_agents.add(state.remote_side_agent)
             submitted = False
             logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
-        if logger.isEnabledFor(logging.DEBUG):
-            state.last_api_state = observed
-            logger.debug(
-                "KVCR_EVENT native_post agent=%.128s transfer=%d handle=%r "
-                "peer=%.128s api_state=%.128s submitted=%s",
-                self._nixl_agent_name,
-                transfer_id,
-                handle,
-                remote_side_agent,
-                observed,
-                submitted,
-            )
+        try:
+            if logger.isEnabledFor(logging.DEBUG):
+                state.last_api_state = observed
+                logger.debug(
+                    "KVCR_EVENT native_post agent=%.128s transfer=%d handle=%r "
+                    "peer=%.128s api_state=%.128s submitted=%s tid=%d "
+                    "monotonic_ns=%d geometry=%s",
+                    self._nixl_agent_name,
+                    transfer_id,
+                    handle,
+                    remote_side_agent,
+                    observed,
+                    submitted,
+                    threading.get_native_id(),
+                    time.monotonic_ns(),
+                    geometry,
+                )
+        except Exception:
+            # POST may already own buffers: always return its active transfer ID.
+            pass
         return transfer_id, submitted
+
+    def _transfer_geometry(self, agent_name, descriptors, prepared, indices):
+        """Metadata only; selectors are input catalog rows, not merged native work."""
+        total, selectors, labels_truncated = 0, [], False
+        for i, ref in enumerate(descriptors):
+            if isinstance(ref, _MemDescriptor):
+                total += ref.size
+                continue  # FILE path has no prepared catalog/selector identity.
+            owner, regions = self._catalogs[agent_name]
+            region = _resolve_region(ref, regions, owner)
+            total += region.size
+            if i < _GEOMETRY_SELECTOR_LIMIT:
+                labels_truncated |= len(ref.label) > 128 or len(region.label) > 128
+                # index, namespace, input label, resolved label, element, type,
+                # selected bytes, stride, catalog row count. No addresses/keys.
+                selectors.append(
+                    (
+                        indices[i],
+                        ref.framework,
+                        ref.label[:128],
+                        region.label[:128],
+                        ref.element_index,
+                        region.mem_type,
+                        region.size,
+                        region.stride or region.size,
+                        region.count,
+                    )
+                )
+        return dict(
+            count=len(descriptors),
+            bytes=total,
+            catalog=id(prepared) if prepared is not None else None,
+            selectors=selectors,
+            omitted=len(descriptors) - len(selectors),
+            labels_truncated=labels_truncated,
+        )
 
     def _make_transfer_descriptors(self, descriptors: Sequence[_MemDescriptor]) -> Any:
         mem_type = descriptors[0].mem_type
