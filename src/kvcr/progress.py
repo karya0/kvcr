@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from itertools import chain
+from itertools import chain, islice
 from typing import Annotated, Any
 
 import msgspec
@@ -88,6 +88,9 @@ class _TransferState:
     outcome: bool | None = None
     telemetry: Any | None = None
     next_release_log_at: float = 0.0
+    last_api_state: str | None = None
+    last_poll_at: float | None = None
+    last_release_result: str | None = None
 
 
 @dataclass
@@ -208,7 +211,9 @@ class _KVCRProgress:
         if outcome is None or (require_completion and not outcome):
             try:
                 xfer_state = agent.check_xfer_state(state.handle)
+                observed = xfer_state
             except Exception as error:
+                observed = type(error).__name__
                 if isinstance(error, nixlRemoteDisconnectError):
                     self._disconnected_remote_agents.add(state.remote_side_agent)
                     # NIXL keeps this as the handle's final status; releasing it
@@ -217,6 +222,20 @@ class _KVCRProgress:
                 if state.outcome is not False:
                     logger.warning("NIXL transfer progress failed", exc_info=True)
                 xfer_state = "ERR"
+            if logger.isEnabledFor(logging.DEBUG):
+                if state.last_poll_at is None or observed != state.last_api_state:
+                    logger.debug(
+                        "KVCR_EVENT native_poll agent=%.128s transfer=%d "
+                        "handle=%r peer=%.128s api_state=%.128s require_completion=%s",
+                        self._nixl_agent_name,
+                        transfer_id,
+                        state.handle,
+                        state.remote_side_agent,
+                        observed,
+                        require_completion,
+                    )
+                state.last_poll_at = time.monotonic()
+                state.last_api_state = observed
             # Releasing a pending NIXL/UCX handle can leave DMA running and lose
             # its completion signal. Retain it until native access has stopped.
             # TODO: Enable timeout cancellation for NIXL backends that guarantee
@@ -295,6 +314,7 @@ class _KVCRProgress:
         submitted = True
         try:
             post_state = agent.transfer(handle)
+            observed = post_state
             if post_state == "DONE":
                 state.outcome = True
             elif post_state == "ERR":
@@ -304,10 +324,23 @@ class _KVCRProgress:
                 submitted = False
                 logger.warning("NIXL transfer returned unexpected state %r", post_state)
         except Exception as error:
+            observed = type(error).__name__
             if isinstance(error, nixlRemoteDisconnectError):
                 self._disconnected_remote_agents.add(state.remote_side_agent)
             submitted = False
             logger.warning("NIXL transfer submission was ambiguous", exc_info=True)
+        if logger.isEnabledFor(logging.DEBUG):
+            state.last_api_state = observed
+            logger.debug(
+                "KVCR_EVENT native_post agent=%.128s transfer=%d handle=%r "
+                "peer=%.128s api_state=%.128s submitted=%s",
+                self._nixl_agent_name,
+                transfer_id,
+                handle,
+                remote_side_agent,
+                observed,
+                submitted,
+            )
         return transfer_id, submitted
 
     def _make_transfer_descriptors(self, descriptors: Sequence[_MemDescriptor]) -> Any:
@@ -431,7 +464,10 @@ class _KVCRProgress:
             return False
         try:
             released = release_xfer(state.handle) is not False
-        except Exception:
+            release_result = "released" if released else "retained"
+        except Exception as error:
+            released = False
+            release_result = type(error).__name__
             now = time.monotonic()
             if now >= state.next_release_log_at:
                 logger.warning(
@@ -440,7 +476,18 @@ class _KVCRProgress:
                     exc_info=True,
                 )
                 state.next_release_log_at = now + _RELEASE_LOG_INTERVAL_SECONDS
-            return False
+        if logger.isEnabledFor(logging.DEBUG):
+            if release_result != state.last_release_result:
+                logger.debug(
+                    "KVCR_EVENT native_release agent=%.128s transfer=%d "
+                    "handle=%r peer=%.128s result=%.128s",
+                    self._nixl_agent_name,
+                    transfer_id,
+                    state.handle,
+                    state.remote_side_agent,
+                    release_result,
+                )
+            state.last_release_result = release_result
         if not released:
             return False
         self._active_transfers.pop(transfer_id, None)
@@ -597,6 +644,27 @@ class _KVCRProgress:
             if not self._in_flight_ops:
                 return
             if time.monotonic() >= deadline:
+                if logger.isEnabledFor(logging.DEBUG):
+                    count = len(self._active_transfers)
+                    logger.error(
+                        "KVCR_EVENT native_close agent=%.128s transfers=%d omitted=%d",
+                        self._nixl_agent_name,
+                        count,
+                        max(0, count - 8),
+                    )
+                    for transfer_id, state in islice(self._active_transfers.items(), 8):
+                        logger.error(
+                            "KVCR_EVENT native_close_transfer agent=%.128s "
+                            "transfer=%d handle=%r peer=%.128s api_state=%.128s "
+                            "last_poll_at=%s release=%.128s",
+                            self._nixl_agent_name,
+                            transfer_id,
+                            state.handle,
+                            state.remote_side_agent,
+                            state.last_api_state,
+                            state.last_poll_at,
+                            state.last_release_result,
+                        )
                 raise RuntimeError("KVCR progress operations did not close")
             time.sleep(_IDLE_WAIT_SECONDS)
 

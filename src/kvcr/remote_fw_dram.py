@@ -42,6 +42,9 @@ from .progress import (
     _RegionMaps,
     _TransferRef,
 )
+from .progress import (
+    logger as progress_logger,
+)
 from .types import (
     BlockKey,
     CacheTier,
@@ -374,6 +377,15 @@ class _SourceWriteOp(_RemoteOp):
                     capture_telemetry=backend._telemetry_enabled,
                 )
                 self.transfer_id = transfer_id
+                if progress_logger.isEnabledFor(logging.DEBUG):
+                    progress_logger.debug(
+                        "KVCR_EVENT native_join agent=%.128s op=%d transfer=%d "
+                        "peer=%.128s",
+                        progress.nixl_agent_name,
+                        self.op_handle,
+                        transfer_id,
+                        self.remote_agent,
+                    )
                 self.state = (
                     _SourceWriteState.WRITING
                     if submitted

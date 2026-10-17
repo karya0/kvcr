@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
-from nixl import nixlRemoteDisconnectError
+from nixl import nixlNotFoundError, nixlRemoteDisconnectError
 
 from kvcr import progress as progress_module
 from kvcr.progress import _KVCRProgress, _MemDescriptor, _ProgressOp, _TransferRef
@@ -154,10 +154,14 @@ def _transfer_progress(agent: _TransferAgent, *, prepare: bool = True) -> _KVCRP
 
 
 @pytest.mark.parametrize("fail_post", [False, True])
-@pytest.mark.parametrize("error_type", [nixlRemoteDisconnectError, RuntimeError])
+@pytest.mark.parametrize(
+    "error_type", [nixlRemoteDisconnectError, nixlNotFoundError, RuntimeError]
+)
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
 def test_typed_disconnect_marks_peer_and_releases_handle(
-    monkeypatch, fail_post, error_type
+    monkeypatch, fail_post, error_type, level, caplog
 ) -> None:
+    caplog.set_level(level, logger="kvcr.progress")
     agent = _TransferAgent()
     progress = _transfer_progress(agent)
     # NIXL keeps a failed handle's status, so every later check fails the same way.
@@ -177,10 +181,25 @@ def test_typed_disconnect_marks_peer_and_releases_handle(
         else set()
     )
     result = progress.poll_transfer(transfer_id, require_completion=True)
-    if error_type is RuntimeError:
+    assert fail.call_count == 1 + fail_post
+    fail.assert_called_with(1)
+    diagnostics = [m for m in caplog.messages if "KVCR_EVENT native_" in m]
+    assert bool(diagnostics) == (level == logging.DEBUG)
+    if diagnostics:
+        assert any(f"api_state={error_type.__name__}" in m for m in diagnostics)
+        assert all(
+            "agent=transfer-test transfer=1 handle=1 peer=remote-agent" in m
+            for m in diagnostics
+        )
+    if error_type is not nixlRemoteDisconnectError:
         # An untyped failure may leave DMA running, so the handle stays.
         assert result is None and transfer_id in progress._active_transfers
         assert not progress._disconnected_remote_agents
+        assert progress.poll_transfer(transfer_id, require_completion=True) is None
+        assert fail.call_count == 2 + fail_post
+        assert not any(e.startswith("release-transfer:") for e in agent.events)
+        polls = [m for m in caplog.messages if "native_poll " in m]
+        assert len(polls) == (1 if level == logging.DEBUG else 0)
     else:
         assert result == (False, None)
         assert progress._disconnected_remote_agents == {"remote-agent"}
@@ -333,7 +352,11 @@ def test_progress_submits_and_completes_transfer(
     assert telemetry < release
 
 
-def test_progress_retries_release_while_operation_is_active() -> None:
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_progress_retries_release_while_operation_is_active(
+    level, caplog, monkeypatch
+) -> None:
+    caplog.set_level(level, logger="kvcr.progress")
     agent = _TransferAgent()
     agent.state = "ERR"
     agent.submit_exception = True
@@ -347,13 +370,72 @@ def test_progress_retries_release_while_operation_is_active() -> None:
     )
 
     assert not submitted
+    state = progress._active_transfers[transfer_id]
+    release = Mock(
+        side_effect=[
+            False,
+            False,
+            RuntimeError("release failed"),
+            RuntimeError("release failed"),
+            True,
+        ]
+    )
+    monkeypatch.setattr(agent, "release_xfer_handle", release)
+    monkeypatch.setattr(progress_module, "time", SimpleNamespace(monotonic=lambda: 10))
+    assert progress.poll_transfer(transfer_id) is None
+    last_poll = state.last_poll_at
+    assert progress.poll_transfer(transfer_id) is None
     assert progress.poll_transfer(transfer_id) is None
     assert progress.poll_transfer(transfer_id) is None
     result = progress.poll_transfer(transfer_id)
     assert result is not None
     success, _ = result
     assert not success
-    assert agent.events.count("release-transfer:1") == 3
+    assert release.call_args_list == [((1,),)] * 5
+    assert agent.events.count("check:1") == 1
+    assert sum("NIXL transfer release failed" in m for m in caplog.messages) == 1
+    assert state.last_poll_at == last_poll  # Cached outcome does not poll again.
+    diagnostics = [m for m in caplog.messages if "KVCR_EVENT native_" in m]
+    assert bool(diagnostics) == (level == logging.DEBUG)
+    if diagnostics:
+        assert "api_state=RuntimeError submitted=False" in diagnostics[0]
+        assert [
+            m.rsplit("result=", 1)[1] for m in diagnostics if "native_release" in m
+        ] == ["retained", "RuntimeError", "released"]
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_native_poll_diagnostics_only_record_transitions(level, caplog, monkeypatch):
+    caplog.set_level(level, logger="kvcr.progress")
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent)
+    transfer_id, _ = progress.submit_transfer(
+        "WRITE",
+        [_mem(0)],
+        [_mem(1, owner="remote-agent")],
+        remote_side_agent="remote-agent",
+        notif_msg=b"private-payload",
+    )
+    state = progress._active_transfers[transfer_id]
+    clock = Mock(side_effect=range(10, 18))
+    monkeypatch.setattr(progress_module, "time", SimpleNamespace(monotonic=clock))
+    for status in ("PROC", "PROC", "PEND", "PEND", "ERR", "ERR", "DONE"):
+        agent.state = status
+        result = progress.poll_transfer(transfer_id, require_completion=True)
+        assert result == ((False, None) if status == "DONE" else None)
+    assert agent.events == [
+        "make:WRITE:[]:b'private-payload'",
+        "submit:1",
+        *["check:1"] * 7,
+        "release-transfer:1",
+    ]
+    polls = [m for m in caplog.messages if "native_poll " in m]
+    assert [m.split("api_state=")[1].split()[0] for m in polls] == (
+        ["PROC", "PEND", "ERR", "DONE"] if level == logging.DEBUG else []
+    )
+    assert clock.call_count == (7 if level == logging.DEBUG else 0)
+    assert state.last_poll_at == (16 if level == logging.DEBUG else None)
+    assert "private-payload" not in caplog.text
 
 
 def test_progress_reports_rejected_transfer_submission() -> None:
@@ -613,6 +695,34 @@ def test_progress_close_retries_operations_until_they_release() -> None:
 
     assert operation.close_attempts == 2
     assert progress._in_flight_ops == {}
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_native_close_snapshot_is_bounded_and_cached(level, caplog, monkeypatch):
+    caplog.set_level(level, logger="kvcr.progress")
+    agent = _TransferAgent()
+    progress = _transfer_progress(agent)
+    for _ in range(10):
+        progress.submit_transfer(
+            "WRITE",
+            [_mem(0)],
+            [_mem(1, owner="remote-agent")],
+            remote_side_agent="remote-agent",
+        )
+    progress._in_flight_ops[("test", 1)] = SimpleNamespace(
+        close=lambda _: False, progress=lambda *_: (False, False)
+    )
+    before = list(agent.events)
+    monkeypatch.setattr(progress_module, "_OP_CLEANUP_TIMEOUT_SECONDS", 0)
+    caplog.clear()
+    with pytest.raises(RuntimeError, match="operations did not close"):
+        progress._close_progress_ops()
+    assert agent.events == before  # Snapshot must not query/release native handles.
+    assert len(progress._active_transfers) == 10
+    assert len(caplog.messages) == (9 if level == logging.DEBUG else 0)
+    if level == logging.DEBUG:
+        assert "transfers=10 omitted=2" in caplog.messages[0]
+        assert all("last_poll_at=None release=None" in m for m in caplog.messages[1:])
 
 
 @pytest.mark.parametrize(

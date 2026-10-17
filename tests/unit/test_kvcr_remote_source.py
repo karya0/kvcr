@@ -110,7 +110,11 @@ def _write_probe_message(op_handle: int, incarnation=None) -> bytes:
 
 
 @pytest.mark.parametrize("transfer_state", ["PROC", "DONE"])
-def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypatch):
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_local_source_starts_inline_and_holds_its_slot(
+    transfer_state, level, monkeypatch, caplog
+):
+    caplog.set_level(level, logger="kvcr.progress")
     memory = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16 + b"c" * 16, 48)
     descriptors = [
         _mem_descriptor(i, label=label, end_point_name="source")
@@ -243,6 +247,15 @@ def test_local_source_starts_inline_and_holds_its_slot(transfer_state, monkeypat
                 lambda _: len(agent.released_xfers) == 3 and residency.claim_count == 0,
             )
         assert make_ref.call_count == 2
+        joins = [m for m in caplog.messages if "native_join " in m]
+        assert joins == (
+            [
+                "KVCR_EVENT native_join agent=source op=12 transfer=2 peer=remote-1",
+                "KVCR_EVENT native_join agent=source op=13 transfer=3 peer=remote-1",
+            ]
+            if level == logging.DEBUG
+            else []
+        )
         assert agent.xfers[-1][1] == agent.xfers[-2][1]
         assert pinning.searches == []
     finally:
