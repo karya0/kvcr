@@ -740,8 +740,14 @@ class _Guard:
         Returns whether the pool is safe to take over.
         """
         try:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("KVCR_EVENT heartbeat_fence result=attempt guard=%d pool=%s incarnation=%s monotonic_ns=%d", self._guard_index, self._spec.pool_id, lease.incarnation, time.monotonic_ns())
             signal.pidfd_send_signal(lease.fileno(), signal.SIGKILL)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("KVCR_EVENT heartbeat_fence result=signal_queued guard=%d pool=%s incarnation=%s monotonic_ns=%d", self._guard_index, self._spec.pool_id, lease.incarnation, time.monotonic_ns())
         except ProcessLookupError:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("KVCR_EVENT heartbeat_fence result=already_gone guard=%d pool=%s incarnation=%s monotonic_ns=%d", self._guard_index, self._spec.pool_id, lease.incarnation, time.monotonic_ns())
             return True  # already gone; the poll below will confirm it
         except (OSError, ValueError) as error:
             # Unfenced: a live primary could still be writing, so stay put and

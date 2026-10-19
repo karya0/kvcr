@@ -221,11 +221,20 @@ class _DanglingOps:
             "_TargetPullOp | None", progress._in_flight_ops.get(("target", handle))
         )
         if op is None or op.remote_ctrl_ep != endpoint:
+            logger.debug(
+                "KVCR_EVENT target_probe_ack op=%d incarnation=%s terminal=%s "
+                "accepted=False reason=unknown_op_or_endpoint",
+                handle, incarnation, terminal,
+            )
             return
         expected = op.source_incarnation
         if expected and payload.get("dead_incarnation") == expected:
             # Guard verifies death of this process, not just an expired heartbeat.
             self.sources[endpoint] = incarnation
             self._backend._refused_writes[("target", handle)] = {"success": False}
+            logger.debug("KVCR_EVENT target_probe_ack op=%d expected_incarnation=%s incarnation=%s terminal=%s dead_match=True accepted=True reason=dead_incarnation", handle, expected, incarnation, terminal)
         elif expected == incarnation and terminal:
             self._backend._refused_writes[("target", handle)] = {"success": False}
+            logger.debug("KVCR_EVENT target_probe_ack op=%d expected_incarnation=%s incarnation=%s terminal=%s dead_match=False accepted=True reason=same_incarnation_terminal", handle, expected, incarnation, terminal)
+        else:
+            logger.debug("KVCR_EVENT target_probe_ack op=%d expected_incarnation=%s incarnation=%s terminal=%s dead_match=False accepted=False reason=unproven_terminal", handle, expected, incarnation, terminal)

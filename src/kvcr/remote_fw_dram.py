@@ -148,6 +148,12 @@ class _TargetPullOp(_RemoteOp):
                     "allow_layout_subset": not self.local_fill,
                 },
             )
+            logger.debug(
+                "KVCR_EVENT target_start_write_sent scope=%s op=%d source=%s "
+                "expected_incarnation=%s target_incarnation=%s sent=%s",
+                scope, self.op_id[1], self.remote_ctrl_ep,
+                self.source_incarnation, backend._dangling_ops.incarnation, sent,
+            )
             if not sent:
                 self.success = False
                 self.state = _TargetPullState.FINISHED
@@ -1102,6 +1108,10 @@ class _RemoteFWDram:
         if type(op_handle) is not int:
             logger.warning("KVCR malformed start_write: invalid op_handle")
             return
+        logger.debug(
+            "KVCR_EVENT source_start_write_received op=%d expected_incarnation=%s incarnation=%s",
+            op_handle, payload.get("source_incarnation") if isinstance(payload.get("source_incarnation"), (str, type(None))) else "<invalid-type>", self._dangling_ops.incarnation,
+        )
         try:
             remaining_timeout_ms = payload["remaining_timeout_ms"]
             if (

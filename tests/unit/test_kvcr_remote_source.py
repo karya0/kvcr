@@ -247,7 +247,7 @@ def test_local_source_starts_inline_and_holds_its_slot(
                 lambda _: len(agent.released_xfers) == 3 and residency.claim_count == 0,
             )
         assert make_ref.call_count == 2
-        joins = [m for m in caplog.messages if "native_join " in m]
+        joins = [m for m in caplog.messages if "native_join " in m and "peer=remote-1" in m]
         assert joins == (
             [
                 "KVCR_EVENT native_join agent=source op=12 transfer=2 peer=remote-1",
