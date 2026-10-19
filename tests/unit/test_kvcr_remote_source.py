@@ -151,6 +151,7 @@ def test_local_source_starts_inline_and_holds_its_slot(
         local = source._core._local_dram
         residency = source._core._block_record_map[key].local_dram
         assert residency.indices_by_label == {"": 0, ":b": 1, ":c": 2}
+        caplog.clear()
         make_ref = Mock(wraps=local._descriptor)
         monkeypatch.setattr(local, "_descriptor", make_ref)
         assert not source._core._remote_fw_dram._try_local_source_write(
