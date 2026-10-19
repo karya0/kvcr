@@ -821,6 +821,276 @@ def test_kvcr_metadata_ack_retry_lifecycle():
     ] == ["target_metadata"]
 
 
+@pytest.mark.parametrize("second_refusal", [False, True])
+def test_metadata_required_refusal_retries_same_pinned_deliver_once(second_refusal):
+    control = FakeBytesControl()
+    agent = FakeNixlAgent(metadata=b"target-md")
+    kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)
+    source = "tcp://source:1"
+    key = BlockKey(b"k0")
+    handle, wire_handle = _acked_deliver(control, kvcr, source, key)
+    backend = kvcr._core._remote_fw_dram
+    op = kvcr._core._progress._in_flight_ops[("target", wire_handle)]
+    original_deadline = op.deadline
+    control.sent.clear()
+    refusal = {
+        "type": "write_refused",
+        "reason": "metadata_required",
+        "sender_control_endpoint": source,
+        "sender_incarnation": "guard",
+        "dead_incarnation": "source",
+        "write_attempt": 0,
+        "op_handle": wire_handle,
+    }
+    control.incoming.append(msgspec.msgpack.encode(refusal))
+    _wait_until(lambda: bool(control.sent))
+    retry = _decode_control_message(control.sent[-1][1])
+    assert retry["type"] == "start_write"
+    assert retry["op_handle"] == wire_handle
+    assert retry["write_attempt"] == 1
+    assert retry["source_incarnation"] == "guard"
+    assert retry["target_agent_metadata"] == b"target-md"
+    assert op.deadline == original_deadline
+    assert list(kvcr.poll_completed()) == []
+    assert kvcr._core._progress._in_flight_ops[("target", wire_handle)] is op
+
+    # A duplicate refusal for attempt0 cannot release attempt1's destinations.
+    control.incoming.append(msgspec.msgpack.encode(refusal))
+    _wait_until(lambda: not control.incoming)
+    assert list(kvcr.poll_completed()) == []
+    assert op.write_attempt == 1
+    assert source not in backend._metadata_acked_sources
+    if second_refusal:
+        control.incoming.append(msgspec.msgpack.encode({**refusal, "write_attempt": 1}))
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+    else:
+        agent.notifs["guard"] = [_write_done_notification(wire_handle)]
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: True}))]
+    assert len(control.sent) == 1
+
+
+@pytest.mark.parametrize(
+    "terminal,success", [(True, True), (True, False), (False, False)]
+)
+def test_native_terminal_or_cancellation_outranks_metadata_retry(terminal, success):
+    from kvcr.remote_fw_dram import _TargetPullState
+
+    control, agent = FakeBytesControl(), FakeNixlAgent(metadata=b"target-md")
+    kvcr = _new_kvcr(agent, FakePrimaryPinning(), control)
+    source, key = "tcp://source:1", BlockKey(b"k0")
+    handle, wire_handle = _acked_deliver(control, kvcr, source, key)
+    op = kvcr._core._progress._in_flight_ops[("target", wire_handle)]
+    control.sent.clear()
+    refusal = {
+        "type": "write_refused",
+        "reason": "metadata_required",
+        "sender_control_endpoint": source,
+        "sender_incarnation": "guard",
+        "dead_incarnation": "source",
+        "op_handle": wire_handle,
+    }
+    sent = []
+
+    def recv():
+        if sent:
+            return []
+        sent.append(True)
+        agent.notifs["source"] = [
+            _write_done_notification(wire_handle, success=success, terminal=terminal)
+        ]
+        return [msgspec.msgpack.encode(refusal)]
+
+    control.recv = recv
+    if terminal:
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: success}))]
+    else:
+        _wait_until(lambda: op.state is _TargetPullState.WAITING_TERMINAL)
+        assert list(kvcr.poll_completed()) == []
+        assert _has_outstanding_operations(kvcr)
+        agent.notifs["source"] = [_write_done_notification(wire_handle, success=False)]
+        assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+    assert op.write_attempt == 0
+    assert not any(
+        _decode_control_message(raw)["type"] == "start_write" for _, raw in control.sent
+    )
+
+
+def test_four_initial_deliveries_refresh_even_after_guard_learns_peer_and_late_ack():
+    control, agent = FakeBytesControl(), FakeNixlAgent(metadata=b"target-md")
+    target = _new_kvcr(agent, FakePrimaryPinning(), control)
+    target._core._clock = lambda: 0.0
+    endpoint = "tcp://source:1"
+    operations = []
+    for index in range(4):
+        key = BlockKey(f"k{index}".encode())
+        if index == 0:
+            handle, wire_handle = _acked_deliver(control, target, endpoint, key)
+        else:
+            request = f"load-{index}"
+            target.submit_hint(_router_hint(endpoint), request_id=request)
+            handle = target.deliver({key: [_mem_descriptor()]}, request_id=request)
+            _wait_until(
+                lambda: any(
+                    _decode_control_message(raw).get("op_handle") == handle
+                    for _, raw in control.sent
+                )
+            )
+            wire_handle = handle
+        operations.append(
+            (handle, wire_handle, key, _decode_control_message(control.sent[-1][1]))
+        )
+    active = _block_op_ids(target)
+    control.sent.clear()
+    source_control = FakeBytesControl(endpoint)
+    source_agent = FakeNixlAgent(metadata=b"guard-md")
+    guard = _new_kvcr(source_agent, FakePrimaryPinning(), source_control, name="guard")
+    backend, progress = guard._core._remote_fw_dram, guard._core._progress
+    backend._dangling_ops.incarnation = "guard"
+    backend._dangling_ops.dead_incarnations.add("source")
+    backend._handle_start_write(progress, operations[0][3])
+    # The first retry learns the peer before the other initial requests arrive.
+    backend._remote_agent(
+        progress,
+        {
+            **operations[0][3],
+            "target_agent_metadata": b"target-md",
+            "target_regions": target._core._progress._memory_regions,
+        },
+    )
+    for _, _, _, payload in operations[1:]:
+        backend._handle_start_write(progress, payload)
+    refusals = [
+        _decode_control_message(raw)
+        for _, raw in source_control.sent
+        if _decode_control_message(raw)["type"] == "write_refused"
+    ]
+    assert [payload["reason"] for payload in refusals] == ["metadata_required"] + [
+        "source_restarted"
+    ] * 3
+    assert not source_agent.sent_notifs
+    # An old ACK in this same batch must not suppress retry metadata or restore
+    # the old incarnation on the already-selected retry operation.
+    control.incoming.extend(
+        [msgspec.msgpack.encode(payload) for payload in refusals]
+        + [
+            msgspec.msgpack.encode(
+                {
+                    "type": "target_metadata_ack",
+                    "sender_control_endpoint": endpoint,
+                    "sender_incarnation": "source",
+                }
+            )
+        ]
+    )
+    _wait_until(
+        lambda: (
+            len(
+                [
+                    raw
+                    for _, raw in control.sent
+                    if _decode_control_message(raw)["type"] == "start_write"
+                ]
+            )
+            == 4
+        )
+    )
+    retries = [
+        _decode_control_message(raw)
+        for _, raw in control.sent
+        if _decode_control_message(raw)["type"] == "start_write"
+    ]
+    assert {payload["op_handle"] for payload in retries} == {op[1] for op in operations}
+    assert all(
+        payload["write_attempt"] == 1
+        and payload["source_incarnation"] == "guard"
+        and payload["target_agent_metadata"] == b"target-md"
+        for payload in retries
+    )
+    assert _block_op_ids(target) == active
+    assert list(target.poll_completed()) == []
+    agent.notifs["guard"] = [
+        _write_done_notification(wire_handle) for _, wire_handle, _, _ in operations
+    ]
+    completed = []
+
+    def all_completed():
+        completed.extend(target.poll_completed())
+        return len(completed) == 4
+
+    _wait_until(all_completed)
+    assert dict(completed) == {
+        handle: _op_entries({key: True}) for handle, _, key, _ in operations
+    }
+
+
+@pytest.mark.parametrize("attempt", [True, -1, "0", None, 2])
+def test_malformed_or_future_refusal_attempt_does_not_release_current_write(attempt):
+    control, agent = FakeBytesControl(), FakeNixlAgent()
+    target = _new_kvcr(agent, FakePrimaryPinning(), control)
+    endpoint, key = "tcp://source:1", BlockKey(b"k0")
+    handle, wire_handle = _acked_deliver(control, target, endpoint, key)
+    backend = target._core._remote_fw_dram
+    payload = {
+        "type": "write_refused",
+        "reason": "metadata_required",
+        "sender_control_endpoint": endpoint,
+        "sender_incarnation": "guard",
+        "dead_incarnation": "source",
+        "op_handle": wire_handle,
+        "write_attempt": attempt,
+    }
+    backend._handle_write_refused(target._core._progress, payload)
+    assert backend._refused_writes == {}
+    assert endpoint in backend._metadata_acked_sources
+    assert list(target.poll_completed()) == []
+    agent.notifs["source"] = [_write_done_notification(wire_handle)]
+    assert _poll_until(target, bool) == [(handle, _op_entries({key: True}))]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["generic", "unknown_reason", "unproven_incarnation", "expired", "uncertain"],
+)
+def test_nonrecoverable_refusal_never_retries(case):
+    control, agent = FakeBytesControl(), FakeNixlAgent()
+    target = _new_kvcr(agent, FakePrimaryPinning(), control)
+    target._core._clock = lambda: 0.0
+    endpoint, key = "tcp://source:1", BlockKey(b"k0")
+    handle, wire_handle = _acked_deliver(control, target, endpoint, key)
+    op = target._core._progress._in_flight_ops[("target", wire_handle)]
+    payload = {
+        "type": "write_refused",
+        "reason": "metadata_required",
+        "sender_control_endpoint": endpoint,
+        "sender_incarnation": "guard",
+        "dead_incarnation": "source",
+        "op_handle": wire_handle,
+    }
+    if case == "generic":
+        del payload["reason"]
+    elif case == "unknown_reason":
+        payload["reason"] = "other"
+    elif case == "unproven_incarnation":
+        del payload["dead_incarnation"]
+    elif case == "expired":
+        op.deadline = -1
+    elif case == "uncertain":
+        op.uncertain = True
+    control.sent.clear()
+    control.incoming.append(msgspec.msgpack.encode(payload))
+    if case == "uncertain":
+        _wait_until(
+            lambda: ("target", wire_handle) not in target._core._progress._in_flight_ops
+        )
+        assert list(target.poll_completed()) == []
+    else:
+        assert _poll_until(target, bool) == [(handle, _op_entries({key: False}))]
+    assert op.write_attempt == 0
+    assert not any(
+        _decode_control_message(raw)["type"] == "start_write" for _, raw in control.sent
+    )
+
+
 @pytest.mark.parametrize("source_responsive", [False, True])
 def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     errors = []

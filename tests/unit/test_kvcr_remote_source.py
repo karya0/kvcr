@@ -1463,3 +1463,91 @@ def test_route_setup_propagates_cleanup_errors(message_type) -> None:
     assert str(error.value.__cause__) == "route busy"
     assert sticky.remote_agents == [b"gen-1"]
     assert tier._route_generation == {}
+
+
+@pytest.mark.parametrize(
+    "with_metadata,reason", [(False, "metadata_required"), (True, "source_restarted")]
+)
+def test_known_dead_source_refuses_before_submit_with_retry_proof(
+    with_metadata, reason
+):
+    agent = FakeNixlAgent(metadata=b"guard-md")
+    control = FakeBytesControl("tcp://guard:1")
+    source = _new_kvcr(agent, FakePrimaryPinning(), control, name="guard")
+    tier = source._core._remote_fw_dram
+    tier._dangling_ops.incarnation = "guard"
+    tier._dangling_ops.dead_incarnations.add("old")
+    payload = msgspec.msgpack.decode(
+        _start_write_message(17, b"k", target_agent="target")
+    )
+    payload.update(
+        sender_control_endpoint="tcp://target:1",
+        source_control_endpoint="tcp://guard:1",
+        source_incarnation="old",
+        write_attempt=0,
+    )
+    if not with_metadata:
+        del payload["target_agent_metadata"]
+    tier._handle_start_write(source._core._progress, payload)
+    refusals = [
+        _decode_control_message(data)
+        for _, data in control.sent
+        if _decode_control_message(data)["type"] == "write_refused"
+    ]
+    assert len(refusals) == 1
+    assert refusals[0]["reason"] == reason
+    assert refusals[0]["write_attempt"] == 0
+    assert refusals[0]["sender_incarnation"] == "guard"
+    assert refusals[0]["dead_incarnation"] == "old"
+    assert not agent.xfers
+    assert not tier._dangling_ops.source_writes
+
+
+@pytest.mark.parametrize("submitted", [False, True])
+def test_missing_metadata_for_accepted_write_never_promises_pre_submit_refusal(
+    submitted,
+):
+    from kvcr.dangling_ops import _SourceWriteStatus
+
+    control = FakeBytesControl()
+    agent = FakeNixlAgent()
+    source = _new_kvcr(agent, FakePrimaryPinning(), control, name="source")
+    tier = source._core._remote_fw_dram
+    tier._dangling_ops.source_writes[("target", 17)] = _SourceWriteStatus(
+        submitted=submitted
+    )
+    payload = msgspec.msgpack.decode(
+        _start_write_message(17, b"k", target_agent="target")
+    )
+    payload.update(
+        sender_control_endpoint="tcp://target:1",
+        source_control_endpoint="tcp://source:1",
+    )
+    del payload["target_agent_metadata"]
+    tier._handle_start_write(source._core._progress, payload)
+    assert not control.sent
+    assert not agent.sent_notifs
+
+
+@pytest.mark.parametrize("expected", ["unknown", ["malformed"]])
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_unknown_source_incarnation_never_offers_retry(expected, with_metadata):
+    agent, control = FakeNixlAgent(), FakeBytesControl()
+    source = _new_kvcr(agent, FakePrimaryPinning(), control, name="source")
+    tier = source._core._remote_fw_dram
+    payload = msgspec.msgpack.decode(
+        _start_write_message(17, b"k", target_agent="target")
+    )
+    payload.update(
+        sender_control_endpoint="tcp://target:1",
+        source_control_endpoint="tcp://source:1",
+        source_incarnation=expected,
+    )
+    if not with_metadata:
+        del payload["target_agent_metadata"]
+    tier._handle_start_write(source._core._progress, payload)
+    assert not any(
+        _decode_control_message(raw).get("reason") for _, raw in control.sent
+    )
+    assert not tier._dangling_ops.source_writes
+    assert not agent.xfers

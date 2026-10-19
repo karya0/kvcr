@@ -62,6 +62,10 @@ if TYPE_CHECKING:
 _MEMORY_REF_LISTS_TYPE = tuple[tuple[_TransferRef, ...], ...]
 
 
+class _MissingTargetMetadata(TypeError):
+    pass
+
+
 @dataclass(slots=True)
 class _FwMemResidency:
     descriptors: list[_TransferRef]
@@ -118,6 +122,7 @@ class _TargetPullOp(_RemoteOp):
     probe_sent: bool = False
     source_incarnation: str | None = None
     uncertain: bool = False
+    write_attempt: int = 0
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -127,10 +132,11 @@ class _TargetPullOp(_RemoteOp):
         cancelled = isinstance(event, Mapping) and event.get("cancelled", False)
         scope = "remote_fetch" if self.local_fill else "remote_deliver"
         if self.state is _TargetPullState.START_WRITE:
-            self.source_incarnation = backend._dangling_ops.sources.get(
-                self.remote_ctrl_ep
-            )
-            if now >= self.deadline:
+            if self.write_attempt == 0:
+                self.source_incarnation = backend._dangling_ops.sources.get(
+                    self.remote_ctrl_ep
+                )
+            if cancelled or now >= self.deadline:
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
@@ -143,10 +149,12 @@ class _TargetPullOp(_RemoteOp):
                     "op_handle": self.op_id[1],
                     "remaining_timeout_ms": (self.deadline - now) * 1000,
                     "source_incarnation": self.source_incarnation,
+                    "write_attempt": self.write_attempt,
                     "keys": list(self.ordered_keys),
                     "dst_descriptors": self.dst_descriptors,
                     "allow_layout_subset": not self.local_fill,
                 },
+                force_metadata=self.write_attempt > 0,
             )
             if not sent:
                 self.success = False
@@ -261,6 +269,25 @@ class _TargetPullOp(_RemoteOp):
             # Retry failed enqueues without extending the grace period.
             self.probe_sent = backend._dangling_ops.probe(progress, self)
             return False, self.probe_sent
+        if (
+            self.state is _TargetPullState.WAITING_WRITE_DONE
+            and self.write_attempt == 0
+            and isinstance(event, Mapping)
+            and isinstance(event.get("retry_metadata"), str)
+        ):
+            logger.debug(
+                "KVCR_EVENT metadata_refresh_retry op=%d endpoint=%s reason=%s "
+                "attempt=1 old_incarnation=%s new_incarnation=%s",
+                self.op_id[1],
+                self.remote_ctrl_ep,
+                event["retry_reason"],
+                self.source_incarnation,
+                event["retry_metadata"],
+            )
+            self.source_incarnation = event["retry_metadata"]
+            self.write_attempt = 1
+            self.state = _TargetPullState.START_WRITE
+            return False, True
         return False, False
 
     def close(self, progress: _KVCRProgress) -> bool:
@@ -550,7 +577,7 @@ class _RemoteFWDram:
         self._published_remote_count = 0
         self._metadata_acked_sources: set[str] = set()
         self._metadata_retry_after: dict[str, float] = {}
-        self._refused_writes: dict[_OpId, dict[str, bool]] = {}
+        self._refused_writes: dict[_OpId, dict[str, Any]] = {}
         self._dangling_ops = _DanglingOps(self)
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
@@ -882,7 +909,10 @@ class _RemoteFWDram:
         # Only terminal notifications outrank a refusal for the same operation.
         events = self._poll_notifications(progress)
         for op_id, refusal in self._refused_writes.items():
-            if not events.get(op_id, {}).get("terminal"):
+            native = events.get(op_id, {})
+            if not native.get("terminal") and not (
+                refusal.get("retry_metadata") and native.get("cancelled")
+            ):
                 events[op_id] = refusal
         self._refused_writes.clear()
         observed_work |= bool(events)
@@ -959,6 +989,8 @@ class _RemoteFWDram:
         progress: _KVCRProgress,
         endpoint: str,
         payload: dict[str, Any],
+        *,
+        force_metadata: bool = False,
     ) -> bool:
         kvcr = self._kvcr
         started_at = kvcr._timer()
@@ -975,7 +1007,7 @@ class _RemoteFWDram:
             payload["source_control_endpoint"] = endpoint
         includes_metadata = (
             message_type not in ("target_metadata_ack", "write_refused")
-            and endpoint not in self._metadata_acked_sources
+            and (force_metadata or endpoint not in self._metadata_acked_sources)
             and (
                 message_type in ("target_metadata", "start_write")
                 or kvcr._clock() >= self._metadata_retry_after.get(endpoint, 0)
@@ -1024,7 +1056,13 @@ class _RemoteFWDram:
         if not isinstance(endpoint, str) or type(op_handle) is not int:
             return
         op = progress._in_flight_ops.get(("target", op_handle))
-        if getattr(op, "remote_ctrl_ep", None) != endpoint:
+        attempt = payload.get("write_attempt", 0)
+        if (
+            not isinstance(op, _TargetPullOp)
+            or op.remote_ctrl_ep != endpoint
+            or type(attempt) is not int
+            or attempt != op.write_attempt
+        ):
             return
         # Whatever answered is not the process our metadata was loaded into, so
         # drop the snapshot and let the next request republish it.
@@ -1034,6 +1072,26 @@ class _RemoteFWDram:
         refused_incarnation = getattr(op, "source_incarnation", None)
         if self._dangling_ops.sources.get(endpoint) == refused_incarnation:
             self._dangling_ops.sources.pop(endpoint, None)
+        incarnation = payload.get("sender_incarnation")
+        if (
+            payload.get("reason") in ("metadata_required", "source_restarted")
+            and isinstance(incarnation, str)
+            and incarnation
+            and (
+                refused_incarnation in (None, incarnation)
+                or payload.get("dead_incarnation") == refused_incarnation
+            )
+            and op.write_attempt == 0
+            and op.state is _TargetPullState.WAITING_WRITE_DONE
+            and not op.uncertain
+            and self._kvcr._clock() < op.deadline
+        ):
+            self._refused_writes[("target", op_handle)] = {
+                "terminal": False,
+                "retry_metadata": incarnation,
+                "retry_reason": payload["reason"],
+            }
+            return
         # A refusal is only sent before a write is submitted, so it is as terminal as a
         # failed write_done and safe to act on even from WAITING_TERMINAL. Deliberately
         # unauthenticated: a "resend it" signal on a channel already trusted to let a
@@ -1103,6 +1161,9 @@ class _RemoteFWDram:
             logger.warning("KVCR malformed start_write: invalid op_handle")
             return
         try:
+            attempt = payload.get("write_attempt", 0)
+            if type(attempt) is not int or attempt not in (0, 1):
+                raise TypeError("invalid write_attempt")
             remaining_timeout_ms = payload["remaining_timeout_ms"]
             if (
                 isinstance(remaining_timeout_ms, bool)
@@ -1161,6 +1222,12 @@ class _RemoteFWDram:
                 self._send_write_done(progress, remote_agent, op_handle, False)
             return
         expected = payload.get("source_incarnation")
+        if (
+            isinstance(expected, str)
+            and expected in self._dangling_ops.dead_incarnations
+        ):
+            self._refuse_start_write(progress, payload, op_handle, "source_restarted")
+            return
         if (
             progress._stop_requested
             or not self._dangling_ops.check_source_progress()
@@ -1393,32 +1460,69 @@ class _RemoteFWDram:
         payload: Mapping[str, Any],
         op_handle: OpHandle,
     ) -> None:
+        # A duplicate with lost peer metadata cannot prove an accepted write
+        # (including queued pins) is quiescent. Its original lifecycle owns it.
+        target_agent = payload.get("target_agent")
+        if (
+            isinstance(target_agent, str)
+            and (target_agent, op_handle) in self._dangling_ops.source_writes
+        ):
+            return
         # TODO: reuse this request's peer resolution; if it failed, refuse over
         # control instead of retrying setup.
         try:
             _, remote_agent = self._remote_agent(progress, payload)
         except _RemoteAgentCleanupError:
             raise
-        except Exception:
+        except Exception as error:
             # A promoted Guard adopts the dead primary's control endpoint but
             # not its peer table, so there is no NIXL route home to report on.
             # Refusing over the control channel is the only way this operation
             # ever reaches a terminal.
             logger.warning("KVCR refusing unresolvable start_write op=%d", op_handle)
-            reply_to = payload.get("sender_control_endpoint")
-            reflected_self = payload.get("source_control_endpoint")
-            if isinstance(reply_to, str) and isinstance(reflected_self, str):
-                self._send_control(
-                    progress,
-                    reply_to,
-                    {
-                        "type": "write_refused",
-                        "sender_control_endpoint": reflected_self,
-                        "op_handle": op_handle,
-                    },
+            expected = payload.get("source_incarnation")
+            reason = (
+                "metadata_required"
+                if isinstance(error, _MissingTargetMetadata)
+                and (
+                    expected in (None, self._dangling_ops.incarnation)
+                    or (
+                        isinstance(expected, str)
+                        and expected in self._dangling_ops.dead_incarnations
+                    )
                 )
+                else None
+            )
+            self._refuse_start_write(progress, payload, op_handle, reason)
             return
         self._send_write_done(progress, remote_agent, op_handle, False)
+
+    def _refuse_start_write(
+        self,
+        progress: _KVCRProgress,
+        payload: Mapping[str, Any],
+        op_handle: OpHandle,
+        reason: str | None,
+    ) -> None:
+        reply_to = payload.get("sender_control_endpoint")
+        reflected_self = payload.get("source_control_endpoint")
+        if not isinstance(reply_to, str) or not isinstance(reflected_self, str):
+            return
+        response = {
+            "type": "write_refused",
+            "sender_control_endpoint": reflected_self,
+            "op_handle": op_handle,
+            "write_attempt": payload.get("write_attempt", 0),
+        }
+        if reason is not None:
+            response["reason"] = reason
+            expected = payload.get("source_incarnation")
+            if (
+                isinstance(expected, str)
+                and expected in self._dangling_ops.dead_incarnations
+            ):
+                response["dead_incarnation"] = expected
+        self._send_control(progress, reply_to, response)
 
     # Shared framework-pin coordination.
 
@@ -1891,7 +1995,7 @@ class _RemoteFWDram:
         started_at = kvcr._timer()
         try:
             if not isinstance(target_metadata, bytes):
-                raise TypeError("missing target agent metadata")
+                raise _MissingTargetMetadata("missing target agent metadata")
             remote_agent = agent.add_remote_agent(target_metadata)
             if isinstance(remote_agent, bytes):
                 remote_agent = remote_agent.decode()
