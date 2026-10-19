@@ -132,8 +132,7 @@ class _DanglingOps:
             self.report_target(op, "uncertain")
             self._backend._progress_outbound.append(replace(op))
             self._backend._invalidate_control_peer(op.remote_ctrl_ep)
-            return self.probe(progress, op)
-        return False
+        return self.probe(progress, op)
 
     def report_target(
         self, op: "_TargetPullOp", state: Literal["uncertain", "quiesced"]
@@ -156,6 +155,10 @@ class _DanglingOps:
         )
 
     def probe(self, progress: "_KVCRProgress", op: "_TargetPullOp") -> bool:
+        now = self._backend._kvcr._clock()
+        if now < op.next_probe_at:
+            return False
+        op.next_probe_at = now + 1.0
         return self._backend._send_control(
             progress,
             op.remote_ctrl_ep,

@@ -115,7 +115,7 @@ class _TargetPullOp(_RemoteOp):
     request_id: str | None = None
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
-    probe_sent: bool = False
+    next_probe_at: float = 0.0
     source_incarnation: str | None = None
     uncertain: bool = False
 
@@ -254,7 +254,7 @@ class _TargetPullOp(_RemoteOp):
                 config.abandon_timeout_ms - config.operation_timeout_ms
             ) / 1000
             backend._invalidate_control_peer(self.remote_ctrl_ep)
-            self.probe_sent = backend._dangling_ops.probe(progress, self)
+            backend._dangling_ops.probe(progress, self)
             if self.local_fill:
                 backend._progress_outbound.append(
                     replace(
@@ -263,10 +263,9 @@ class _TargetPullOp(_RemoteOp):
                     )
                 )
             return False, True
-        if self.state is _TargetPullState.WAITING_TERMINAL and not self.probe_sent:
-            # Retry failed enqueues without extending the grace period.
-            self.probe_sent = backend._dangling_ops.probe(progress, self)
-            return False, self.probe_sent
+        if self.state is _TargetPullState.WAITING_TERMINAL:
+            # Retry terminal probes without extending the grace period.
+            return False, backend._dangling_ops.probe(progress, self)
         return False, False
 
     def close(self, progress: _KVCRProgress) -> bool:

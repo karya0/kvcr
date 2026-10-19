@@ -847,6 +847,11 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     control.send = Mock(wraps=control.send, side_effect=[False, DEFAULT])
     control.recv = Mock(wraps=control.recv)
     now = 1.0
+    _wait_until(lambda: control.send.call_count == 1)
+    received = control.recv.call_count
+    _wait_until(lambda: control.recv.call_count >= received + 2)
+    assert control.send.call_count == 1  # Failed enqueues also wait one second.
+    now = 2.0
     _wait_until(lambda: control.send.call_count == 2)
     control.send.side_effect = None
     assert list(kvcr.poll_completed()) == []
@@ -858,11 +863,11 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         _wait_until(lambda: not control.incoming and not agent.notifs)
         assert list(kvcr.poll_completed()) == []
     now = 6.0
-    time.sleep(0.01)
+    _wait_until(lambda: control.send.call_count == 3)
     assert list(kvcr.poll_completed()) == []
     now = 7.0
     assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
-    assert control.send.call_count == 3  # Retry at T, then cleanup at abandonment.
+    _wait_until(lambda: control.send.call_count == 4)
     assert [error.state for error in errors] == ["uncertain"]
     assert errors[0].op_handle == handle
 
@@ -884,10 +889,15 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         _probe_ack(handle, source, sender_incarnation="guard", terminal=True)
     )
     _wait_until(lambda: not control.incoming)
+    sent = control.send.call_count
     now = 100.0
     received = control.recv.call_count
     # Two receives ensure a full progress pass has observed the advanced clock.
     _wait_until(lambda: control.recv.call_count >= received + 2)
+    _wait_until(lambda: control.send.call_count == sent + 1)
+    received = control.recv.call_count
+    _wait_until(lambda: control.recv.call_count >= received + 2)
+    assert control.send.call_count == sent + 1  # No repeated probe at the same clock.
     assert list(kvcr.poll_completed()) == []
     assert _has_outstanding_operations(kvcr)
     assert len(errors) == 1
@@ -909,7 +919,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
         message["op_handle"]
         for _, raw in control.sent
         if (message := _decode_control_message(raw))["type"] == "write_probe"
-    ] == [handle, handle]
+    ] == [handle] * 4  # Successful probes at 2, 6, 7 and 100 seconds.
 
 
 @pytest.mark.parametrize(
