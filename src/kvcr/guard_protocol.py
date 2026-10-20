@@ -96,6 +96,7 @@ class _Claim(msgspec.Struct, frozen=True, tag="claim"):
     control_port: Annotated[int, msgspec.Meta(ge=1, le=65535)]
     version: ProtocolVersion
     incarnation: Annotated[str, msgspec.Meta(min_length=1)] | None = None
+    startup_timeout_seconds: Annotated[int, msgspec.Meta(gt=0)] | None = None
 
     def __post_init__(self) -> None:
         # A literal address, because the service binds this holding the lock
@@ -308,6 +309,7 @@ class KVCRClient:
         remote_fw_dram_backend: str = "UCX",
         operation_timeout_ms: int = 1000,
         abandon_timeout_ms: int = 5000,
+        startup_timeout_seconds: int | None = None,
     ) -> KVCRPoolHold:
         """Claim and map one Guard-owned pool group."""
         g3_config = g3 and {
@@ -333,6 +335,7 @@ class KVCRClient:
                 "control_port": control_bind[1],
                 "version": _PROTOCOL_VERSION,
                 "incarnation": uuid.uuid4().hex,
+                "startup_timeout_seconds": startup_timeout_seconds,
             },
             type=_Claim,
         )
@@ -350,7 +353,10 @@ class KVCRClient:
                     connection.send_with_fd(request, worker_pidfd)
                 finally:
                     os.close(worker_pidfd)
-            response, listener_fd = connection.receive_with_fd(_CLAIM_RESPONSE_DECODER)
+            with connection.extended_timeout(startup_timeout_seconds):
+                response, listener_fd = connection.receive_with_fd(
+                    _CLAIM_RESPONSE_DECODER
+                )
             if isinstance(response, _Error):
                 raise KVCRServiceError(response.message)
             grant_received = True

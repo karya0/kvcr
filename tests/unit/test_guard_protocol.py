@@ -116,6 +116,15 @@ class _RecordingConnection:
         self.received_fd: int | None = os.open(os.devnull, os.O_RDONLY)
         self.handed_fd: int | None = None
         self.closed = False
+        self._connection = Mock()
+        self._connection.gettimeout.return_value = 60.0
+        self._connection.settimeout.side_effect = lambda value: setattr(
+            self._connection.gettimeout, "return_value", value
+        )
+        self.receive_timeouts = []
+
+    def extended_timeout(self, extra_seconds):
+        return protocol_module.FramedConnection.extended_timeout(self, extra_seconds)
 
     def send(self, message: object) -> None:
         self.events.append("send")
@@ -132,6 +141,7 @@ class _RecordingConnection:
         return message, self.handed_fd
 
     def receive(self, _decoder: object) -> object:
+        self.receive_timeouts.append(self._connection.gettimeout())
         self.events.append("receive")
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
@@ -254,9 +264,11 @@ def test_g3_config_keeps_its_intrinsic_path_checks() -> None:
 
 
 @pytest.mark.parametrize("budgets", [(1000, 5000), (5000, 10000)])
+@pytest.mark.parametrize("startup_budget", [None, 600])
 def test_claim_and_release_round_trip_typed_messages_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
     budgets,
+    startup_budget,
 ) -> None:
     """A claim/release round-trips typed wire messages, geometry, and ownership."""
     events: list[str] = []
@@ -277,6 +289,13 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     attach = Mock(return_value=attachment)
     _connect_with(monkeypatch, connection)
     monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
+    real_hold = KVCRPoolHold
+
+    def make_hold(**fields):
+        assert connection._connection.gettimeout() == 60.0
+        return real_hold(**fields)
+
+    monkeypatch.setattr(protocol_module, "KVCRPoolHold", make_hold)
 
     hold = KVCRClient("/unused").claim(
         _GUARD_INDEX,
@@ -285,6 +304,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         ("127.0.0.1", 5555),
         operation_timeout_ms=budgets[0],
         abandon_timeout_ms=budgets[1],
+        startup_timeout_seconds=startup_budget,
     )
 
     assert hold._incarnation
@@ -304,6 +324,7 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
         "control_port": 5555,
         "version": 1,
         "incarnation": hold._incarnation,
+        "startup_timeout_seconds": startup_budget,
     }
     grant_wire = msgspec.to_builtins(grant)
     assert grant_wire["dead_incarnations"] == ("dead-primary",)
@@ -324,6 +345,8 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
     assert hold._control_listener_fd == connection.handed_fd
 
     hold.release()
+    assert connection.receive_timeouts == [60.0 + (startup_budget or 0), 60.0]
+    assert connection._connection.gettimeout() == 60.0
 
     # Released rather than disowned, so the hold closes what it was given.
     assert len(connection.sent_fds) == 1  # The claim carried the worker pidfd.
@@ -382,12 +405,17 @@ def test_claim_and_release_round_trip_typed_messages_and_geometry(
             id="undecodable-grant",
         ),
         pytest.param(_grant(), PermissionError("mapping failed"), id="mapping-failed"),
+        pytest.param(EOFError("claim EOF"), None, id="claim-eof"),
+        pytest.param(TimeoutError("claim timeout"), None, id="claim-timeout"),
+        pytest.param(_Error("claim refused", 1), None, id="claim-refused"),
     ],
 )
+@pytest.mark.parametrize("startup_budget", [None, 600])
 def test_a_failed_claim_is_released_without_masking_the_original(
     monkeypatch: pytest.MonkeyPatch,
     reply: _Granted | BaseException,
     mapping_error: BaseException | None,
+    startup_budget,
 ) -> None:
     """A failed claim hands the pool back and raises the original, unmasked error."""
     # A rollback that itself fails must not mask the mapping error either.
@@ -400,15 +428,31 @@ def test_a_failed_claim_is_released_without_masking_the_original(
     monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
 
     original = mapping_error or (reply if isinstance(reply, BaseException) else None)
-    with pytest.raises(
-        type(original) if original is not None else KVCRGuardProtocolError
-    ) as raised:
+    wrapped = isinstance(reply, (OSError, EOFError))
+    expected = (
+        KVCRSocketError
+        if wrapped
+        else (
+            type(original)
+            if original is not None
+            else KVCRServiceError
+            if isinstance(reply, _Error)
+            else KVCRGuardProtocolError
+        )
+    )
+    with pytest.raises(expected) as raised:
         KVCRClient("/unused").claim(
-            _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
+            _GUARD_INDEX,
+            _POOL_LAYOUTS,
+            _DIGEST,
+            ("127.0.0.1", 5555),
+            startup_timeout_seconds=startup_budget,
         )
 
-    if original is not None:
+    if original is not None and not wrapped:
         assert raised.value is original
+    assert connection.receive_timeouts == [60.0 + (startup_budget or 0), 60.0]
+    assert connection._connection.gettimeout() == 60.0
     # A mismatched or undecodable grant is refused before the pool is mapped.
     assert attach.call_count == (1 if mapping_error else 0)
     claim, release = connection.sent
@@ -416,6 +460,21 @@ def test_a_failed_claim_is_released_without_masking_the_original(
     # Unactivated: this claim never served, so the Guard may resume.
     assert release == _Release(1, activated=False)
     assert connection.closed is True
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5])
+def test_invalid_claim_startup_budget_is_rejected_before_connect(monkeypatch, budget):
+    connect = Mock()
+    monkeypatch.setattr(protocol_module.FramedConnection, "connect", connect)
+    with pytest.raises(msgspec.ValidationError, match="startup_timeout_seconds"):
+        KVCRClient("/unused").claim(
+            _GUARD_INDEX,
+            _POOL_LAYOUTS,
+            _DIGEST,
+            ("127.0.0.1", 5555),
+            startup_timeout_seconds=budget,
+        )
+    connect.assert_not_called()
 
 
 def test_release_failures_leave_a_retry_and_report_a_lost_acknowledgement() -> None:

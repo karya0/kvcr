@@ -13,7 +13,8 @@ import os
 import socket
 import struct
 from array import array
-from contextlib import ExitStack
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from typing import TypeVar
 
 import msgspec
@@ -73,6 +74,17 @@ class FramedConnection:
 
     def close(self) -> None:
         self._connection.close()
+
+    @contextmanager
+    def extended_timeout(self, extra_seconds: int | None) -> Iterator[None]:
+        """Extend one blocking receive, then restore the connection's budget."""
+        previous = self._connection.gettimeout()
+        if extra_seconds is not None and previous is not None:
+            self._connection.settimeout(previous + extra_seconds)
+        try:
+            yield
+        finally:
+            self._connection.settimeout(previous)
 
     def send(self, message: object) -> None:
         self._connection.sendall(self._encode_frame(message))

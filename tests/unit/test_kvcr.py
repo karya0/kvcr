@@ -377,8 +377,9 @@ def test_startup_timeout_retains_nonquiescent_resources(
     assert cores[0].is_quiescent()
 
 
+@pytest.mark.parametrize("startup_budget", [None, 600])
 def test_service_journal_is_attached_before_primary_start(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, startup_budget
 ) -> None:
     """Journal, records, and listener are wired in before the core may start."""
     events: list[str] = []
@@ -440,6 +441,7 @@ def test_service_journal_is_attached_before_primary_start(
             pool_layouts=[("", mmap.PAGESIZE)],
             operation_timeout_ms=5000,
             abandon_timeout_ms=10000,
+            startup_timeout_seconds=startup_budget,
         ),
         KVCRBindings(Mock(), Mock(), Mock(), framework_control=primary_control),
         backend_configs,
@@ -459,6 +461,7 @@ def test_service_journal_is_attached_before_primary_start(
         "REMOTE",
         operation_timeout_ms=5000,
         abandon_timeout_ms=10000,
+        startup_timeout_seconds=startup_budget,
     )
     assert constructor.call_args.args[1].framework_control is primary_control
     assert constructor.call_args.args[2].g3 is g3_config
