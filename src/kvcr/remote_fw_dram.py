@@ -741,7 +741,11 @@ class _RemoteFWDram:
                     self._kvcr._discard_local_dram_fill(item.keys)
                 elif item.state is _TargetPullState.QUARANTINED:
                     self._finish_target_pull(item)
-                elif item.state is _TargetPullState.FINISHED and item.uncertain:
+                elif (
+                    item.state is _TargetPullState.FINISHED
+                    and item.uncertain
+                    and item.local_fill
+                ):
                     self._kvcr._remove_block_dependencies(item)
                     if item.local_fill:
                         self._kvcr._complete_local_dram_fill(item.keys, success=False)
@@ -846,6 +850,8 @@ class _RemoteFWDram:
                     op.keys - completed_keys,
                     success=False,
                 )
+            return
+        if op.state is _TargetPullState.QUARANTINED:
             return
         kvcr._complete(
             cast(OpHandle, op.op_id[1]),
