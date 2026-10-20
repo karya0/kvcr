@@ -866,7 +866,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     _wait_until(lambda: control.send.call_count == 3)
     assert list(kvcr.poll_completed()) == []
     now = 7.0
-    assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+    assert _poll_until(kvcr, lambda _: bool(errors)) == []
     _wait_until(lambda: control.send.call_count == 4)
     assert [error.state for error in errors] == ["uncertain"]
     assert errors[0].op_handle == handle
@@ -874,7 +874,7 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
     # An abandoned operation must not blacklist the endpoint for fresh work.
     kvcr.submit_hint(_router_hint(source), request_id="retry")
     retry = kvcr.deliver(
-        {key: [_mem_descriptor(label="framework")]}, request_id="retry"
+        {key: [_mem_descriptor(1, label="framework")]}, request_id="retry"
     )
     _wait_until(
         lambda: any(
@@ -906,7 +906,9 @@ def test_kvcr_deliver_timeout_probes_source_before_finishing(source_responsive):
             handle, source, sender_incarnation="guard", dead_incarnation="source"
         )
     )
-    assert _poll_until(kvcr, lambda _: len(errors) == 2) == []
+    assert _poll_until(kvcr, lambda _: len(errors) == 2) == [
+        (handle, _op_entries({key: False}))
+    ]
     assert not _has_outstanding_operations(kvcr)
     assert [error.state for error in errors] == ["uncertain", "quiesced"]
     assert (
@@ -1014,9 +1016,11 @@ def test_remote_write_cancellation_and_late_completion(
         with pytest.raises(RuntimeError):
             _poll_until(kvcr, bool)
         assert [error.state for error in errors] == ["uncertain"]
-    assert _poll_until(kvcr, bool) == [(handle, _op_entries({key: False}))]
+    assert _poll_until(kvcr, lambda _: kvcr._core._progress._in_flight_ops[
+        ("target", handle)
+    ].uncertain) == []
     kvcr.submit_hint(_router_hint(source), request_id="retry")
-    other_handle = kvcr.deliver({key: [_mem_descriptor()]}, request_id="retry")
+    other_handle = kvcr.deliver({key: [_mem_descriptor(1)]}, request_id="retry")
     _wait_until(
         lambda: any(
             _decode_control_message(raw).get("op_handle") == other_handle
@@ -1056,7 +1060,10 @@ def test_remote_write_cancellation_and_late_completion(
             _poll_until(kvcr, bool)
     # Even a raising handler must not kill progress or lose another completion.
     if not shutting_down:
-        assert _poll_until(kvcr, bool) == [(other_handle, _op_entries({key: True}))]
+        assert dict(_poll_until(kvcr, lambda completed: len(completed) == 2)) == {
+            handle: _op_entries({key: False}),
+            other_handle: _op_entries({key: True}),
+        }
     if outcome == "log" or shutting_down:
         errors = [
             record.args[0]
