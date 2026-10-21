@@ -745,13 +745,11 @@ class _LocalDram:
 
     def _finish_copy(self, copy: _LocalCopyOp) -> None:
         if copy.transfer_id is not None:
+            # Uncertain snapshot: the native copy is still active. A fill owns
+            # its destination slots and can discard them; a delivery writes into
+            # framework memory, so its completion waits for the terminal copy.
             if copy.deliver_op_id is None:
                 self.discard_fill(copy.keys)
-            else:
-                op = self._pending_deliver_ops[copy.deliver_op_id]
-                for key in copy.ordered_keys:
-                    op.results[key] = _FAILED_RESULT
-                self._finish_deliver_if_ready(op)
             return
         byte_count = self._kvcr._descriptor_bytes(copy.src_descriptors)
         self._kvcr._record_transfer(
