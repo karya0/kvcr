@@ -910,7 +910,11 @@ def test_local_copy_timeout_retains_memory_until_completion(
     assert agent.released_xfers == released
     if abandon:
         now = 5.0
-        assert _poll_until(kvcr, bool) == [(op_handle, _op_entries({key: False}))]
+        # A fill owns its slots and fails its callers at abandonment; a delivery
+        # into framework memory completes only once the copy is terminal.
+        assert _poll_until(kvcr, lambda done: bool(errors)) == (
+            [] if kind == "deliver" else [(op_handle, _op_entries({key: False}))]
+        )
         assert [error.state for error in errors] == ["uncertain"]
         if kind == "deposit":
             assert errors[0].source_blocks == {key: [_mem_descriptor()]}
@@ -942,7 +946,11 @@ def test_local_copy_timeout_retains_memory_until_completion(
             if kind == "deliver"
             else key not in kvcr._core._block_record_map
         ),
-    ) == ([] if abandon else [(op_handle, _op_entries({key: False}))])
+    ) == (
+        []
+        if abandon and kind != "deliver"
+        else [(op_handle, _op_entries({key: False}))]
+    )
     assert [error.state for error in errors] == (
         ["uncertain", "quiesced"] if abandon else []
     )
