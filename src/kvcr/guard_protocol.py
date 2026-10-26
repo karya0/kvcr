@@ -8,6 +8,7 @@ import errno
 import logging
 import mmap
 import os
+import signal
 import socket
 import struct
 import threading
@@ -174,21 +175,29 @@ class _PeerVerdict(enum.Enum):
     NOT_A_PIDFD = "not_a_pidfd"
 
 
-def _peer_pidfd_verdict(connection: socket.socket, worker_pidfd: int) -> _PeerVerdict:
-    """Classify a descriptor a peer sent as its pidfd.
+def _peer_credentials(connection: socket.socket) -> tuple[int, int]:
+    """The peer's (pid, uid) from SO_PEERCRED."""
+    pid, uid, _gid = struct.unpack(
+        "3i",
+        connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        ),
+    )
+    return pid, uid
+
+
+def _peer_pidfd_verdict(
+    connection: socket.socket, worker_pidfd: int
+) -> tuple[_PeerVerdict, int]:
+    """Classify a descriptor a peer sent as its pidfd; also return the peer uid.
 
     With /proc mounted for the service's PID namespace, SO_PEERCRED and fdinfo
     report comparable PIDs. A peer outside the namespace reads as 0 on both.
     """
     try:
-        peer_pid, _, _ = struct.unpack(
-            "3i",
-            connection.getsockopt(
-                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
-            ),
-        )
+        peer_pid, peer_uid = _peer_credentials(connection)
         if os.readlink(f"/proc/self/fd/{worker_pidfd}") != "anon_inode:[pidfd]":
-            return _PeerVerdict.NOT_A_PIDFD
+            return _PeerVerdict.NOT_A_PIDFD, peer_uid
         with open(f"/proc/self/fdinfo/{worker_pidfd}") as info:
             worker_pid = next(
                 (int(line.split()[1]) for line in info if line.startswith("Pid:")),
@@ -198,28 +207,34 @@ def _peer_pidfd_verdict(connection: socket.socket, worker_pidfd: int) -> _PeerVe
         raise KVCRServiceError("cannot verify worker pidfd") from error
     if worker_pid is None or worker_pid == -1:
         # No Pid: line, or -1 for a pidfd whose process is already reaped.
-        return _PeerVerdict.NOT_A_PIDFD
+        return _PeerVerdict.NOT_A_PIDFD, peer_uid
     if peer_pid > 0 and worker_pid == peer_pid:
-        return _PeerVerdict.VERIFIED
+        return _PeerVerdict.VERIFIED, peer_uid
     if peer_pid == 0 and worker_pid == 0:
-        return _PeerVerdict.PEER_NOT_VISIBLE
-    return _PeerVerdict.MISMATCH
+        return _PeerVerdict.PEER_NOT_VISIBLE, peer_uid
+    return _PeerVerdict.MISMATCH, peer_uid
 
 
 PeerTrust = Literal["strict", "trusted-peer"]
 
 
 def _peer_uid(connection: socket.socket) -> int | None:
-    """The peer's uid from SO_PEERCRED, for logs only."""
+    """The peer's uid for logs only; None where SO_PEERCRED is unavailable."""
     try:
-        return struct.unpack(
-            "3i",
-            connection.getsockopt(
-                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
-            ),
-        )[2]
-    except (AttributeError, OSError, struct.error):
+        return _peer_credentials(connection)[1]
+    except (AttributeError, OSError, struct.error, TypeError):
         return None
+
+
+def _can_signal(pidfd: int) -> bool:
+    """Whether this process may signal the pidfd's process (signal 0, no delivery)."""
+    try:
+        signal.pidfd_send_signal(pidfd, 0)
+    except ProcessLookupError:
+        return True  # already gone; the poll confirms it
+    except (AttributeError, OSError):
+        return False
+    return True
 
 
 def peer_liveness_mode(peer_trust: PeerTrust) -> str:
@@ -238,8 +253,7 @@ def peer_liveness_mode(peer_trust: PeerTrust) -> str:
 class PidfdLiveness:
     """Own the pidfd returned for an accepted Unix-socket peer.
 
-    ``fenceable`` is False when the pidfd was accepted without proving it names
-    the peer: it is then only a death signal, never a handle to signal through.
+    ``fenceable`` means the pidfd is verified and this process may signal it.
     """
 
     def __init__(
@@ -266,11 +280,7 @@ class PidfdLiveness:
         worker_pidfd: int | None = None,
         peer_trust: PeerTrust = "strict",
     ) -> "PidfdLiveness":
-        """Prefer the kernel's peer pidfd; fall back to a checked transferred one.
-
-        Under "trusted-peer" a peer in another PID namespace, which cannot be
-        verified, is accepted but is not fenceable.
-        """
+        """Prefer the kernel's peer pidfd; fall back to a checked transferred one."""
         with contextlib.ExitStack() as transferred:
             if worker_pidfd is not None:
                 transferred.callback(os.close, worker_pidfd)
@@ -283,7 +293,7 @@ class PidfdLiveness:
                     message = "worker pidfd is required without SO_PEERPIDFD"
                     logger.warning(message)
                     raise KVCRServiceError(message) from error
-                verdict = _peer_pidfd_verdict(connection, worker_pidfd)
+                verdict, peer_uid = _peer_pidfd_verdict(connection, worker_pidfd)
                 trusted = (
                     peer_trust == "trusted-peer"
                     and verdict is _PeerVerdict.PEER_NOT_VISIBLE
@@ -292,16 +302,24 @@ class PidfdLiveness:
                     raise KVCRServiceError(
                         "worker pidfd does not match socket peer"
                     ) from error
+                if trusted:
+                    logger.warning(
+                        "KVCR accepted an unverified worker pidfd (peer_uid=%s): "
+                        "its lease cannot be fenced",
+                        peer_uid,
+                    )
                 liveness = cls(
                     worker_pidfd,
                     mode="pidfd_trusted" if trusted else "pidfd_verified",
                     verified=not trusted,
-                    fenceable=not trusted,
-                    peer_uid=_peer_uid(connection),
+                    fenceable=not trusted and _can_signal(worker_pidfd),
+                    peer_uid=peer_uid,
                 )
                 transferred.pop_all()
                 return liveness
-            return cls(pidfd, peer_uid=_peer_uid(connection))
+            return cls(
+                pidfd, fenceable=_can_signal(pidfd), peer_uid=_peer_uid(connection)
+            )
 
     def fileno(self) -> int:
         if self._pidfd < 0:

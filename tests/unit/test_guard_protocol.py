@@ -624,7 +624,7 @@ def _stub_peer_view(
     # Absent on macOS; the connection is a stand-in either way.
     monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
     connection = Mock()
-    connection.getsockopt.return_value = struct.pack("3i", peer_pid, 0, 0)
+    connection.getsockopt.return_value = struct.pack("3i", peer_pid, 77, 0)
     monkeypatch.setattr(protocol_module.os, "readlink", lambda _path: link)
     monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: io.StringIO(fdinfo))
     return connection
@@ -654,7 +654,7 @@ def test_peer_pidfd_verdict(
     connection = _stub_peer_view(
         monkeypatch, peer_pid=peer_pid, link=link, fdinfo=fdinfo
     )
-    assert _peer_pidfd_verdict(connection, 5) is verdict
+    assert _peer_pidfd_verdict(connection, 5) == (verdict, 77)
 
 
 def test_peer_pidfd_verdict_fails_closed_when_proc_is_unreadable(
@@ -668,86 +668,70 @@ def test_peer_pidfd_verdict_fails_closed_when_proc_is_unreadable(
         _peer_pidfd_verdict(connection, 5)
 
 
-def test_strict_mode_refuses_a_peer_it_cannot_see(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    connection = _stub_peer_view(monkeypatch, peer_pid=0)
-    connection.getsockopt.side_effect = [
-        OSError(errno.ENOPROTOOPT, "no"),
-        struct.pack("3i", 0, 0, 0),
-    ]
-    descriptor = os.open(os.devnull, os.O_RDONLY)
-    with pytest.raises(KVCRServiceError, match="does not match socket peer"):
-        PidfdLiveness.from_peer_socket(connection, descriptor)
-    with pytest.raises(OSError):
-        os.fstat(descriptor)  # the refused descriptor was closed
-
-
-def _legacy_connection(monkeypatch: pytest.MonkeyPatch, verdict: _PeerVerdict) -> Mock:
-    """A peer on a kernel without SO_PEERPIDFD, whose pidfd gets this verdict."""
-    connection = Mock()
-    connection.getsockopt.side_effect = [
-        OSError(errno.ENOPROTOOPT, "no"),
-        struct.pack("3i", 0, 0, 1234),
-    ]
-    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+@pytest.fixture
+def _signal_probe(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """The signal-0 reachability probe, absent on macOS."""
+    probe = Mock()
     monkeypatch.setattr(
-        protocol_module, "_peer_pidfd_verdict", lambda _connection, _fd: verdict
+        protocol_module.signal, "pidfd_send_signal", probe, raising=False
     )
-    return connection
+    return probe
 
 
-def test_trusted_peer_grants_a_peer_it_cannot_see_without_fencing(
+# (trust, verdict) -> (mode, verified, fenceable), or None when refused.
+@pytest.mark.parametrize(
+    ("trust", "verdict", "expected"),
+    [
+        ("strict", _PeerVerdict.PEER_NOT_VISIBLE, None),
+        (
+            "trusted-peer",
+            _PeerVerdict.PEER_NOT_VISIBLE,
+            ("pidfd_trusted", False, False),
+        ),
+        ("strict", _PeerVerdict.VERIFIED, ("pidfd_verified", True, True)),
+        ("trusted-peer", _PeerVerdict.VERIFIED, ("pidfd_verified", True, True)),
+        ("trusted-peer", _PeerVerdict.MISMATCH, None),
+        ("trusted-peer", _PeerVerdict.NOT_A_PIDFD, None),
+    ],
+)
+def test_transferred_pidfd_acceptance_by_trust_and_verdict(
     monkeypatch: pytest.MonkeyPatch,
+    _signal_probe: Mock,
+    trust: str,
+    verdict: _PeerVerdict,
+    expected: tuple[str, bool, bool] | None,
 ) -> None:
-    connection = _legacy_connection(monkeypatch, _PeerVerdict.PEER_NOT_VISIBLE)
+    connection = Mock()
+    connection.getsockopt.side_effect = OSError(errno.ENOPROTOOPT, "no")
+    monkeypatch.setattr(
+        protocol_module, "_peer_pidfd_verdict", lambda _connection, _fd: (verdict, 1234)
+    )
     descriptor = os.open(os.devnull, os.O_RDONLY)
-    liveness = PidfdLiveness.from_peer_socket(connection, descriptor, "trusted-peer")
+    if expected is None:
+        with pytest.raises(KVCRServiceError, match="does not match socket peer"):
+            PidfdLiveness.from_peer_socket(connection, descriptor, trust)
+        with pytest.raises(OSError):
+            os.fstat(descriptor)  # the refused descriptor was closed
+        _signal_probe.assert_not_called()
+        return
+    liveness = PidfdLiveness.from_peer_socket(connection, descriptor, trust)
     try:
-        assert liveness.fileno() == descriptor
-        assert (liveness.mode, liveness.verified, liveness.fenceable) == (
-            "pidfd_trusted",
-            False,
-            False,
-        )
+        assert (liveness.mode, liveness.verified, liveness.fenceable) == expected
         assert liveness.peer_uid == 1234
+        # An unverified pidfd is never probed, let alone signalled.
+        assert _signal_probe.called is expected[2]
     finally:
         liveness.close()
 
 
-def test_trusted_peer_keeps_a_verified_pidfd_fenceable(
-    monkeypatch: pytest.MonkeyPatch,
+def test_peer_pidfd_path_ignores_the_trust_mode(
+    monkeypatch: pytest.MonkeyPatch, _signal_probe: Mock
 ) -> None:
-    connection = _legacy_connection(monkeypatch, _PeerVerdict.VERIFIED)
-    liveness = PidfdLiveness.from_peer_socket(
-        connection, os.open(os.devnull, os.O_RDONLY), "trusted-peer"
-    )
-    try:
-        assert (liveness.mode, liveness.verified, liveness.fenceable) == (
-            "pidfd_verified",
-            True,
-            True,
-        )
-    finally:
-        liveness.close()
-
-
-@pytest.mark.parametrize("verdict", [_PeerVerdict.MISMATCH, _PeerVerdict.NOT_A_PIDFD])
-def test_trusted_peer_still_refuses_a_bad_pidfd(
-    monkeypatch: pytest.MonkeyPatch, verdict: _PeerVerdict
-) -> None:
-    connection = _legacy_connection(monkeypatch, verdict)
-    descriptor = os.open(os.devnull, os.O_RDONLY)
-    with pytest.raises(KVCRServiceError, match="does not match socket peer"):
-        PidfdLiveness.from_peer_socket(connection, descriptor, "trusted-peer")
-    with pytest.raises(OSError):
-        os.fstat(descriptor)
-
-
-def test_peer_pidfd_path_ignores_the_trust_mode() -> None:
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
     kernel_pidfd = os.open(os.devnull, os.O_RDONLY)
     connection = Mock()
-    connection.getsockopt.return_value = kernel_pidfd
+    # The pidfd, then SO_PEERCRED for the log-only uid.
+    connection.getsockopt.side_effect = [kernel_pidfd, struct.pack("3i", 1, 2, 3)]
     liveness = PidfdLiveness.from_peer_socket(connection, None, "trusted-peer")
     try:
         assert liveness.fileno() == kernel_pidfd
@@ -756,6 +740,31 @@ def test_peer_pidfd_path_ignores_the_trust_mode() -> None:
             True,
             True,
         )
+        assert liveness.peer_uid == 2
+    finally:
+        liveness.close()
+
+
+@pytest.mark.parametrize(
+    ("failure", "fenceable"),
+    [
+        (None, True),
+        (OSError(errno.EINVAL, "other pid namespace"), False),
+        (PermissionError(errno.EPERM, "denied"), False),
+        (ProcessLookupError(errno.ESRCH, "gone"), True),
+    ],
+)
+def test_fenceable_follows_a_signal_zero_probe(
+    _signal_probe: Mock, failure: OSError | None, fenceable: bool
+) -> None:
+    _signal_probe.side_effect = failure
+    kernel_pidfd = os.open(os.devnull, os.O_RDONLY)
+    connection = Mock()
+    connection.getsockopt.return_value = kernel_pidfd
+    liveness = PidfdLiveness.from_peer_socket(connection)
+    try:
+        _signal_probe.assert_called_once_with(kernel_pidfd, 0)
+        assert liveness.fenceable is fenceable
     finally:
         liveness.close()
 

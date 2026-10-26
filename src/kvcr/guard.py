@@ -770,25 +770,14 @@ class _Guard:
                 self._reserved = None
 
     def _fence_missing_primary(self, lease: "_Lease") -> bool:
-        """Kill a primary that stopped heartbeating, so it cannot write again.
+        """Best-effort SIGKILL of a primary that stopped heartbeating.
 
-        Best-effort, and weaker than the fenced-takeover contract: a successful
-        pidfd_send_signal() means the signal was queued, not that the primary
-        stopped. SIGKILL cannot be caught, but a primary in uninterruptible
-        sleep finishes its kernel operation first, and nothing here orders
-        delivery before promotion. Only confirmed exit via POLLIN fences for
-        certain, which is why this stays opt-in.
-
-        Checking PF_EXITING (0x4 in field 9 of /proc/<pid>/stat) would close
-        most of that gap far sooner than the pidfd reports death, but it needs
-        a shared PID namespace, which separate containers do not have.
-
-        A lease accepted without proof that its pidfd names the peer is never
-        signalled: only its death, seen as POLLIN, may promote.
-
-        Returns whether the pool is safe to take over.
+        A queued signal is not a stopped primary (uninterruptible sleep), and
+        PF_EXITING needs a shared PID namespace, so only POLLIN fences for
+        certain. An unfenceable lease is never signalled. Returns whether the
+        pool is safe to take over.
         """
-        if not getattr(lease, "fenceable", True):
+        if not lease.fenceable:
             if self._fence_failed is not lease:
                 self._fence_failed = lease
                 logger.warning(
@@ -846,9 +835,9 @@ class _Guard:
                         self._spec.pool_id,
                         bind[0],
                         bind[1],
-                        getattr(liveness, "mode", None),
-                        getattr(liveness, "verified", None),
-                        getattr(liveness, "peer_uid", None),
+                        liveness.mode,
+                        liveness.verified,
+                        liveness.peer_uid,
                     )
                     return self._spec, self._recovery.pools, granted_fd, liveness
             # Refused at the commit: a closing service must not grant a pool.

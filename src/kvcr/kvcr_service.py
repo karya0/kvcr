@@ -823,17 +823,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(default: unlink on exit, allocate fresh); never run adopting and "
         "non-adopting services on one pool directory",
     )
-    # The pidfd is a liveness handle, not authorization: who may claim is decided
-    # by who can reach the socket. "trusted-peer" accepts a pidfd from a peer in
-    # another PID namespace (Guard and workers in separate pods), which cannot be
-    # matched to the connection. A buggy peer can then cause early or never
-    # promotion of its own pool only, and such a lease is never fenced by signal.
+    # The pidfd is a liveness handle, not authorization: who may claim is whoever
+    # can reach the socket. trusted-peer accepts a pidfd from a peer in another PID
+    # namespace, which cannot be matched to the connection, and never signals it. A
+    # buggy peer can then cause early or never promotion of its own pool only. An
+    # unfenceable lease whose worker hangs alive, or whose pidfd names a long-lived
+    # sibling, holds its guard_index until that process exits (POLLIN fires on
+    # thread-group exit); a pidfd naming a process outside the pod needs a restart.
     parser.add_argument(
         "--peer-trust",
         choices=("strict", "trusted-peer"),
         default="strict",
-        help="accept a worker pidfd only when verified against the socket peer "
-        "(strict), or also from a peer in another PID namespace (trusted-peer)",
+        help="require a worker pidfd verified against the socket peer (strict), or "
+        "also accept one from another PID namespace (trusted-peer)",
     )
     parser.add_argument(
         "--log-level",
