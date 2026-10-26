@@ -30,6 +30,7 @@ from .control_channels import (
 from .guard import _Guard, _Lease
 from .guard_protocol import (
     _CLAIM_DECODER,
+    _claim_fd_counts,
     _HOLD_DECODER,
     _MIN_HEARTBEAT_TIMEOUT_SECONDS,
     _PROTOCOL_VERSION,
@@ -284,6 +285,24 @@ class _PoolRegistry:
         self.on_uncontained_failure(error)
 
 
+def _open_pool_fd(spec: KVCRPoolSpec) -> int:
+    """A fresh open-file-description of the pool, for one claimant.
+
+    Never a dup of the Guard's descriptor: flock belongs to the description,
+    and the claimant's shared lock must be independent of the Guard's or an
+    orphan check could not tell a live worker from a dead one.
+    """
+    pool_fd = os.open(spec.path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        pool_stat = os.fstat(pool_fd)
+        if (pool_stat.st_dev, pool_stat.st_ino) != (spec.device, spec.inode):
+            raise KVCRServiceError("KVCR pool file does not match its grant")
+    except BaseException:
+        os.close(pool_fd)
+        raise
+    return pool_fd
+
+
 class _RequestHandler(socketserver.BaseRequestHandler):
     server: "_ThreadingUnixServer"
     request: socket.socket
@@ -293,7 +312,10 @@ class _RequestHandler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:
         try:
-            request, worker_pidfd = self.channel.receive_with_fd(_CLAIM_DECODER)
+            request, worker_fds = self.channel.receive_with_fd(
+                _CLAIM_DECODER, _claim_fd_counts
+            )
+            worker_pidfd = worker_fds[0] if worker_fds else None
         except (EOFError, OSError):
             return
         except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
@@ -323,7 +345,14 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             # No timeout: a held connection must wait as long as the lease lives.
             # Inside the try: shutdown may have landed; listener_fd closes either way.
             self.request.settimeout(None)
-            self.channel.send_with_fd(response, listener_fd)
+            if response.attach_mode == "fd":
+                pool_fd = _open_pool_fd(response.spec)
+                try:
+                    self.channel.send_with_fd(response, pool_fd, listener_fd)
+                finally:
+                    os.close(pool_fd)
+            else:
+                self.channel.send_with_fd(response, listener_fd)
         # The lease is already granted and the send may have partially
         # crossed: releasing could double-grant a pool a claimant just mapped.
         # Hold it instead, under the same fencing as any lease: the claimant's
@@ -448,6 +477,7 @@ class _ThreadingUnixServer(
                 _PROTOCOL_VERSION,
                 dead_incarnations=guard.dead_incarnations,
                 heartbeat_enabled=guard.heartbeat_enabled,
+                attach_mode=request.attach_mode,
             ),
             (request.guard_index, listener_fd, lease),
         )

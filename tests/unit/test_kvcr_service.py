@@ -41,13 +41,14 @@ from kvcr.guard_protocol import (
     _TierConfig,
 )
 from kvcr.kvcr_service import (
+    _open_pool_fd,
     _KVCRService,
     _parse_args,
     _PoolRegistry,
     _RequestHandler,
     _ThreadingUnixServer,
 )
-from kvcr.memory import _KVCRPoolOwner
+from kvcr.memory import _KVCRPoolOwner, _reclaim_pool_if_orphaned
 
 
 def _holders_of(registry) -> dict[int, object]:
@@ -1555,3 +1556,59 @@ def test_service_startup_timeout_defaults_to_sixty_seconds() -> None:
 def test_invalid_pool_size_items_are_rejected(value: str) -> None:
     with pytest.raises(SystemExit):
         _parse_args(_service_args(value))
+
+
+def test_fd_claim_maps_the_pool_without_opening_its_path(tmp_path: Path) -> None:
+    """Linux only: pidfd liveness. The worker gets the pool as a descriptor."""
+    with _running_server(tmp_path) as harness:
+        guard = harness.server._registry._guards[0]
+        pool_path = Path(guard._spec.path)
+        with patch(
+            "kvcr.guard_protocol.KVCRPoolAttachment.attach",
+            side_effect=AssertionError("fd mode must not open the pool path"),
+        ):
+            hold = harness.client.claim(
+                0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0), attach_mode="fd"
+            )
+        try:
+            assert hold._attachment.address
+            assert hold._attachment._spec == guard._spec
+        finally:
+            hold.release()
+        # The worker's lock was its own: with it gone the Guard's still holds.
+        assert _reclaim_pool_if_orphaned(pool_path) is False
+        assert pool_path.exists()
+
+
+def test_a_path_claim_still_works_against_a_service_that_supports_fd(
+    tmp_path: Path,
+) -> None:
+    with _running_server(tmp_path) as harness:
+        hold = harness.client.claim(
+            0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
+        )
+        assert hold._attachment.address
+        hold.release()
+
+
+def test_each_grant_gets_a_fresh_open_file_description(tmp_path: Path) -> None:
+    """Never the Guard's own descriptor: a worker's flock must be its own."""
+    owner = _KVCRPoolOwner.allocate(
+        pool_id="engine",
+        pool_size_bytes=2 * _PAGE_BLOCK_SIZE_BYTES,
+        journal_bytes=_PAGE_BLOCK_SIZE_BYTES,
+        pool_dir=tmp_path,
+    )
+    try:
+        first, second = _open_pool_fd(owner.spec), _open_pool_fd(owner.spec)
+        try:
+            assert first != second
+            assert os.fstat(first).st_ino == owner.spec.inode
+        finally:
+            os.close(first)
+            os.close(second)
+        tampered = msgspec.structs.replace(owner.spec, inode=owner.spec.inode + 1)
+        with pytest.raises(KVCRServiceError, match="does not match"):
+            _open_pool_fd(tampered)
+    finally:
+        owner.close()
