@@ -812,7 +812,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--adopt-pools",
         action="store_true",
         help="keep pool files on exit and adopt a previous run's on start, cold "
-        "(default: unlink on exit, allocate fresh)",
+        "(default: unlink on exit, allocate fresh); never run adopting and "
+        "non-adopting services on one pool directory",
     )
     parser.add_argument(
         "--log-level",

@@ -450,6 +450,7 @@ class _KVCRPoolOwner:
                 _ADOPT_EPOCH_OFFSET,
             )
             if not _try_lock_pool(self._file_descriptor, exclusive=False):
+                # Linux's failed conversion leaves no lock; BSD/macOS may keep the old.
                 fcntl.flock(self._file_descriptor, fcntl.LOCK_UN)
                 return False
             if os.fstat(self._file_descriptor).st_size > self.spec.mapping_bytes:
