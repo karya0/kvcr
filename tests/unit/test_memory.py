@@ -500,7 +500,8 @@ def test_a_kept_pool_is_adopted_with_its_bytes_and_identity(tmp_path: Path) -> N
     second = _adopt(tmp_path)
 
     assert second is not None
-    assert second.spec == first.spec
+    assert not second.held
+    assert second.spec == msgspec.structs.replace(first.spec, epoch=1)
     assert [path.name for path in tmp_path.iterdir()] == [Path(first.spec.path).name]
     with open(second.spec.path, "rb") as pool:
         pool.seek(_TEST_JOURNAL_BYTES)
@@ -579,6 +580,8 @@ def test_a_pool_that_is_not_what_was_built_is_refused(
 
     assert _adopt(tmp_path) is None
     assert "Refusing to adopt KVCR pool" in caplog.text
+    # Refused, not repaired: the file is left for the purge.
+    assert os.path.lexists(kept.spec.path)
 
 
 def test_a_pool_built_for_other_terms_is_refused(tmp_path: Path) -> None:
@@ -586,8 +589,6 @@ def test_a_pool_built_for_other_terms_is_refused(tmp_path: Path) -> None:
     kept.close()
 
     assert _adopt(tmp_path, stamp=bytes(32)) is None
-    # Refused, not repaired: the file is left for the purge.
-    assert Path(kept.spec.path).exists()
 
 
 def test_adoption_is_held_by_one_service_at_a_time(tmp_path: Path) -> None:
@@ -625,9 +626,42 @@ def test_a_pool_a_previous_worker_holds_is_adopted_held_until_it_lets_go(
     adopted.close()
 
 
-def test_a_pool_nobody_holds_is_adopted_ready(tmp_path: Path) -> None:
-    _kept_pool(tmp_path).close()
+@pytest.fixture
+def _madv_dontfork(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Absent on macOS; the attach path only needs the call to succeed.
+    monkeypatch.setattr(mmap, "MADV_DONTFORK", mmap.MADV_NORMAL, raising=False)
+
+
+def _attach(spec: KVCRPoolSpec) -> KVCRPoolAttachment:
+    return KVCRPoolAttachment.attach_fd(os.open(spec.path, os.O_RDWR), spec)
+
+
+@pytest.mark.usefixtures("_madv_dontfork")
+def test_a_grant_from_before_an_adoption_cannot_attach_after_it(
+    tmp_path: Path,
+) -> None:
+    first = _kept_pool(tmp_path)
+    old_grant = first.spec
+    assert old_grant.epoch == 0
+    first.close()
+
     adopted = _adopt(tmp_path)
+
     assert adopted is not None
-    assert not adopted.held
+    assert adopted.spec.epoch == 1
+    with pytest.raises(ValueError, match="adopted since this grant"):
+        _attach(old_grant)
+    _attach(adopted.spec).close()
     adopted.close()
+
+
+@pytest.mark.usefixtures("_madv_dontfork")
+def test_a_fresh_pool_and_a_spec_without_an_epoch_are_epoch_zero(
+    pool_owner: _KVCRPoolOwner,
+) -> None:
+    assert pool_owner.spec.epoch == 0
+    wire = msgspec.json.decode(msgspec.json.encode(pool_owner.spec))
+    del wire["epoch"]
+    legacy = msgspec.convert(wire, KVCRPoolSpec)
+    assert legacy.epoch == 0
+    _attach(legacy).close()

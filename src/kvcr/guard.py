@@ -456,7 +456,10 @@ class _Guard:
         self._started = True
         # Attaching is not thread-affine; done here so a failure surfaces
         # directly, with nothing to tear down.
-        self._recovery.prepare()
+        # A held pool is attached once its previous worker is gone: attaching
+        # now would take a shared lock that blocks our own takeover probe.
+        if not self._held:
+            self._recovery.prepare()
         self._thread.start()
 
     def claim(
@@ -696,7 +699,14 @@ class _Guard:
             return
         try:
             released = self._owner.try_unhold()
+            if released:
+                self._recovery.prepare()
         except BaseException as error:  # noqa: BLE001 - the Guard cannot serve
+            logger.error(
+                "KVCR Guard %d cannot take over its adopted pool: %s",
+                self._guard_index,
+                error,
+            )
             self._record_background_failure(error)
             return
         if released:

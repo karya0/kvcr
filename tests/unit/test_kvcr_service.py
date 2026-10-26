@@ -56,7 +56,7 @@ from kvcr.kvcr_service import (
     _RequestHandler,
     _ThreadingUnixServer,
 )
-from kvcr.memory import _KVCRPoolOwner
+from kvcr.memory import KVCRPoolAttachment, _KVCRPoolOwner
 
 
 def _holders_of(registry) -> dict[int, object]:
@@ -234,16 +234,45 @@ def _stand_in_pool(spec) -> Mock:
     return attachment
 
 
-def _new_registry(
-    tmp_path: Path, guard_count: int = 1, digest: str = _TEST_DIGEST, **options
-) -> _PoolRegistry:
-    """A registry of real Guards over stand-in pool mappings."""
+@contextmanager
+def _guard_patches(real_attach: bool = False) -> Iterator[None]:
+    """Stand-in pool mappings, or real ones with a stand-in journal."""
     journal = Mock()
     journal.read_next.return_value = None
     with (
-        patch("kvcr.guard.KVCRPoolAttachment.attach", side_effect=_stand_in_pool),
+        patch(
+            "kvcr.guard.KVCRPoolAttachment.attach",
+            side_effect=KVCRPoolAttachment.attach if real_attach else _stand_in_pool,
+        ),
         patch("kvcr.guard.RecoveryJournal", Mock(return_value=journal)),
     ):
+        yield
+
+
+@pytest.fixture
+def _stand_in_guards() -> Iterator[None]:
+    """Kept for the whole test: a held Guard attaches long after construction."""
+    with _guard_patches():
+        yield
+
+
+@pytest.fixture
+def _real_attach_guards(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    # Absent on macOS; real attachments only need the call to succeed.
+    monkeypatch.setattr(mmap, "MADV_DONTFORK", mmap.MADV_NORMAL, raising=False)
+    with _guard_patches(real_attach=True):
+        yield
+
+
+def _new_registry(
+    tmp_path: Path,
+    guard_count: int = 1,
+    digest: str = _TEST_DIGEST,
+    real_attach: bool = False,
+    **options,
+) -> _PoolRegistry:
+    """A registry of real Guards over stand-in pool mappings (or real ones)."""
+    with _guard_patches(real_attach):
         registry = _PoolRegistry(
             tmp_path,
             guard_count,
@@ -1661,10 +1690,15 @@ def test_a_restarted_service_adopts_its_pools_and_serves_them(
     try:
         assert _pool_files(tmp_path) == files
         for rank, guard in second._guards.items():
-            assert guard._spec == specs[rank]
+            assert guard._spec == msgspec.structs.replace(specs[rank], epoch=1)
+            assert not guard._held
         assert worker[-5:] == b"bytes"
         spec, lease = _claim(second, 0, _FakeLiveness())
-        assert (spec.generation, spec.inode) == (specs[0].generation, specs[0].inode)
+        assert (spec.generation, spec.inode, spec.epoch) == (
+            specs[0].generation,
+            specs[0].inode,
+            1,
+        )
         second.release(0, lease)
     finally:
         worker.close()
@@ -1720,6 +1754,7 @@ def test_a_second_live_service_does_not_adopt_the_first_ones_pools(
     first.close()
 
 
+@pytest.mark.usefixtures("_stand_in_guards")
 def test_adoption_leaves_a_live_workers_pool_and_purges_true_orphans(
     tmp_path: Path,
 ) -> None:
@@ -1740,6 +1775,8 @@ def test_adoption_leaves_a_live_workers_pool_and_purges_true_orphans(
     second = _new_registry(tmp_path, adopt_pools=True)
     try:
         assert second._guards[0]._spec.inode == spec.inode
+        # The worker still holds it, so it is adopted but not yet claimable.
+        assert second._guards[0]._held
         assert not older.exists()
         assert not other_rank.exists()
         assert Path(spec.path).exists()
@@ -1753,20 +1790,23 @@ def test_adopt_pools_is_an_opt_in_flag() -> None:
     assert _parse_args(_service_args("1") + ["--adopt-pools"]).adopt_pools is True
 
 
+@pytest.mark.usefixtures("_real_attach_guards")
 def test_a_pool_a_previous_worker_still_holds_is_refused_until_it_exits(
     tmp_path: Path,
 ) -> None:
-    first = _new_registry(tmp_path, adopt_pools=True)
+    first = _new_registry(tmp_path, adopt_pools=True, real_attach=True)
     spec = first._guards[0]._spec
     first.close()
     worker = os.open(spec.path, os.O_RDWR)
     fcntl.flock(worker, fcntl.LOCK_SH)
 
-    second = _new_registry(tmp_path, adopt_pools=True)
+    second = _new_registry(tmp_path, adopt_pools=True, real_attach=True)
     try:
         guard = second._guards[0]
         assert guard._spec.inode == spec.inode
         assert guard._held
+        # Not attached while held: that would block its own takeover probe.
+        assert guard._recovery.attachment is None
         with pytest.raises(KVCRServiceError, match="still attached by a previous"):
             _claim(second, 0, _FakeLiveness())
         # Its holder going away must not expose it to a purge before the Guard
@@ -1783,14 +1823,3 @@ def test_a_pool_a_previous_worker_still_holds_is_refused_until_it_exits(
         if worker >= 0:
             os.close(worker)
         second.close()
-
-
-def test_an_adopted_pool_with_no_holder_is_claimable_at_once(tmp_path: Path) -> None:
-    _new_registry(tmp_path, adopt_pools=True).close()
-    registry = _new_registry(tmp_path, adopt_pools=True)
-    try:
-        assert not registry._guards[0]._held
-        _spec, lease = _claim(registry, 0, _FakeLiveness())
-        registry.release(0, lease)
-    finally:
-        registry.close()
