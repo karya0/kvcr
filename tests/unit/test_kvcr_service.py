@@ -1214,6 +1214,7 @@ def test_a_failed_grant_delivery_retracts_through_the_guard(tmp_path: Path) -> N
         def __init__(self) -> None:
             self.registry = registry
             self.compatibility_digest = _TEST_DIGEST
+            self.peer_trust = "strict"
 
         def dispatch(self, request, liveness):
             return _ThreadingUnixServer.dispatch(self, request, liveness)
@@ -1257,10 +1258,13 @@ def test_an_undelivered_grants_lease_survives_its_connection(
     server = object.__new__(_ThreadingUnixServer)
     server.registry = registry
     server.compatibility_digest = _TEST_DIGEST
+    server.peer_trust = "strict"
     monkeypatch.setattr(
         PidfdLiveness,
         "from_peer_socket",
-        classmethod(lambda _cls, _sock, _fd: PidfdLiveness(os.pidfd_open(child.pid))),
+        classmethod(
+            lambda _cls, _sock, _fd, _trust: PidfdLiveness(os.pidfd_open(child.pid))
+        ),
     )
     handler = object.__new__(_RequestHandler)
     handler.request = Mock()
