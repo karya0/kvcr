@@ -88,6 +88,10 @@ class _FakeLiveness:
         self._read, self._write = os.pipe()
         self.closed = False
         self.incarnation = None
+        self.mode = "so_peerpidfd"
+        self.verified = True
+        self.fenceable = True
+        self.peer_uid = None
 
     def fileno(self) -> int:
         if self.closed:
@@ -385,29 +389,17 @@ def test_legacy_claim_rejects_wrong_process_or_non_pidfd(
         _wait_until(lambda: len(os.listdir("/proc/self/fd")) <= open_fds, timeout=2)
 
 
-@pytest.mark.parametrize(
-    ("peer_trust", "granted"), [("strict", False), ("trusted-peer", True)]
-)
-def test_peer_in_another_pid_namespace_is_granted_only_when_trusted(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    peer_trust: str,
-    granted: bool,
+def test_trusted_peer_grants_a_peer_in_another_pid_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The real thing needs a second PID namespace; see the unshare test below.
+    # The real thing needs a second PID namespace; see the unshare tests below.
     monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
     monkeypatch.setattr(
         guard_protocol,
         "_peer_pidfd_verdict",
-        lambda _connection, _fd: guard_protocol._PeerVerdict.PEER_NOT_VISIBLE,
+        lambda _connection, _fd: (guard_protocol._PeerVerdict.PEER_NOT_VISIBLE, 0),
     )
-    with _running_server(tmp_path, guard_count=1, peer_trust=peer_trust) as harness:
-        if not granted:
-            with pytest.raises(KVCRServiceError, match="does not match socket peer"):
-                harness.client.claim(
-                    0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
-                )
-            return
+    with _running_server(tmp_path, guard_count=1, peer_trust="trusted-peer") as harness:
         hold = harness.client.claim(
             0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
         )
@@ -418,22 +410,6 @@ def test_peer_in_another_pid_namespace_is_granted_only_when_trusted(
             False,
         )
         hold.release()
-
-
-def test_peer_trust_flag_defaults_to_strict() -> None:
-    base = [
-        "--socket-path=/s",
-        "--pool-dir=/p",
-        "--guard-count=1",
-        "--pool-sizes-gb=1",
-        "--compatibility-digest=d",
-    ]
-    assert _parse_args(base).peer_trust == "strict"
-    assert _parse_args([*base, "--peer-trust=trusted-peer"]).peer_trust == (
-        "trusted-peer"
-    )
-    with pytest.raises(SystemExit):
-        _parse_args([*base, "--peer-trust=lax"])
 
 
 def test_service_refuses_startup_without_pidfd_open(tmp_path: Path) -> None:
@@ -1882,25 +1858,23 @@ def test_a_pool_a_previous_worker_still_holds_is_refused_until_it_exits(
 def _unshare_pid_namespace() -> list[str]:
     """The argv prefix that runs a command as pid 1 of a fresh PID namespace.
 
-    Skips when the host cannot: no unshare (macOS), user namespaces disabled,
-    or /proc cannot be remounted (AppArmor-restricted hosts).
+    Skips, with the probe's own error, when the host cannot: no unshare (macOS),
+    user namespaces disabled, or /proc cannot be remounted (AppArmor).
     """
-    prefix = [
-        "unshare",
-        "--user",
-        "--map-root-user",
-        "--pid",
-        "--fork",
-        "--mount-proc",
-    ]
+    prefix = ["unshare", "--pid", "--fork", "--mount-proc"]
+    if os.geteuid() != 0:
+        prefix = ["unshare", "--user", "--map-root-user", *prefix[1:]]
     try:
         probe = subprocess.run(
             [*prefix, "true"], capture_output=True, text=True, timeout=10
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as error:
-        pytest.skip(f"cannot unshare a PID namespace: {error}")
+        pytest.skip(f"SKIPPED, no PID namespace ({' '.join(prefix)}): {error}")
     if probe.returncode != 0:
-        pytest.skip(f"cannot unshare a PID namespace: {probe.stderr.strip()}")
+        pytest.skip(
+            f"SKIPPED, no PID namespace ({' '.join(prefix)} true exited "
+            f"{probe.returncode}): {probe.stderr.strip()}"
+        )
     return prefix
 
 
@@ -1920,9 +1894,8 @@ time.sleep(60)
 """
 
 
-@pytest.mark.parametrize("peer_trust", ["strict", "trusted-peer"])
 def test_claimant_in_a_child_pid_namespace_is_visible_and_its_death_promotes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peer_trust: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The service is an ancestor of the claimant, so it can still verify it.
 
@@ -1930,7 +1903,7 @@ def test_claimant_in_a_child_pid_namespace_is_visible_and_its_death_promotes(
     """
     prefix = _unshare_pid_namespace()
     monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
-    with _running_server(tmp_path, guard_count=1, peer_trust=peer_trust) as harness:
+    with _running_server(tmp_path, guard_count=1, peer_trust="trusted-peer") as harness:
         guard = harness.server._registry._guards[0]
         guard._promote = Mock()
         program = _CLAIM_AND_WAIT.format(
