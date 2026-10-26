@@ -641,7 +641,7 @@ class _Guard:
                         or bool(self._orphans)
                     )
                     timeout = _POLL_SECONDS if busy and not self._failure else None
-                    if timeout is None and self._held:
+                    if timeout is None and self._held and not self._failure:
                         timeout = _HELD_PROBE_SECONDS
                     command = self._commands.get(timeout=timeout)
             except queue.Empty:
