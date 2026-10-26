@@ -3,6 +3,7 @@
 """The wire between a KVCR worker and KVCR-Service, and the client half."""
 
 import contextlib
+import enum
 import errno
 import logging
 import mmap
@@ -165,20 +166,29 @@ _CLAIM_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Granted | _Error)
 _RELEASE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Released | _Error)
 
 
-def _verify_peer_pidfd(connection: socket.socket, worker_pidfd: int) -> None:
-    """Refuse a descriptor that is not a pidfd for this socket's peer.
+class _PeerVerdict(enum.Enum):
+    VERIFIED = "verified"
+    # The peer lives in another PID namespace: both sides read pid 0.
+    PEER_NOT_VISIBLE = "peer_not_visible"
+    MISMATCH = "mismatch"
+    NOT_A_PIDFD = "not_a_pidfd"
+
+
+def _peer_pidfd_verdict(connection: socket.socket, worker_pidfd: int) -> _PeerVerdict:
+    """Classify a descriptor a peer sent as its pidfd.
 
     With /proc mounted for the service's PID namespace, SO_PEERCRED and fdinfo
-    report comparable PIDs. A non-pidfd has no Pid: line and a peer outside
-    the namespace reads as 0; both fail closed.
+    report comparable PIDs. A peer outside the namespace reads as 0 on both.
     """
     try:
-        peer_pid = struct.unpack(
+        peer_pid, _, _ = struct.unpack(
             "3i",
             connection.getsockopt(
                 socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
             ),
-        )[0]
+        )
+        if os.readlink(f"/proc/self/fd/{worker_pidfd}") != "anon_inode:[pidfd]":
+            return _PeerVerdict.NOT_A_PIDFD
         with open(f"/proc/self/fdinfo/{worker_pidfd}") as info:
             worker_pid = next(
                 (int(line.split()[1]) for line in info if line.startswith("Pid:")),
@@ -186,8 +196,14 @@ def _verify_peer_pidfd(connection: socket.socket, worker_pidfd: int) -> None:
             )
     except (OSError, ValueError) as error:
         raise KVCRServiceError("cannot verify worker pidfd") from error
-    if peer_pid <= 0 or worker_pid != peer_pid:
-        raise KVCRServiceError("worker pidfd does not match socket peer")
+    if worker_pid is None or worker_pid == -1:
+        # No Pid: line, or -1 for a pidfd whose process is already reaped.
+        return _PeerVerdict.NOT_A_PIDFD
+    if peer_pid > 0 and worker_pid == peer_pid:
+        return _PeerVerdict.VERIFIED
+    if peer_pid == 0 and worker_pid == 0:
+        return _PeerVerdict.PEER_NOT_VISIBLE
+    return _PeerVerdict.MISMATCH
 
 
 class PidfdLiveness:
@@ -215,7 +231,10 @@ class PidfdLiveness:
                     message = "worker pidfd is required without SO_PEERPIDFD"
                     logger.warning(message)
                     raise KVCRServiceError(message) from error
-                _verify_peer_pidfd(connection, worker_pidfd)
+                if _peer_pidfd_verdict(connection, worker_pidfd) is not (
+                    _PeerVerdict.VERIFIED
+                ):
+                    raise KVCRServiceError("worker pidfd does not match socket peer")
                 liveness = cls(worker_pidfd)
                 transferred.pop_all()
                 return liveness
