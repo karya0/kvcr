@@ -36,6 +36,10 @@ _JOURNAL_HEADER_BYTES = 4096
 # clear of the three cursors at 0, 128 and 192.
 _ADOPT_STAMP_OFFSET = 256
 _ADOPT_STAMP_BYTES = 32
+# How many times a pool has been adopted. A grant carries the epoch it was made
+# under; an attachment refuses a pool adopted since.
+_ADOPT_EPOCH_OFFSET = _ADOPT_STAMP_OFFSET + _ADOPT_STAMP_BYTES
+_ADOPT_EPOCH_BYTES = 8
 # Never removed: it holds no state, and unlinking it would let two services
 # lock different files. The purge ignores it (it is not a pool name).
 _ADOPT_LOCK_NAME = "adopt.lock"
@@ -65,6 +69,7 @@ class KVCRPoolSpec(msgspec.Struct, frozen=True):
     inode: Annotated[int, msgspec.Meta(ge=0)]
     mapping_bytes: Annotated[int, msgspec.Meta(gt=0)]
     journal_bytes: Annotated[int, msgspec.Meta(gt=0)]
+    epoch: Annotated[int, msgspec.Meta(ge=0)] = 0
 
     @property
     def data_bytes(self) -> int:
@@ -129,6 +134,17 @@ class KVCRPoolAttachment:
                 raise ValueError(
                     "KVCR pool is smaller than the grant describes: "
                     f"{file_stat.st_size} < {spec.mapping_bytes}"
+                )
+            # After the lock: an adopter holds it exclusively while it bumps the
+            # epoch, so a grant made before an adoption cannot map the pool after.
+            header_epoch = int.from_bytes(
+                os.pread(file_descriptor, _ADOPT_EPOCH_BYTES, _ADOPT_EPOCH_OFFSET),
+                "little",
+            )
+            if header_epoch != spec.epoch:
+                raise ValueError(
+                    f"KVCR pool was adopted since this grant: {spec.path} "
+                    f"(grant epoch {spec.epoch}, pool epoch {header_epoch})"
                 )
             mapping = mmap.mmap(
                 file_descriptor,
@@ -236,6 +252,8 @@ class _KVCRPoolOwner:
         self._keep = keep
         # Adopted while another process still held the pool: no lock of ours yet.
         self.held = held
+        # What the header will say once this owner holds the pool.
+        self._epoch = spec.epoch
         self._path = Path(spec.path)
         self._file_identity = (spec.device, spec.inode)
 
@@ -385,12 +403,18 @@ class _KVCRPoolOwner:
                 inode=file_stat.st_ino,
                 mapping_bytes=pool_size_bytes,
                 journal_bytes=journal_bytes,
+                epoch=1
+                + int.from_bytes(
+                    os.pread(file_descriptor, _ADOPT_EPOCH_BYTES, _ADOPT_EPOCH_OFFSET),
+                    "little",
+                ),
             )
+            owner = cls(spec, file_descriptor, keep=True, held=True)
+            unheld = owner.try_unhold()
         except BaseException:
             os.close(file_descriptor)
             raise
-        owner = cls(spec, file_descriptor, keep=True, held=True)
-        if owner.try_unhold():
+        if unheld:
             logger.info(
                 "Adopted KVCR pool %s (cold: its bytes are kept, its contents are "
                 "not recovered)",
@@ -407,12 +431,11 @@ class _KVCRPoolOwner:
     def try_unhold(self) -> bool:
         """Make an adopted pool ours if nobody else holds it any more.
 
-        The probe is an exclusive lock on this descriptor's own open file
-        description, taken while we hold nothing: once we held it shared we
-        could not tell our lock from a previous worker's. On success it is
-        converted to the usual shared lock and the handback region is cut away.
-        Under the directory guard, shared like every creation, so no purge can
-        reclaim the file between the probe and the conversion.
+        Probed with an exclusive lock while we hold nothing of our own, since
+        a shared one could not be told from a previous worker's. Under that
+        lock the epoch is bumped, so a grant made before this adoption fails to
+        attach after it, and the lock is then converted to the usual shared
+        one. Under the shared directory guard, so no purge reclaims the file.
         """
         if not self.held:
             return True
@@ -421,7 +444,13 @@ class _KVCRPoolOwner:
                 raise RuntimeError(f"KVCR pool was unlinked while held: {self._path}")
             if not _try_lock_pool(self._file_descriptor, exclusive=True):
                 return False
+            os.pwrite(
+                self._file_descriptor,
+                self._epoch.to_bytes(_ADOPT_EPOCH_BYTES, "little"),
+                _ADOPT_EPOCH_OFFSET,
+            )
             if not _try_lock_pool(self._file_descriptor, exclusive=False):
+                fcntl.flock(self._file_descriptor, fcntl.LOCK_UN)
                 return False
             if os.fstat(self._file_descriptor).st_size > self.spec.mapping_bytes:
                 os.ftruncate(self._file_descriptor, self.spec.mapping_bytes)
@@ -504,14 +533,11 @@ def _try_lock_pool(file_descriptor: int, *, exclusive: bool) -> bool:
 
 
 def _try_lock_adoption(directory: Path) -> int | None:
-    """Claim the right to adopt this directory's pools for the caller's lifetime.
+    """Take the right to adopt this directory's pools until the descriptor closes.
 
-    A separate file, not the directory guard: that one is taken shared by every
-    allocation, this service's own included, so holding it exclusively would
-    lock the owner out of its own directory. The pools' own locks cannot say
-    either, since a live worker and a live service both hold them shared. The
-    kernel drops the lock with the process, so a crash never leaves it held.
-    Returns the descriptor to keep open, or None if another service has it.
+    Not the directory guard (every allocation takes that shared) and not the
+    pools' locks (workers and services both hold those shared). Never mix
+    adopting and legacy services on one directory: a legacy purge ignores this.
     """
     file_descriptor = os.open(
         directory / _ADOPT_LOCK_NAME,
