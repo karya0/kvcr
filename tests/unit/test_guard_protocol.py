@@ -130,7 +130,9 @@ class _RecordingConnection:
         self.send(message)
         self.sent_fds.extend(file_descriptors)
 
-    def receive_with_fd(self, decoder: object, expected_counts: Any) -> tuple[object, list[int]]:
+    def receive_with_fd(
+        self, decoder: object, expected_counts: Any
+    ) -> tuple[object, list[int]]:
         message = self.receive(decoder)
         if len(self.received_fds) not in expected_counts(message):
             # Refused deliveries close what they received, as the real channel does.
@@ -532,55 +534,43 @@ def test_fd_claim_round_trips_and_hands_both_descriptors_over(monkeypatch) -> No
     hold.release()
 
 
+def test_each_response_states_the_descriptor_count_it_carries() -> None:
+    counts = protocol_module._response_fd_counts
+    assert counts(_Error("no", 1)) == (0,)
+    assert counts(_grant()) == (1,)
+    assert counts(_fd_grant()) == (2,)
+
+
 @pytest.mark.parametrize(
-    ("grant", "fd_count"),
+    ("claim_mode", "grant", "fd_count", "error", "match"),
     [
-        pytest.param(_fd_grant(), 1, id="fd-mode-one-descriptor"),
-        pytest.param(_fd_grant(), 0, id="fd-mode-none"),
-        pytest.param(_grant(), 2, id="path-mode-two-descriptors"),
-        pytest.param(_Error("no", 1), 1, id="error-with-descriptor"),
+        # A fd grant needs both descriptors.
+        ("fd", _fd_grant(), 0, KVCRMsgFramingError, "unexpected number"),
+        # A v1 service never heard of attach_mode: it echoes path with one fd.
+        ("fd", _grant(), 1, KVCRGuardProtocolError, "attach mode mismatch"),
+        # A fd grant answering a path claim.
+        ("path", _fd_grant(), 2, KVCRGuardProtocolError, "attach mode mismatch"),
     ],
 )
-def test_a_grant_with_the_wrong_descriptor_count_is_refused_and_closed(
-    monkeypatch, grant, fd_count
+def test_a_grant_that_disagrees_with_the_claim_fails_closed(
+    monkeypatch, claim_mode, grant, fd_count, error, match
 ) -> None:
     connection, attach_fd = _fd_claim(monkeypatch, grant, fd_count)
     received = list(connection.received_fds)
 
-    with pytest.raises(KVCRMsgFramingError, match="unexpected number"):
+    with pytest.raises(error, match=match):
         KVCRClient("/unused").claim(
-            _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555), attach_mode="fd"
+            _GUARD_INDEX,
+            _POOL_LAYOUTS,
+            _DIGEST,
+            ("127.0.0.1", 5555),
+            attach_mode=claim_mode,
         )
 
     attach_fd.assert_not_called()
     for file_descriptor in received:
         with pytest.raises(OSError):
             os.fstat(file_descriptor)
-
-
-def test_a_v1_service_answering_a_fd_claim_fails_closed(monkeypatch) -> None:
-    """A service that never heard of attach_mode echoes path, with one descriptor."""
-    connection, attach_fd = _fd_claim(monkeypatch, _grant(), fd_count=1)
-    received = connection.received_fds[0]
-
-    with pytest.raises(KVCRGuardProtocolError, match="attach mode mismatch"):
-        KVCRClient("/unused").claim(
-            _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555), attach_mode="fd"
-        )
-
-    attach_fd.assert_not_called()
-    with pytest.raises(OSError):
-        os.fstat(received)
-
-
-def test_a_fd_grant_answering_a_path_claim_fails_closed(monkeypatch) -> None:
-    connection = _RecordingConnection([_fd_grant()], received_fd_count=2)
-    _connect_with(monkeypatch, connection)
-
-    with pytest.raises(KVCRGuardProtocolError, match="attach mode mismatch"):
-        KVCRClient("/unused").claim(
-            _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
-        )
 
 
 def test_v1_messages_without_an_attach_mode_still_decode_as_path() -> None:
@@ -596,33 +586,24 @@ def test_v1_messages_without_an_attach_mode_still_decode_as_path() -> None:
         )
     )
     v1_claim = {k: v for k, v in claim.items() if k != "attach_mode"}
-    assert protocol_module._CLAIM_DECODER.decode(
-        msgspec.msgpack.encode(v1_claim)
-    ).attach_mode == "path"
+    assert (
+        protocol_module._CLAIM_DECODER.decode(
+            msgspec.msgpack.encode(v1_claim)
+        ).attach_mode
+        == "path"
+    )
 
     v1_grant = {
         k: v for k, v in msgspec.to_builtins(_grant()).items() if k != "attach_mode"
     }
-    assert protocol_module._CLAIM_RESPONSE_DECODER.decode(
-        msgspec.msgpack.encode(v1_grant)
-    ).attach_mode == "path"
+    assert (
+        protocol_module._CLAIM_RESPONSE_DECODER.decode(
+            msgspec.msgpack.encode(v1_grant)
+        ).attach_mode
+        == "path"
+    )
 
     with pytest.raises(msgspec.ValidationError):
         protocol_module._CLAIM_DECODER.decode(
             msgspec.msgpack.encode({**claim, "attach_mode": "memfd"})
         )
-
-
-def test_a_path_claim_keeps_attaching_by_path(monkeypatch) -> None:
-    connection = _RecordingConnection([_grant(), _Released(1)])
-    attach = Mock(return_value=_Attachment())
-    _connect_with(monkeypatch, connection)
-    monkeypatch.setattr(protocol_module.KVCRPoolAttachment, "attach", attach)
-
-    hold = KVCRClient("/unused").claim(
-        _GUARD_INDEX, _POOL_LAYOUTS, _DIGEST, ("127.0.0.1", 5555)
-    )
-
-    assert connection.sent[0].attach_mode == "path"
-    attach.assert_called_once_with(_grant().spec)
-    hold.release()

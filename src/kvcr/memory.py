@@ -88,7 +88,9 @@ class KVCRPoolAttachment:
         return cls.attach_fd(os.open(spec.path, _OPEN_FLAGS), spec)
 
     @classmethod
-    def attach_fd(cls, file_descriptor: int, spec: KVCRPoolSpec) -> "KVCRPoolAttachment":
+    def attach_fd(
+        cls, file_descriptor: int, spec: KVCRPoolSpec
+    ) -> "KVCRPoolAttachment":
         """Map a pool from a descriptor the service opened; spec.path is never used.
 
         Takes ownership of the descriptor, closing it on failure. Every check

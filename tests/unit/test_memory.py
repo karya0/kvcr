@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import contextlib
 import ctypes
 import errno
 import fcntl
@@ -15,6 +14,7 @@ from unittest.mock import Mock, patch
 
 import msgspec
 import pytest
+from _kvcr_test_utils import manual_pool_spec
 
 from kvcr import memory as kvcr_memory
 from kvcr.memory import (
@@ -23,7 +23,6 @@ from kvcr.memory import (
     KVCRPoolSpec,
     _compute_pool_geometry,
     _KVCRPoolOwner,
-    _pool_filename,
     _populate_pages,
     _reclaim_pool_if_orphaned,
 )
@@ -417,16 +416,20 @@ def test_attach_fd_refuses_a_tampered_descriptor_and_closes_it(
     assert closed.value.errno == errno.EBADF
 
 
-def test_attach_fd_keeps_every_other_check(pool_owner: _KVCRPoolOwner) -> None:
-    spec = pool_owner.spec
+def test_attach_fd_keeps_every_other_check(tmp_path: Path) -> None:
+    spec = manual_pool_spec(tmp_path)
     os.chmod(spec.path, 0o644)
     with pytest.raises(PermissionError, match="0600"):
         KVCRPoolAttachment.attach_fd(_open_fresh(spec), spec)
     os.chmod(spec.path, 0o600)
 
-    with patch("kvcr.memory._try_lock_pool", return_value=False):
+    holder = _open_fresh(spec)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
         with pytest.raises(RuntimeError, match="exclusively locked"):
             KVCRPoolAttachment.attach_fd(_open_fresh(spec), spec)
+    finally:
+        os.close(holder)
 
     bigger = msgspec.structs.replace(spec, mapping_bytes=spec.mapping_bytes * 2)
     with pytest.raises(ValueError, match="smaller than the grant"):
@@ -435,20 +438,8 @@ def test_attach_fd_keeps_every_other_check(pool_owner: _KVCRPoolOwner) -> None:
 
 def test_a_workers_lock_is_independent_of_the_guards(tmp_path: Path) -> None:
     """Each holds its own open-file-description, so either can outlive the other."""
-    # By hand, because the owner's own shared lock would hide who is holding.
-    path = tmp_path / _pool_filename("engine", _TEST_GENERATION)
-    path.write_bytes(bytes(12288))
-    path.chmod(0o600)
-    file_stat = path.stat()
-    spec = KVCRPoolSpec(
-        pool_id="engine",
-        path=str(path),
-        generation=_TEST_GENERATION,
-        device=file_stat.st_dev,
-        inode=file_stat.st_ino,
-        mapping_bytes=12288,
-        journal_bytes=_TEST_JOURNAL_BYTES,
-    )
+    spec = manual_pool_spec(tmp_path)
+    path = Path(spec.path)
     guard = KVCRPoolAttachment.attach(spec)
     worker = KVCRPoolAttachment.attach_fd(_open_fresh(spec), spec)
 

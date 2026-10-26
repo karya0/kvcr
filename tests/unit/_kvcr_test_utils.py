@@ -676,3 +676,23 @@ def _key_history(caplog) -> list[dict[str, str]]:
         for record in caplog.records
         if record.message.startswith("KVCR_KEY_HISTORY ")
     ]
+
+
+def manual_pool_spec(directory: Path, size: int = 12288, journal: int = 8192):
+    """A pool file made by hand, so no owner's own flock hides who holds it."""
+    from kvcr.memory import KVCRPoolSpec, _pool_filename
+
+    generation = "0123456789abcdef0123456789abcdef"
+    path = directory / _pool_filename("engine", generation)
+    path.write_bytes(bytes(size))
+    path.chmod(0o600)
+    file_stat = path.stat()
+    return KVCRPoolSpec(
+        pool_id="engine",
+        path=str(path),
+        generation=generation,
+        device=file_stat.st_dev,
+        inode=file_stat.st_ino,
+        mapping_bytes=size,
+        journal_bytes=journal,
+    )

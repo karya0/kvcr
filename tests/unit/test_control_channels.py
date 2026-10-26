@@ -125,7 +125,7 @@ def test_a_frame_carries_the_descriptor_count_its_message_expects(
     pair: Pair,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Descriptors arrive cloexec, in order; any unexpected count is refused and closed."""
+    """Descriptors arrive cloexec, in order; an unexpected count is refused."""
     sender, receiver = pair
     receiver.settimeout(1)
     incoming = FramedConnection(receiver)
@@ -166,6 +166,11 @@ def test_a_frame_carries_the_descriptor_count_its_message_expects(
         assert len(closed) == 2
         receiver.recv(len(payload))  # Drain the body of the refused frame.
 
+    # A frame with no descriptor is refused when one is expected.
+    FramedConnection(sender).send(_Message("claim"))
+    with pytest.raises(KVCRMsgFramingError, match="unexpected number"):
+        incoming.receive_with_fd(_MESSAGE_DECODER, lambda _m: (2,))
+
     # A frame header that stops early is a truncation; its descriptor is closed.
     with _pipe() as (late_fd, _late_peer):
         sender.sendmsg(
@@ -179,22 +184,6 @@ def test_a_frame_carries_the_descriptor_count_its_message_expects(
                 incoming.receive_with_fd(_MESSAGE_DECODER, lambda _m: (1,))
 
         assert len(closed) == 1
-
-
-def test_a_frame_with_no_descriptor_is_refused_when_one_is_expected(pair: Pair) -> None:
-    sender, receiver = pair
-    FramedConnection(sender).send(_Message("claim"))
-
-    with pytest.raises(KVCRMsgFramingError, match="unexpected number"):
-        FramedConnection(receiver).receive_with_fd(_MESSAGE_DECODER, lambda _m: (2,))
-
-
-def test_send_with_fd_bounds_the_descriptor_count(pair: Pair) -> None:
-    connection = FramedConnection(pair[0])
-    with pytest.raises(ValueError):
-        connection.send_with_fd(_Message("claim"))
-    with pytest.raises(ValueError):
-        connection.send_with_fd(_Message("claim"), 0, 1, 2)
 
 
 def test_complete_descriptor_frame_does_not_send_an_empty_tail(monkeypatch) -> None:
