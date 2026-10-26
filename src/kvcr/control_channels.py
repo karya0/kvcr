@@ -115,7 +115,7 @@ class FramedConnection:
         # would never reach recvmsg.
         header, ancillary, flags, _ = self._connection.recvmsg(
             _FRAME_HEADER.size,
-            socket.CMSG_SPACE(array("i").itemsize * 2),
+            socket.CMSG_SPACE(array("i").itemsize * _MAX_FDS),
             socket.MSG_CMSG_CLOEXEC,
         )
         if not header:

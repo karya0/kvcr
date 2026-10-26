@@ -32,11 +32,9 @@ logger = logging.getLogger(__name__)
 ProtocolVersion = Literal[1]
 _PROTOCOL_VERSION: ProtocolVersion = 1
 
-# How a claimant reaches the pool. "path" (the default, and all a v1 peer
-# speaks) opens spec.path; "fd" receives the pool file as a descriptor, so the
-# claimant needs no pool-directory mount. Version 1 stays: the mode is an
-# optional field, and each side checks the other's echo and fd count, failing
-# closed when they disagree.
+# How a claimant reaches the pool: "path" (default; all a v1 peer speaks) opens
+# spec.path, "fd" receives the pool file. Still version 1: each side checks the
+# echoed mode and fd count and fails closed on a mismatch.
 AttachMode = Literal["path", "fd"]
 
 # SO_PEERPIDFD requires Linux 6.5 or later.
@@ -381,13 +379,6 @@ class KVCRClient:
             spec, granted_pools = _grant_layout(
                 response, guard_index, request.tier_config, request.attach_mode
             )
-            if listener_fd is None:
-                # Every pool has a Guard, and a Guard answers on the endpoint
-                # this claimant named. A grant without it means the two sides
-                # disagree about who serves this pool group.
-                raise KVCRGuardProtocolError(
-                    "claim was granted without the endpoint it answers on"
-                )
             if pool_fd is None:
                 attachment = KVCRPoolAttachment.attach(spec)
             else:

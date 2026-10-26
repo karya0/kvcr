@@ -30,12 +30,12 @@ from .control_channels import (
 from .guard import _Guard, _Lease
 from .guard_protocol import (
     _CLAIM_DECODER,
-    _claim_fd_counts,
     _HOLD_DECODER,
     _MIN_HEARTBEAT_TIMEOUT_SECONDS,
     _PROTOCOL_VERSION,
     PidfdLiveness,
     _Claim,
+    _claim_fd_counts,
     _Error,
     _Granted,
     _Heartbeat,
@@ -288,9 +288,8 @@ class _PoolRegistry:
 def _open_pool_fd(spec: KVCRPoolSpec) -> int:
     """A fresh open-file-description of the pool, for one claimant.
 
-    Never a dup of the Guard's descriptor: flock belongs to the description,
-    and the claimant's shared lock must be independent of the Guard's or an
-    orphan check could not tell a live worker from a dead one.
+    flock belongs to the open-file-description; a fresh one keeps the
+    claimant's lock separate from the Guard's, exactly as a path open would.
     """
     pool_fd = os.open(spec.path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
     try:
@@ -341,18 +340,24 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             return
 
         guard_index, listener_fd, lease = grant
+        pool_fd: int | None = None
+        if response.attach_mode == "fd":
+            try:
+                pool_fd = _open_pool_fd(response.spec)
+            except Exception:  # noqa: BLE001 - nothing has been sent yet
+                # Nothing crossed, so the claimant never saw the grant: take it
+                # back now rather than leave the claimant waiting on a send.
+                logger.exception("KVCR could not open the pool for a claimant")
+                os.close(listener_fd)
+                self._release_or_fail(guard_index, lease, activated=False)
+                self._send_error(KVCRServiceError("KVCR could not open the pool"))
+                return
         try:
             # No timeout: a held connection must wait as long as the lease lives.
             # Inside the try: shutdown may have landed; listener_fd closes either way.
             self.request.settimeout(None)
-            if response.attach_mode == "fd":
-                pool_fd = _open_pool_fd(response.spec)
-                try:
-                    self.channel.send_with_fd(response, pool_fd, listener_fd)
-                finally:
-                    os.close(pool_fd)
-            else:
-                self.channel.send_with_fd(response, listener_fd)
+            fds = (listener_fd,) if pool_fd is None else (pool_fd, listener_fd)
+            self.channel.send_with_fd(response, *fds)
         # The lease is already granted and the send may have partially
         # crossed: releasing could double-grant a pool a claimant just mapped.
         # Hold it instead, under the same fencing as any lease: the claimant's
@@ -362,8 +367,10 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         except BaseException:
             logger.exception("KVCR grant delivery failed; holding the lease")
         finally:
-            with contextlib.suppress(OSError):
-                os.close(listener_fd)
+            for file_descriptor in (pool_fd, listener_fd):
+                if file_descriptor is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(file_descriptor)
         self._await_release(guard_index, lease)
 
     def _await_release(self, guard_index: int, lease: "_Lease") -> None:
