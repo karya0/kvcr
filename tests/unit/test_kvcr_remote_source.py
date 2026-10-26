@@ -82,7 +82,11 @@ def test_framework_pin_result_diagnostic(level, caplog):
     caplog.set_level(level, logger="kvcr.core")
     remote = Mock()
     wait = SimpleNamespace(
-        request=7, op_ids={("source", 3)}, keys=(b"key",), started_at=None
+        request=7,
+        op_ids={("source", 3)},
+        keys=(b"key",),
+        started_at=None,
+        trace=None,
     )
     _RemoteFWDram._record_pending_pin_wait(remote, wait, result)
     remote._kvcr._record_duration.assert_called_once_with(
