@@ -1134,14 +1134,15 @@ def test_a_failed_grant_delivery_retracts_through_the_guard(tmp_path: Path) -> N
         def receive(self, _decoder: object):
             return self.messages.pop(0)
 
-        def receive_with_fd(self, _decoder: object):
-            return self.messages.pop(0), os.pidfd_open(os.getpid())
+        def receive_with_fd(self, _decoder: object, _expected_counts: object):
+            return self.messages.pop(0), [os.pidfd_open(os.getpid())]
 
         def send(self, response: object) -> None:
             self.sent.append(response)
 
-        def send_with_fd(self, response: object, listener_fd: int) -> None:
+        def send_with_fd(self, response: object, *descriptors: int) -> None:
             assert isinstance(response, _Granted)
+            (listener_fd,) = descriptors
             assert listener_fd >= 0
             self.granted_fd = listener_fd
             raise RuntimeError("grant could not be delivered")
@@ -1202,7 +1203,7 @@ def test_an_undelivered_grants_lease_survives_its_connection(
     handler.request = Mock()
     handler.server = server
     handler.channel = Mock()
-    handler.channel.receive_with_fd.return_value = (_claim_request(), None)
+    handler.channel.receive_with_fd.return_value = (_claim_request(), [])
     handler.channel.receive.side_effect = [EOFError()]
     handler.channel.send_with_fd.side_effect = RuntimeError("undelivered")
     try:

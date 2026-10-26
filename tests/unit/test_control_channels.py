@@ -164,7 +164,10 @@ def test_a_frame_carries_the_descriptor_count_its_message_expects(
                 incoming.receive_with_fd(_MESSAGE_DECODER, lambda _m: (0, 1))
 
         assert len(closed) == 2
-        receiver.recv(len(payload))  # Drain the body of the refused frame.
+        # The body was consumed before the count was judged, so the stream is
+        # still on a frame boundary: the next frame reads cleanly.
+        FramedConnection(sender).send(_Message("ping"))
+        assert incoming.receive(_MESSAGE_DECODER) == _Message("ping")
 
     # A frame with no descriptor is refused when one is expected.
     FramedConnection(sender).send(_Message("claim"))
