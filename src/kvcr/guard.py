@@ -783,8 +783,20 @@ class _Guard:
         most of that gap far sooner than the pidfd reports death, but it needs
         a shared PID namespace, which separate containers do not have.
 
+        A lease accepted without proof that its pidfd names the peer is never
+        signalled: only its death, seen as POLLIN, may promote.
+
         Returns whether the pool is safe to take over.
         """
+        if not getattr(lease, "fenceable", True):
+            if self._fence_failed is not lease:
+                self._fence_failed = lease
+                logger.warning(
+                    "KVCR Guard %d cannot fence its primary (peer pidfd is "
+                    "unverified), waiting for pidfd",
+                    self._guard_index,
+                )
+            return False
         try:
             signal.pidfd_send_signal(lease.fileno(), signal.SIGKILL)
         except ProcessLookupError:
@@ -828,11 +840,15 @@ class _Guard:
                     self._last_heartbeat = None
                     self._phase = _Phase.PRIMARY
                     logger.debug(
-                        "KVCR_EVENT primary_attached guard=%d pool=%s control=%s:%d",
+                        "KVCR_EVENT primary_attached guard=%d pool=%s control=%s:%d "
+                        "liveness=%s verified=%s peer_uid=%s",
                         self._guard_index,
                         self._spec.pool_id,
                         bind[0],
                         bind[1],
+                        getattr(liveness, "mode", None),
+                        getattr(liveness, "verified", None),
+                        getattr(liveness, "peer_uid", None),
                     )
                     return self._spec, self._recovery.pools, granted_fd, liveness
             # Refused at the commit: a closing service must not grant a pool.

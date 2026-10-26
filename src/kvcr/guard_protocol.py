@@ -206,19 +206,71 @@ def _peer_pidfd_verdict(connection: socket.socket, worker_pidfd: int) -> _PeerVe
     return _PeerVerdict.MISMATCH
 
 
-class PidfdLiveness:
-    """Own the pidfd returned for an accepted Unix-socket peer."""
+PeerTrust = Literal["strict", "trusted-peer"]
 
-    def __init__(self, pidfd: int) -> None:
+
+def _peer_uid(connection: socket.socket) -> int | None:
+    """The peer's uid from SO_PEERCRED, for logs only."""
+    try:
+        return struct.unpack(
+            "3i",
+            connection.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            ),
+        )[2]
+    except (AttributeError, OSError, struct.error):
+        return None
+
+
+def peer_liveness_mode(peer_trust: PeerTrust) -> str:
+    """How this host will learn of a worker's death, probed the way a claim does."""
+    probe, peer = socket.socketpair()
+    try:
+        os.close(probe.getsockopt(socket.SOL_SOCKET, _SO_PEERPIDFD))
+        return "so_peerpidfd"
+    except OSError:
+        return "pidfd_trusted" if peer_trust == "trusted-peer" else "pidfd_verified"
+    finally:
+        probe.close()
+        peer.close()
+
+
+class PidfdLiveness:
+    """Own the pidfd returned for an accepted Unix-socket peer.
+
+    ``fenceable`` is False when the pidfd was accepted without proving it names
+    the peer: it is then only a death signal, never a handle to signal through.
+    """
+
+    def __init__(
+        self,
+        pidfd: int,
+        *,
+        mode: str = "so_peerpidfd",
+        verified: bool = True,
+        fenceable: bool = True,
+        peer_uid: int | None = None,
+    ) -> None:
         self._pidfd = pidfd
+        self.mode = mode
+        self.verified = verified
+        self.fenceable = fenceable
+        self.peer_uid = peer_uid
         self.incarnation: str | None = None
         self._close_lock = threading.Lock()
 
     @classmethod
     def from_peer_socket(
-        cls, connection: socket.socket, worker_pidfd: int | None = None
+        cls,
+        connection: socket.socket,
+        worker_pidfd: int | None = None,
+        peer_trust: PeerTrust = "strict",
     ) -> "PidfdLiveness":
-        """Prefer the kernel's peer pidfd; fall back to a verified transferred one."""
+        """Prefer the kernel's peer pidfd; fall back to a checked transferred one.
+
+        Under "trusted-peer" a peer in another PID namespace, which cannot be
+        verified, is accepted but is not fenceable.
+        """
         with contextlib.ExitStack() as transferred:
             if worker_pidfd is not None:
                 transferred.callback(os.close, worker_pidfd)
@@ -231,14 +283,25 @@ class PidfdLiveness:
                     message = "worker pidfd is required without SO_PEERPIDFD"
                     logger.warning(message)
                     raise KVCRServiceError(message) from error
-                if _peer_pidfd_verdict(connection, worker_pidfd) is not (
-                    _PeerVerdict.VERIFIED
-                ):
-                    raise KVCRServiceError("worker pidfd does not match socket peer")
-                liveness = cls(worker_pidfd)
+                verdict = _peer_pidfd_verdict(connection, worker_pidfd)
+                trusted = (
+                    peer_trust == "trusted-peer"
+                    and verdict is _PeerVerdict.PEER_NOT_VISIBLE
+                )
+                if verdict is not _PeerVerdict.VERIFIED and not trusted:
+                    raise KVCRServiceError(
+                        "worker pidfd does not match socket peer"
+                    ) from error
+                liveness = cls(
+                    worker_pidfd,
+                    mode="pidfd_trusted" if trusted else "pidfd_verified",
+                    verified=not trusted,
+                    fenceable=not trusted,
+                    peer_uid=_peer_uid(connection),
+                )
                 transferred.pop_all()
                 return liveness
-            return cls(pidfd)
+            return cls(pidfd, peer_uid=_peer_uid(connection))
 
     def fileno(self) -> int:
         if self._pidfd < 0:

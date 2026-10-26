@@ -155,6 +155,7 @@ def _running_server(
     pool_sizes_bytes: tuple[int, ...] = _TEST_POOL_SIZES_BYTES,
     journal_bytes: int = _TEST_JOURNAL_BYTES,
     heartbeat_timeout_seconds: float | None = None,
+    peer_trust: str = "strict",
 ) -> Iterator[_ServerHarness]:
     socket_path = _test_socket_path()
     pool_dir = tmp_path / "pools"
@@ -167,6 +168,7 @@ def _running_server(
         compatibility_digest=_TEST_DIGEST,
         journal_bytes=journal_bytes,
         heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+        peer_trust=peer_trust,
     )
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
@@ -356,11 +358,12 @@ def test_legacy_service_refuses_client_without_own_pidfd(
                 )
 
 
+@pytest.mark.parametrize("peer_trust", ["strict", "trusted-peer"])
 def test_legacy_claim_rejects_wrong_process_or_non_pidfd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peer_trust: str
 ) -> None:
     monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
-    with _running_server(tmp_path, guard_count=1) as harness:
+    with _running_server(tmp_path, guard_count=1, peer_trust=peer_trust) as harness:
         open_fds = len(os.listdir("/proc/self/fd"))
         for descriptor_type in ("wrong-pid", "not-pidfd"):
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -380,6 +383,57 @@ def test_legacy_claim_rejects_wrong_process_or_non_pidfd(
                 assert "does not match socket peer" in response.message
                 assert _holders_of(harness.server._registry) == {}
         _wait_until(lambda: len(os.listdir("/proc/self/fd")) <= open_fds, timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("peer_trust", "granted"), [("strict", False), ("trusted-peer", True)]
+)
+def test_peer_in_another_pid_namespace_is_granted_only_when_trusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    peer_trust: str,
+    granted: bool,
+) -> None:
+    # The real thing needs a second PID namespace; see the unshare test below.
+    monkeypatch.setattr(guard_protocol, "_SO_PEERPIDFD", 0x7FFFFFFF)
+    monkeypatch.setattr(
+        guard_protocol,
+        "_peer_pidfd_verdict",
+        lambda _connection, _fd: guard_protocol._PeerVerdict.PEER_NOT_VISIBLE,
+    )
+    with _running_server(tmp_path, guard_count=1, peer_trust=peer_trust) as harness:
+        if not granted:
+            with pytest.raises(KVCRServiceError, match="does not match socket peer"):
+                harness.client.claim(
+                    0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
+                )
+            return
+        hold = harness.client.claim(
+            0, _TEST_POOL_LAYOUTS, _TEST_DIGEST, _control_bind(0)
+        )
+        lease = harness.server._registry._guards[0]._pool_lease.current
+        assert (lease.mode, lease.verified, lease.fenceable) == (
+            "pidfd_trusted",
+            False,
+            False,
+        )
+        hold.release()
+
+
+def test_peer_trust_flag_defaults_to_strict() -> None:
+    base = [
+        "--socket-path=/s",
+        "--pool-dir=/p",
+        "--guard-count=1",
+        "--pool-sizes-gb=1",
+        "--compatibility-digest=d",
+    ]
+    assert _parse_args(base).peer_trust == "strict"
+    assert _parse_args([*base, "--peer-trust=trusted-peer"]).peer_trust == (
+        "trusted-peer"
+    )
+    with pytest.raises(SystemExit):
+        _parse_args([*base, "--peer-trust=lax"])
 
 
 def test_service_refuses_startup_without_pidfd_open(tmp_path: Path) -> None:
