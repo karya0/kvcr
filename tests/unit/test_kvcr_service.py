@@ -4,6 +4,7 @@
 import errno
 import fcntl
 import logging
+import mmap
 import os
 import select
 import signal
@@ -233,7 +234,9 @@ def _stand_in_pool(spec) -> Mock:
     return attachment
 
 
-def _new_registry(tmp_path: Path, guard_count: int = 1) -> _PoolRegistry:
+def _new_registry(
+    tmp_path: Path, guard_count: int = 1, digest: str = _TEST_DIGEST, **options
+) -> _PoolRegistry:
     """A registry of real Guards over stand-in pool mappings."""
     journal = Mock()
     journal.read_next.return_value = None
@@ -246,7 +249,8 @@ def _new_registry(tmp_path: Path, guard_count: int = 1) -> _PoolRegistry:
             guard_count,
             _TEST_POOL_SIZES_BYTES,
             _TEST_JOURNAL_BYTES,
-            _TEST_DIGEST,
+            digest,
+            **options,
         )
     for guard in registry._guards.values():
         # Stand-in addresses cannot be registered with the native backend.
@@ -1630,3 +1634,120 @@ def test_a_pool_that_cannot_be_opened_is_reported_and_the_grant_aborted() -> Non
     server.registry.abort_grant.assert_called_once_with(0, lease)
     with pytest.raises(OSError):
         os.fstat(listener_fd)
+
+
+def _pool_files(directory: Path) -> dict[str, int]:
+    return {
+        path.name: path.stat().st_ino for path in sorted(directory.glob("kvcr-pool_*"))
+    }
+
+
+def test_a_restarted_service_adopts_its_pools_and_serves_them(
+    tmp_path: Path,
+) -> None:
+    first = _new_registry(tmp_path, guard_count=2, adopt_pools=True)
+    specs = {rank: guard._spec for rank, guard in first._guards.items()}
+    files = _pool_files(tmp_path)
+    assert len(files) == 2
+    # A worker's mapping, which a guard restart must not invalidate.
+    with open(specs[0].path, "r+b") as pool:
+        worker = mmap.mmap(pool.fileno(), specs[0].mapping_bytes)
+    worker[-5:] = b"bytes"
+    first.close()
+    # Kept on close, as a crash would leave them.
+    assert _pool_files(tmp_path) == files
+
+    second = _new_registry(tmp_path, guard_count=2, adopt_pools=True)
+    try:
+        assert _pool_files(tmp_path) == files
+        for rank, guard in second._guards.items():
+            assert guard._spec == specs[rank]
+        assert worker[-5:] == b"bytes"
+        spec, lease = _claim(second, 0, _FakeLiveness())
+        assert (spec.generation, spec.inode) == (specs[0].generation, specs[0].inode)
+        second.release(0, lease)
+    finally:
+        worker.close()
+        second.close()
+    assert _pool_files(tmp_path) == files
+
+
+def test_without_the_flag_a_restart_allocates_fresh_and_unlinks(
+    tmp_path: Path,
+) -> None:
+    first = _new_registry(tmp_path)
+    generation = first._guards[0]._spec.generation
+    first.close()
+    assert _pool_files(tmp_path) == {}
+
+    second = _new_registry(tmp_path)
+    try:
+        assert second._guards[0]._spec.generation != generation
+    finally:
+        second.close()
+
+
+def test_a_changed_configuration_refuses_the_old_pool_and_purges_it(
+    tmp_path: Path,
+) -> None:
+    first = _new_registry(tmp_path, adopt_pools=True)
+    old = _pool_files(tmp_path)
+    first.close()
+
+    second = _new_registry(tmp_path, digest="another model", adopt_pools=True)
+    try:
+        now = _pool_files(tmp_path)
+        assert len(now) == 1
+        assert not set(now) & set(old)
+    finally:
+        second.close()
+
+
+def test_a_second_live_service_does_not_adopt_the_first_ones_pools(
+    tmp_path: Path,
+) -> None:
+    first = _new_registry(tmp_path, adopt_pools=True)
+    mine = _pool_files(tmp_path)
+    second = _new_registry(tmp_path, adopt_pools=True)
+    try:
+        assert second._adoption_lock is None
+        assert second._guards[0]._spec.path != first._guards[0]._spec.path
+        assert set(mine) <= set(_pool_files(tmp_path))
+    finally:
+        second.close()
+    # The loser unlinks its own pool as a service always did; the first is untouched.
+    assert _pool_files(tmp_path) == mine
+    first.close()
+
+
+def test_adoption_leaves_a_live_workers_pool_and_purges_true_orphans(
+    tmp_path: Path,
+) -> None:
+    first = _new_registry(tmp_path, adopt_pools=True)
+    spec = first._guards[0]._spec
+    first.close()
+    # A worker of the previous service still holds its pool.
+    worker = os.open(spec.path, os.O_RDWR)
+    fcntl.flock(worker, fcntl.LOCK_SH)
+    older = tmp_path / ("kvcr-pool_0-" + "b" * 32)
+    older.write_bytes(b"")
+    other_rank = tmp_path / ("kvcr-pool_7-" + "c" * 32)
+    other_rank.write_bytes(b"")
+    for orphan in (older, other_rank):
+        orphan.chmod(0o600)
+    os.utime(older, ns=(1, 1))
+
+    second = _new_registry(tmp_path, adopt_pools=True)
+    try:
+        assert second._guards[0]._spec.inode == spec.inode
+        assert not older.exists()
+        assert not other_rank.exists()
+        assert Path(spec.path).exists()
+    finally:
+        second.close()
+        os.close(worker)
+
+
+def test_adopt_pools_is_an_opt_in_flag() -> None:
+    assert _parse_args(_service_args("1")).adopt_pools is False
+    assert _parse_args(_service_args("1") + ["--adopt-pools"]).adopt_pools is True
