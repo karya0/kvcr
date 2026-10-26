@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import errno
+import io
 import mmap
 import os
 import select
 import socket
+import struct
 from typing import Any
 from unittest.mock import MagicMock, Mock
 
@@ -30,6 +32,8 @@ from kvcr.guard_protocol import (
     _G3Config,
     _Granted,
     _Heartbeat,
+    _peer_pidfd_verdict,
+    _PeerVerdict,
     _PoolDescriptor,
     _Release,
     _Released,
@@ -607,3 +611,73 @@ def test_v1_messages_without_an_attach_mode_still_decode_as_path() -> None:
         protocol_module._CLAIM_DECODER.decode(
             msgspec.msgpack.encode({**claim, "attach_mode": "memfd"})
         )
+
+
+def _stub_peer_view(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    peer_pid: int,
+    link: str = "anon_inode:[pidfd]",
+    fdinfo: str = "pos:\t0\nPid:\t0\n",
+) -> Mock:
+    """A connection whose SO_PEERCRED and a descriptor's /proc view are fixed."""
+    # Absent on macOS; the connection is a stand-in either way.
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+    connection = Mock()
+    connection.getsockopt.return_value = struct.pack("3i", peer_pid, 0, 0)
+    monkeypatch.setattr(protocol_module.os, "readlink", lambda _path: link)
+    monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: io.StringIO(fdinfo))
+    return connection
+
+
+@pytest.mark.parametrize(
+    ("peer_pid", "link", "fdinfo", "verdict"),
+    [
+        (42, "anon_inode:[pidfd]", "Pid:\t42\n", _PeerVerdict.VERIFIED),
+        (0, "anon_inode:[pidfd]", "Pid:\t0\n", _PeerVerdict.PEER_NOT_VISIBLE),
+        (42, "anon_inode:[pidfd]", "Pid:\t7\n", _PeerVerdict.MISMATCH),
+        (42, "anon_inode:[pidfd]", "Pid:\t0\n", _PeerVerdict.MISMATCH),
+        (0, "anon_inode:[pidfd]", "Pid:\t7\n", _PeerVerdict.MISMATCH),
+        (0, "/dev/null", "Pid:\t0\n", _PeerVerdict.NOT_A_PIDFD),
+        (0, "socket:[1234]", "Pid:\t0\n", _PeerVerdict.NOT_A_PIDFD),
+        (0, "anon_inode:[pidfd]", "pos:\t0\n", _PeerVerdict.NOT_A_PIDFD),
+        (0, "anon_inode:[pidfd]", "Pid:\t-1\n", _PeerVerdict.NOT_A_PIDFD),
+    ],
+)
+def test_peer_pidfd_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+    peer_pid: int,
+    link: str,
+    fdinfo: str,
+    verdict: _PeerVerdict,
+) -> None:
+    connection = _stub_peer_view(
+        monkeypatch, peer_pid=peer_pid, link=link, fdinfo=fdinfo
+    )
+    assert _peer_pidfd_verdict(connection, 5) is verdict
+
+
+def test_peer_pidfd_verdict_fails_closed_when_proc_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _stub_peer_view(monkeypatch, peer_pid=1)
+    monkeypatch.setattr(
+        protocol_module.os, "readlink", Mock(side_effect=OSError(errno.ENOENT, "gone"))
+    )
+    with pytest.raises(KVCRServiceError, match="cannot verify"):
+        _peer_pidfd_verdict(connection, 5)
+
+
+def test_strict_mode_refuses_a_peer_it_cannot_see(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _stub_peer_view(monkeypatch, peer_pid=0)
+    connection.getsockopt.side_effect = [
+        OSError(errno.ENOPROTOOPT, "no"),
+        struct.pack("3i", 0, 0, 0),
+    ]
+    descriptor = os.open(os.devnull, os.O_RDONLY)
+    with pytest.raises(KVCRServiceError, match="does not match socket peer"):
+        PidfdLiveness.from_peer_socket(connection, descriptor)
+    with pytest.raises(OSError):
+        os.fstat(descriptor)  # the refused descriptor was closed
