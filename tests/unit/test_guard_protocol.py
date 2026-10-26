@@ -681,3 +681,91 @@ def test_strict_mode_refuses_a_peer_it_cannot_see(
         PidfdLiveness.from_peer_socket(connection, descriptor)
     with pytest.raises(OSError):
         os.fstat(descriptor)  # the refused descriptor was closed
+
+
+def _legacy_connection(monkeypatch: pytest.MonkeyPatch, verdict: _PeerVerdict) -> Mock:
+    """A peer on a kernel without SO_PEERPIDFD, whose pidfd gets this verdict."""
+    connection = Mock()
+    connection.getsockopt.side_effect = [
+        OSError(errno.ENOPROTOOPT, "no"),
+        struct.pack("3i", 0, 0, 1234),
+    ]
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+    monkeypatch.setattr(
+        protocol_module, "_peer_pidfd_verdict", lambda _connection, _fd: verdict
+    )
+    return connection
+
+
+def test_trusted_peer_grants_a_peer_it_cannot_see_without_fencing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _legacy_connection(monkeypatch, _PeerVerdict.PEER_NOT_VISIBLE)
+    descriptor = os.open(os.devnull, os.O_RDONLY)
+    liveness = PidfdLiveness.from_peer_socket(connection, descriptor, "trusted-peer")
+    try:
+        assert liveness.fileno() == descriptor
+        assert (liveness.mode, liveness.verified, liveness.fenceable) == (
+            "pidfd_trusted",
+            False,
+            False,
+        )
+        assert liveness.peer_uid == 1234
+    finally:
+        liveness.close()
+
+
+def test_trusted_peer_keeps_a_verified_pidfd_fenceable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _legacy_connection(monkeypatch, _PeerVerdict.VERIFIED)
+    liveness = PidfdLiveness.from_peer_socket(
+        connection, os.open(os.devnull, os.O_RDONLY), "trusted-peer"
+    )
+    try:
+        assert (liveness.mode, liveness.verified, liveness.fenceable) == (
+            "pidfd_verified",
+            True,
+            True,
+        )
+    finally:
+        liveness.close()
+
+
+@pytest.mark.parametrize("verdict", [_PeerVerdict.MISMATCH, _PeerVerdict.NOT_A_PIDFD])
+def test_trusted_peer_still_refuses_a_bad_pidfd(
+    monkeypatch: pytest.MonkeyPatch, verdict: _PeerVerdict
+) -> None:
+    connection = _legacy_connection(monkeypatch, verdict)
+    descriptor = os.open(os.devnull, os.O_RDONLY)
+    with pytest.raises(KVCRServiceError, match="does not match socket peer"):
+        PidfdLiveness.from_peer_socket(connection, descriptor, "trusted-peer")
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_peer_pidfd_path_ignores_the_trust_mode() -> None:
+    kernel_pidfd = os.open(os.devnull, os.O_RDONLY)
+    connection = Mock()
+    connection.getsockopt.return_value = kernel_pidfd
+    liveness = PidfdLiveness.from_peer_socket(connection, None, "trusted-peer")
+    try:
+        assert liveness.fileno() == kernel_pidfd
+        assert (liveness.mode, liveness.verified, liveness.fenceable) == (
+            "so_peerpidfd",
+            True,
+            True,
+        )
+    finally:
+        liveness.close()
+
+
+@pytest.mark.parametrize(
+    ("trust", "expected"),
+    [("strict", "pidfd_verified"), ("trusted-peer", "pidfd_trusted")],
+)
+def test_peer_liveness_mode_without_so_peerpidfd(
+    monkeypatch: pytest.MonkeyPatch, trust: str, expected: str
+) -> None:
+    monkeypatch.setattr(protocol_module, "_SO_PEERPIDFD", 0x7FFFFFFF)
+    assert protocol_module.peer_liveness_mode(trust) == expected
