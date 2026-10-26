@@ -2048,3 +2048,46 @@ def test_service_in_its_own_pid_namespace_grants_a_worker_it_cannot_see_when_tru
             worker.wait(timeout=_SERVER_STOP_TIMEOUT_SECONDS)
             if worker.stdout is not None:
                 worker.stdout.close()
+
+
+@pytest.mark.usefixtures("_stand_in_guards")
+def test_a_service_that_lost_adoption_does_not_purge_the_winners_held_pool(
+    tmp_path: Path,
+) -> None:
+    _new_registry(tmp_path, adopt_pools=True).close()
+    spec_path = next(iter(_pool_files(tmp_path)))
+    worker = os.open(tmp_path / spec_path, os.O_RDWR)
+    fcntl.flock(worker, fcntl.LOCK_SH)
+    winner = _new_registry(tmp_path, adopt_pools=True)
+    orphan = tmp_path / ("kvcr-pool_9-" + "d" * 32)
+    orphan.write_bytes(b"")
+    orphan.chmod(0o600)
+    try:
+        assert winner._guards[0]._held
+        loser = _new_registry(tmp_path, adopt_pools=True)
+        try:
+            # Nothing it did not allocate is touched, orphans included.
+            assert orphan.exists()
+            os.close(worker)
+            worker = -1
+            assert (tmp_path / spec_path).exists()
+            _wait_until(lambda: not winner._guards[0]._held, timeout=5)
+            assert winner._guards[0]._failure is None
+        finally:
+            loser.close()
+        assert (tmp_path / spec_path).exists()
+    finally:
+        if worker >= 0:
+            os.close(worker)
+        winner.close()
+
+
+def test_a_plain_service_still_purges_true_orphans(tmp_path: Path) -> None:
+    orphan = tmp_path / ("kvcr-pool_9-" + "e" * 32)
+    orphan.write_bytes(b"")
+    orphan.chmod(0o600)
+    registry = _new_registry(tmp_path)
+    try:
+        assert not orphan.exists()
+    finally:
+        registry.close()

@@ -128,11 +128,23 @@ class _PoolRegistry:
             if self._adoption_lock is None:
                 stamp = None
         try:
-            # By identity, not only by lock: a pool a previous worker still holds
-            # carries none of ours yet, and must survive its holder's exit.
-            self._purge_orphaned_pools(
-                {(owner.spec.device, owner.spec.inode) for owner in adopted.values()}
-            )
+            if adopt_pools and self._adoption_lock is None:
+                # The lock's holder may have adopted a pool its previous worker
+                # still maps; unlocked, that looks like an orphan to this purge.
+                logger.warning(
+                    "Leaving existing KVCR pool files in %s alone: adoption is "
+                    "held by another service",
+                    self._pool_dir,
+                )
+            else:
+                # By identity, not only by lock: a pool a previous worker still
+                # holds carries none of ours yet, and must survive its holder's exit.
+                self._purge_orphaned_pools(
+                    {
+                        (owner.spec.device, owner.spec.inode)
+                        for owner in adopted.values()
+                    }
+                )
         except BaseException:
             self._abandon_adoption(adopted)
             raise
