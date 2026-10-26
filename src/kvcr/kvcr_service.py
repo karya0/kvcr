@@ -125,8 +125,15 @@ class _PoolRegistry:
             adopted = self._adopt_pools(mapping_bytes, journal_bytes, stamp)
             if self._adoption_lock is None:
                 stamp = None
-        # Adopted pools hold their lock, so the purge leaves them alone.
-        self._purge_orphaned_pools()
+        try:
+            # By identity, not only by lock: a pool a previous worker still holds
+            # carries none of ours yet, and must survive its holder's exit.
+            self._purge_orphaned_pools(
+                {(owner.spec.device, owner.spec.inode) for owner in adopted.values()}
+            )
+        except BaseException:
+            self._abandon_adoption(adopted)
+            raise
         for rank in range(guard_count):
             try:
                 owner = adopted.pop(rank, None) or _KVCRPoolOwner.allocate(
@@ -162,9 +169,7 @@ class _PoolRegistry:
                 guard.start()
             except BaseException:
                 self._release_pools()
-                for owner in adopted.values():
-                    owner.close()
-                self._release_adoption_lock()
+                self._abandon_adoption(adopted)
                 raise
 
     def _adopt_pools(
@@ -176,10 +181,17 @@ class _PoolRegistry:
         both adopt. Losing it is not an error: that service allocates and
         unlinks as it always did.
         """
-        self._adoption_lock = _try_lock_adoption(self._pool_dir)
+        try:
+            self._adoption_lock = _try_lock_adoption(self._pool_dir)
+        except OSError as error:
+            logger.warning(
+                "Cannot lock adoption in %s (%s); not adopting", self._pool_dir, error
+            )
+            return {}
         if self._adoption_lock is None:
             logger.warning(
-                "Another KVCR service adopts pools in %s; not adopting", self._pool_dir
+                "Another KVCR service holds the adoption lock in %s; not adopting",
+                self._pool_dir,
             )
             return {}
         adopted: dict[int, _KVCRPoolOwner] = {}
@@ -195,11 +207,16 @@ class _PoolRegistry:
                 if owner is not None:
                     adopted[rank] = owner
         except BaseException:
-            for owner in adopted.values():
-                owner.close()
-            self._release_adoption_lock()
+            self._abandon_adoption(adopted)
             raise
         return adopted
+
+    def _abandon_adoption(self, adopted: "dict[int, _KVCRPoolOwner]") -> None:
+        """Close adopted pools no Guard took; their files stay for a next start."""
+        for owner in adopted.values():
+            owner.close()
+        adopted.clear()
+        self._release_adoption_lock()
 
     def _release_adoption_lock(self) -> None:
         if self._adoption_lock is not None:
@@ -225,8 +242,10 @@ class _PoolRegistry:
                 continue
             del self._guards[guard_index]
 
-    def _purge_orphaned_pools(self) -> None:
-        """Remove pool files no live daemon owns.
+    def _purge_orphaned_pools(
+        self, adopted: set[tuple[int, int]] = frozenset()
+    ) -> None:
+        """Remove pool files no live daemon owns, except those just adopted.
 
         Crash leftovers fill the fixed-size directory and fail the next eager
         allocation. Use is decided by the shared flock, never the filename.
@@ -237,7 +256,10 @@ class _PoolRegistry:
                 if not recognized or path.is_symlink():
                     continue
                 try:
-                    size = path.stat().st_size
+                    file_stat = path.stat()
+                    size = file_stat.st_size
+                    if (file_stat.st_dev, file_stat.st_ino) in adopted:
+                        continue
                     reclaimed = _reclaim_pool_if_orphaned(path)
                 except OSError:
                     logger.warning(

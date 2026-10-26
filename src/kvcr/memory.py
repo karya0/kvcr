@@ -36,6 +36,8 @@ _JOURNAL_HEADER_BYTES = 4096
 # clear of the three cursors at 0, 128 and 192.
 _ADOPT_STAMP_OFFSET = 256
 _ADOPT_STAMP_BYTES = 32
+# Never removed: it holds no state, and unlinking it would let two services
+# lock different files. The purge ignores it (it is not a pool name).
 _ADOPT_LOCK_NAME = "adopt.lock"
 # The errnos that mean "another holder has this lock" rather than "locking is
 # broken here". Anything outside this set must propagate.
@@ -227,10 +229,13 @@ class _KVCRPoolOwner:
         spec: KVCRPoolSpec,
         file_descriptor: int,
         keep: bool = False,
+        held: bool = False,
     ) -> None:
         self.spec = spec
         self._file_descriptor = file_descriptor
         self._keep = keep
+        # Adopted while another process still held the pool: no lock of ours yet.
+        self.held = held
         self._path = Path(spec.path)
         self._file_identity = (spec.device, spec.inode)
 
@@ -309,7 +314,11 @@ class _KVCRPoolOwner:
         they hold does; a handback region past the pool is cut away. A file
         that is not exactly what this configuration would have allocated is
         refused (and logged) rather than repaired, and a refused file is left
-        for the purge. Returns None when there is nothing to adopt.
+        for the purge. Returns None when there is nothing to adopt. The owner
+        may come back `held`: see `try_unhold`.
+
+        "Newest" is the last write time: the pool the previous service was
+        using, not the one it happened to create last.
         """
         _validate_pool_layout(pool_size_bytes, journal_bytes)
         directory = Path(pool_dir).resolve()
@@ -353,8 +362,6 @@ class _KVCRPoolOwner:
     ) -> "_KVCRPoolOwner":
         file_descriptor = os.open(path, _OPEN_FLAGS)
         try:
-            if not _try_lock_pool(file_descriptor, exclusive=False):
-                raise RuntimeError("it is exclusively locked")
             file_stat = os.fstat(file_descriptor)
             if not stat.S_ISREG(file_stat.st_mode):
                 raise ValueError("it is not a regular file")
@@ -370,8 +377,6 @@ class _KVCRPoolOwner:
             )
             if not hmac.compare_digest(recorded, stamp):
                 raise ValueError("it was not built for this configuration")
-            if file_stat.st_size > pool_size_bytes:
-                os.ftruncate(file_descriptor, pool_size_bytes)
             spec = KVCRPoolSpec(
                 pool_id=pool_id,
                 path=str(path),
@@ -384,12 +389,44 @@ class _KVCRPoolOwner:
         except BaseException:
             os.close(file_descriptor)
             raise
-        logger.info(
-            "Adopted KVCR pool %s (cold: its bytes are kept, its contents are not "
-            "recovered)",
-            path,
-        )
-        return cls(spec, file_descriptor, keep=True)
+        owner = cls(spec, file_descriptor, keep=True, held=True)
+        if owner.try_unhold():
+            logger.info(
+                "Adopted KVCR pool %s (cold: its bytes are kept, its contents are "
+                "not recovered)",
+                path,
+            )
+        else:
+            logger.warning(
+                "Adopted KVCR pool %s but a previous worker still holds it; "
+                "it is not claimable until that worker is gone",
+                path,
+            )
+        return owner
+
+    def try_unhold(self) -> bool:
+        """Make an adopted pool ours if nobody else holds it any more.
+
+        The probe is an exclusive lock on this descriptor's own open file
+        description, taken while we hold nothing: once we held it shared we
+        could not tell our lock from a previous worker's. On success it is
+        converted to the usual shared lock and the handback region is cut away.
+        Under the directory guard, shared like every creation, so no purge can
+        reclaim the file between the probe and the conversion.
+        """
+        if not self.held:
+            return True
+        with _pool_dir_guard(self._path.parent, exclusive=False):
+            if os.fstat(self._file_descriptor).st_nlink == 0:
+                raise RuntimeError(f"KVCR pool was unlinked while held: {self._path}")
+            if not _try_lock_pool(self._file_descriptor, exclusive=True):
+                return False
+            if not _try_lock_pool(self._file_descriptor, exclusive=False):
+                return False
+            if os.fstat(self._file_descriptor).st_size > self.spec.mapping_bytes:
+                os.ftruncate(self._file_descriptor, self.spec.mapping_bytes)
+        self.held = False
+        return True
 
     def close(self) -> None:
         """Close the owned pool, unlinking it unless it is kept for adoption."""
