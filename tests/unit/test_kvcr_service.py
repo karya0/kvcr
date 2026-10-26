@@ -1751,3 +1751,46 @@ def test_adoption_leaves_a_live_workers_pool_and_purges_true_orphans(
 def test_adopt_pools_is_an_opt_in_flag() -> None:
     assert _parse_args(_service_args("1")).adopt_pools is False
     assert _parse_args(_service_args("1") + ["--adopt-pools"]).adopt_pools is True
+
+
+def test_a_pool_a_previous_worker_still_holds_is_refused_until_it_exits(
+    tmp_path: Path,
+) -> None:
+    first = _new_registry(tmp_path, adopt_pools=True)
+    spec = first._guards[0]._spec
+    first.close()
+    worker = os.open(spec.path, os.O_RDWR)
+    fcntl.flock(worker, fcntl.LOCK_SH)
+
+    second = _new_registry(tmp_path, adopt_pools=True)
+    try:
+        guard = second._guards[0]
+        assert guard._spec.inode == spec.inode
+        assert guard._held
+        with pytest.raises(KVCRServiceError, match="still attached by a previous"):
+            _claim(second, 0, _FakeLiveness())
+        # Its holder going away must not expose it to a purge before the Guard
+        # has taken it: the purge skips it by identity, not only by lock.
+        os.close(worker)
+        worker = -1
+        second._purge_orphaned_pools({(spec.device, spec.inode)})
+        assert Path(spec.path).exists()
+        _wait_until(lambda: not guard._held, timeout=5)
+        _spec, lease = _claim(second, 0, _FakeLiveness())
+        assert _spec.inode == spec.inode
+        second.release(0, lease)
+    finally:
+        if worker >= 0:
+            os.close(worker)
+        second.close()
+
+
+def test_an_adopted_pool_with_no_holder_is_claimable_at_once(tmp_path: Path) -> None:
+    _new_registry(tmp_path, adopt_pools=True).close()
+    registry = _new_registry(tmp_path, adopt_pools=True)
+    try:
+        assert not registry._guards[0]._held
+        _spec, lease = _claim(registry, 0, _FakeLiveness())
+        registry.release(0, lease)
+    finally:
+        registry.close()

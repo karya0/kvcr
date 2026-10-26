@@ -598,3 +598,36 @@ def test_adoption_is_held_by_one_service_at_a_time(tmp_path: Path) -> None:
     second = _try_lock_adoption(tmp_path)
     assert second is not None
     os.close(second)
+
+
+def test_a_pool_a_previous_worker_holds_is_adopted_held_until_it_lets_go(
+    tmp_path: Path,
+) -> None:
+    kept = _kept_pool(tmp_path)
+    kept.close()
+    # A worker of the previous service: its own open file description.
+    worker = os.open(kept.spec.path, os.O_RDWR)
+    fcntl.flock(worker, fcntl.LOCK_SH)
+    os.truncate(kept.spec.path, _ADOPT_POOL_BYTES + 8192)
+
+    adopted = _adopt(tmp_path)
+
+    assert adopted is not None
+    assert adopted.held
+    assert not adopted.try_unhold()
+    # Nothing of ours is held yet, and the worker's pool is left as it was.
+    assert Path(adopted.spec.path).stat().st_size == _ADOPT_POOL_BYTES + 8192
+    os.close(worker)
+    assert adopted.try_unhold()
+    assert not adopted.held
+    assert Path(adopted.spec.path).stat().st_size == _ADOPT_POOL_BYTES
+    assert not _reclaim_pool_if_orphaned(Path(adopted.spec.path))
+    adopted.close()
+
+
+def test_a_pool_nobody_holds_is_adopted_ready(tmp_path: Path) -> None:
+    _kept_pool(tmp_path).close()
+    adopted = _adopt(tmp_path)
+    assert adopted is not None
+    assert not adopted.held
+    adopted.close()
