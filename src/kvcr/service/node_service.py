@@ -82,6 +82,60 @@ class PoolClaim:
     def data_bytes(self) -> int:
         return int(self.size_gb * _GIB)
 
+    def resources(self) -> dict[str, int]:
+        # H7 bounds the snapshot tail to one additional mapping. Metadata has
+        # no universal size bound; this is an explicit experiment capacity cap,
+        # enforced by tmpfs and fully covered by the Pod reservation.
+        mapping = self.data_bytes + _JOURNAL_BYTES
+        return {
+            "mapping_bytes": mapping,
+            "snapshot_budget_bytes": mapping,
+            "backing_limit_bytes": 2 * mapping,
+            "memory_request_bytes": 2 * mapping + _HEADROOM_BYTES,
+        }
+
+
+def _matching_tolerations(actual: Any, intended: list[dict[str, Any]]) -> bool:
+    """Accept only intent and the two standard DefaultTolerationSeconds entries."""
+
+    def normalize(value: Any) -> tuple[Any, ...] | None:
+        if not isinstance(value, dict) or set(value) - {
+            "key",
+            "operator",
+            "value",
+            "effect",
+            "tolerationSeconds",
+        }:
+            return None
+        return (
+            value.get("key", ""),
+            value.get("operator") or "Equal",
+            value.get("value") or "",
+            value.get("effect") or "",
+            value.get("tolerationSeconds"),
+        )
+
+    if not isinstance(actual, list):
+        return False
+    expected = [normalize(value) for value in intended]
+    allowed_defaults = {
+        (f"node.kubernetes.io/{condition}", "Exists", "", "NoExecute", 300)
+        for condition in ("not-ready", "unreachable")
+    }
+    observed = [normalize(value) for value in actual]
+    if any(value is None for value in observed):
+        return False
+    # Consume rather than use a set: duplicate tolerations are not our template.
+    for value in expected:
+        if value not in observed:
+            return False
+        observed.remove(value)
+    for value in observed:
+        if value not in allowed_defaults:
+            return False
+        allowed_defaults.remove(value)
+    return True
+
 
 class PodAPI(Protocol):
     def get(self, name: str) -> dict[str, Any] | None: ...
@@ -312,8 +366,9 @@ class NodeBroker:
         state["pool_specs"] = info["pool_specs"]
 
     def _pod(self, claim: PoolClaim, state: dict[str, Any]) -> dict[str, Any]:
-        memory = f"{(claim.data_bytes + _JOURNAL_BYTES + _HEADROOM_BYTES) >> 20}Mi"
-        mapping_size = f"{(claim.data_bytes + _JOURNAL_BYTES) >> 20}Mi"
+        resources = claim.resources()
+        memory = f"{resources['memory_request_bytes'] >> 20}Mi"
+        backing_size = f"{resources['backing_limit_bytes'] >> 20}Mi"
         return {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -418,7 +473,7 @@ class NodeBroker:
                         "name": "pool",
                         "emptyDir": {
                             "medium": "Memory",
-                            "sizeLimit": mapping_size,
+                            "sizeLimit": backing_size,
                         },
                     },
                 ],
@@ -456,11 +511,14 @@ class NodeBroker:
             "automountServiceAccountToken",
             "securityContext",
             "imagePullSecrets",
-            "tolerations",
             "volumes",
         ):
             if not _contains(spec.get(key), expected["spec"][key]):
                 raise ValueError(f"holder {key} mismatch")
+        if not _matching_tolerations(
+            spec.get("tolerations", []), expected["spec"]["tolerations"]
+        ):
+            raise ValueError("holder tolerations mismatch")
         if spec.get("nodeName") not in (None, "", self.node_name):
             raise ValueError("holder assigned to another node")
         for key in (
@@ -588,6 +646,7 @@ class NodeBroker:
     def _descriptor(self, state: dict[str, Any]) -> dict[str, Any]:
         return {
             **state["claim"],
+            **PoolClaim.parse(state["claim"]).resources(),
             "namespace": self.namespace,
             "node_name": self.node_name,
             "manager_id": self.manager_id,
