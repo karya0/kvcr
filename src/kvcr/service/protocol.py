@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from math import gcd
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import msgspec
 
@@ -139,8 +139,21 @@ class _Error(msgspec.Struct, frozen=True, tag="error"):
     version: ProtocolVersion
 
 
-def _claim_fd_counts(_claim: _Claim) -> tuple[int, ...]:
-    return (0, 1)  # the worker's pidfd, when it has one
+class _ServiceInfo(msgspec.Struct, frozen=True, tag="service_info"):
+    version: ProtocolVersion
+
+
+class _Drain(msgspec.Struct, frozen=True, tag="drain"):
+    version: ProtocolVersion
+
+
+class _ServiceState(msgspec.Struct, frozen=True, tag="service_state"):
+    info: dict[str, Any]
+    version: ProtocolVersion
+
+
+def _claim_fd_counts(request: _Claim | _ServiceInfo | _Drain) -> tuple[int, ...]:
+    return (0, 1) if isinstance(request, _Claim) else (0,)
 
 
 def _response_fd_counts(response: "_Granted | _Error") -> tuple[int, ...]:
@@ -148,10 +161,41 @@ def _response_fd_counts(response: "_Granted | _Error") -> tuple[int, ...]:
     return (0,) if isinstance(response, _Error) else (2,)
 
 
-_CLAIM_DECODER = msgspec.msgpack.Decoder(_Claim)
+_CLAIM_DECODER = msgspec.msgpack.Decoder(_Claim | _ServiceInfo | _Drain)
 _HOLD_DECODER = msgspec.msgpack.Decoder(_Heartbeat | _Release)
 _CLAIM_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Granted | _Error)
 _RELEASE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Released | _Error)
+_SERVICE_STATE_DECODER = msgspec.msgpack.Decoder(_ServiceState | _Error)
+
+
+def _service_request(
+    socket_path: str | os.PathLike[str], request: Any, timeout_s: float
+) -> dict:
+    if not 0 < timeout_s < float("inf"):
+        raise ValueError("service request timeout must be positive and finite")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout_s)
+        connection.connect(os.fspath(socket_path))
+        channel = FramedConnection(connection)
+        channel.send(request)
+        response = channel.receive(_SERVICE_STATE_DECODER)
+    if isinstance(response, _Error):
+        raise KVCRServiceError(response.message)
+    return response.info
+
+
+def service_info(socket_path: str | os.PathLike[str], timeout_s: float = 30.0) -> dict:
+    """Inspect a holder without acquiring a worker lease or changing its pools."""
+    return _service_request(socket_path, _ServiceInfo(_PROTOCOL_VERSION), timeout_s)
+
+
+def drain_service(socket_path: str | os.PathLike[str], timeout_s: float = 30.0) -> dict:
+    """Request irreversible drain; only ``state == 'drained'`` permits deletion.
+
+    Busy, errors and transport uncertainty retain the holder reservation. The
+    caller may inspect or repeat this idempotent request after references close.
+    """
+    return _service_request(socket_path, _Drain(_PROTOCOL_VERSION), timeout_s)
 
 
 def _verify_peer_pidfd(connection: socket.socket, worker_pidfd: int) -> None:

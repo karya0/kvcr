@@ -215,6 +215,7 @@ class _KVCRPoolOwner:
         self._file_descriptor = file_descriptor
         self._path = Path(spec.path)
         self._file_identity = (spec.device, spec.inode)
+        self._drained = False
 
     @classmethod
     def allocate(
@@ -292,6 +293,45 @@ class _KVCRPoolOwner:
             os.close(self._file_descriptor)
             self._file_descriptor = -1
         _unlink_if_identity(self._path, self._file_identity)
+
+    def drain(self) -> bool:
+        """Reclaim only after internal mappings and every external shared lock go.
+
+        The directory lock excludes our orphan sweep while the owner's shared
+        lock is dropped. A fresh description is essential: flock on a dup would
+        change the owner's lock rather than test other descriptions.
+        """
+        if self._drained:
+            return True
+        if self._file_descriptor == -1:
+            raise RuntimeError("KVCR pool owner closed without a verified drain")
+        with _pool_dir_guard(self._path.parent, exclusive=True):
+            probe = os.open(self._path, _OPEN_FLAGS)
+            try:
+                observed = os.fstat(probe)
+                if (observed.st_dev, observed.st_ino) != self._file_identity:
+                    raise RuntimeError("KVCR pool identity changed during drain")
+                fcntl.flock(self._file_descriptor, fcntl.LOCK_UN)
+                try:
+                    if not _try_lock_pool(probe, exclusive=True):
+                        return False
+                    current = self._path.stat(follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) != self._file_identity:
+                        raise RuntimeError("KVCR pool path changed during drain")
+                    self._path.unlink()
+                    os.close(self._file_descriptor)
+                    self._file_descriptor = -1
+                    self._drained = True
+                    return True
+                finally:
+                    if self._file_descriptor != -1:
+                        fcntl.flock(probe, fcntl.LOCK_UN)
+                        if not _try_lock_pool(self._file_descriptor, exclusive=False):
+                            raise RuntimeError(
+                                "KVCR pool owner lock could not be restored"
+                            )
+            finally:
+                os.close(probe)
 
 
 def _compute_pool_geometry(

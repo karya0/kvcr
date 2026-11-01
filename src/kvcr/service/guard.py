@@ -537,6 +537,48 @@ class _Guard:
         if not already:
             self._commands.put(_Command("close"))
 
+    def begin_drain(self) -> bool:
+        """Close internals only when no claim transition or live primary remains.
+
+        A granted lease is retained even if its socket disappeared or its FDs
+        have not reached the claimant yet. Only release or confirmed death ends
+        that protection; an administrative request must never fence the worker.
+        """
+        with self._phase_lock:
+            if self._failure is not None:
+                raise self._failure
+            if self._closing:
+                return True
+            if self._reserved is not None:
+                return False
+            lease = self._pool_lease.current
+            if lease is not None:
+                events = self._pool_lease.poll_pidfd(lease)
+                if events is None:
+                    return False
+                if not events & select.POLLIN:
+                    raise OSError(f"uncertain pidfd state during drain: {events:#x}")
+            self._closing = True
+        if self._started and self._thread.is_alive():
+            self._commands.put(_Command("close"))
+        elif not self._closed:
+            self._close_resources()
+            self._closed = True
+        return True
+
+    def drain_pool(self) -> bool:
+        """Check external attachments after the actor and native work quiesce."""
+        if self._thread.is_alive() or not self._closed:
+            return False
+        if self._recovery.attachment is not None:
+            return False
+        if self._owner is None:
+            return True
+        if not self._owner.drain():
+            return False
+        self._owner = None
+        return True
+
     def finish_close(self, deadline: float) -> bool:
         """Wait out a begun close; True if the actor is wedged past the
         deadline. A close that finished but failed raises its reason here.
