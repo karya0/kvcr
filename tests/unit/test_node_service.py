@@ -549,3 +549,38 @@ def test_toleration_intent_accepts_absent_default_operator():
     ]
     actual = [{"key": "nvidia.com/gpu", "value": "true", "effect": "NoSchedule"}]
     assert broker_module._matching_tolerations(actual, expected)
+
+
+def test_pod_api_reads_rotated_projected_token_each_request(tmp_path, monkeypatch):
+    import io
+
+    service_account = tmp_path / "service-account"
+    service_account.mkdir()
+    token = service_account / "token"
+    token.write_text("first-fixture-token\n")
+    original_path = Path
+    monkeypatch.setattr(
+        broker_module,
+        "Path",
+        lambda path: service_account
+        if str(path) == "/var/run/secrets/kubernetes.io/serviceaccount"
+        else original_path(path),
+    )
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "api.fixture.invalid")
+    monkeypatch.setattr(
+        broker_module.ssl, "create_default_context", lambda **kwargs: object()
+    )
+    headers = []
+
+    def fake_open(request, **kwargs):
+        headers.append(request.get_header("Authorization"))
+        return io.BytesIO(b'{"items": []}')
+
+    monkeypatch.setattr(broker_module.urllib.request, "urlopen", fake_open)
+    api = broker_module.InClusterPodAPI("bench")
+    assert api.list("gaas") == []
+    replacement = service_account / "next-token"
+    replacement.write_text("rotated-fixture-token\n")
+    replacement.replace(token)
+    assert api.list("gaas") == []
+    assert headers == ["Bearer first-fixture-token", "Bearer rotated-fixture-token"]
