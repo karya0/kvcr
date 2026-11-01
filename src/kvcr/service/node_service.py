@@ -163,7 +163,7 @@ class InClusterPodAPI:
         host = f"[{host}]" if ":" in host else host
         self._url = f"https://{host}:{port}/api/v1/namespaces/{namespace}/pods"
         service_account = Path("/var/run/secrets/kubernetes.io/serviceaccount")
-        self._token = (service_account / "token").read_text().strip()
+        self._token_path = service_account / "token"
         self._context = ssl.create_default_context(cafile=service_account / "ca.crt")
 
     def _request(self, method: str, suffix: str = "", body=None):
@@ -172,7 +172,9 @@ class InClusterPodAPI:
             data=json.dumps(body).encode() if body is not None else None,
             method=method,
             headers={
-                "Authorization": f"Bearer {self._token}",
+                # Projected service-account credentials rotate while the
+                # broker lives; resolve the mounted file on every request.
+                "Authorization": f"Bearer {self._token_path.read_text().strip()}",
                 "Content-Type": "application/json",
             },
         )
