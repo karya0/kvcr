@@ -1,0 +1,454 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import copy
+import importlib.util
+import json
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+# This module has no framework dependencies. Loading it directly also permits
+# its ownership tests on macOS, where the optional NIXL wheel is unavailable.
+_source = Path(__file__).parents[2] / "src/kvcr/service/node_service.py"
+_spec = importlib.util.spec_from_file_location("_node_service_test_target", _source)
+broker_module = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = broker_module
+_spec.loader.exec_module(broker_module)
+NodeBroker = broker_module.NodeBroker
+PoolClaim = broker_module.PoolClaim
+PodAPIError = broker_module.PodAPIError
+
+_IMAGE = "example.test/consumer@sha256:" + "a" * 64
+_CLAIM = {"pool_id": "pool-a", "size_gb": 1.0, "compatibility_digest": "model-v1"}
+_SPECS = [
+    {"pool_id": "allocation-a", "generation": "generation-a", "device": 1, "inode": 2}
+]
+
+
+@pytest.fixture
+def tmp_path():
+    with tempfile.TemporaryDirectory(prefix="gaas-node-", dir="/tmp") as directory:
+        yield Path(directory)
+
+
+class FakeAPI:
+    def __init__(self):
+        self.pods = {}
+        self.creates = []
+        self.deletes = []
+        self.lose_create_response = False
+        self.hide_created_once = False
+        self._hide_next_read = False
+        self.keep_deleted = False
+        self.lose_delete_response = False
+
+    def get(self, name):
+        if self._hide_next_read:
+            self._hide_next_read = False
+            return None
+        return copy.deepcopy(self.pods.get(name))
+
+    def list(self, manager):
+        return [
+            copy.deepcopy(p)
+            for p in self.pods.values()
+            if p["metadata"]["labels"][broker_module._LABEL] == manager
+        ]
+
+    def create(self, pod):
+        self.creates.append(copy.deepcopy(pod))
+        name = pod["metadata"]["name"]
+        if name in self.pods:
+            raise PodAPIError(409, "POST")
+        actual = copy.deepcopy(pod)
+        actual["metadata"]["uid"] = "holder-uid-1"
+        actual["status"] = {"phase": "Running", "podIP": "10.1.2.3"}
+        actual["spec"]["nodeName"] = "node-a"
+        # Kubernetes adds defaults which must not invalidate the intended spec.
+        actual["spec"]["securityContext"]["supplementalGroupsPolicy"] = "Merge"
+        actual["spec"]["containers"][0]["readinessProbe"]["timeoutSeconds"] = 1
+        self.pods[name] = actual
+        if self.lose_create_response:
+            self._hide_next_read = self.hide_created_once
+            raise PodAPIError(None, "POST")
+        return copy.deepcopy(actual)
+
+    def delete(self, name, uid):
+        self.deletes.append((name, uid))
+        assert self.pods[name]["metadata"]["uid"] == uid
+        if not self.keep_deleted:
+            del self.pods[name]
+        else:
+            self.pods[name]["metadata"]["deletionTimestamp"] = "2026-11-01T22:00:00Z"
+        if self.lose_delete_response:
+            raise PodAPIError(None, "DELETE")
+
+
+@pytest.fixture(autouse=True)
+def no_cluster(monkeypatch, tmp_path):
+    config = tmp_path / "empty-kubeconfig"
+    config.write_text("")
+    monkeypatch.setenv("KUBECONFIG", str(config))
+
+    def denied(*args, **kwargs):
+        pytest.fail("unmocked Kubernetes HTTP access")
+
+    monkeypatch.setattr(broker_module.urllib.request, "urlopen", denied)
+
+
+def make_broker(root, api=None, info=None, drain=None):
+    return NodeBroker(
+        namespace="bench",
+        node_name="node-a",
+        manager_id="gaas",
+        image=_IMAGE,
+        socket_root=root,
+        api=api or FakeAPI(),
+        info=info
+        or (
+            lambda _: {
+                "state": "ready",
+                "pool_specs": _SPECS,
+                "compatibility_digest": "model-v1",
+            }
+        ),
+        drain=drain
+        or (
+            lambda _: {
+                "state": "drained",
+                "pool_specs": _SPECS,
+                "compatibility_digest": "model-v1",
+            }
+        ),
+        poll_interval=0,
+    )
+
+
+def test_create_idempotent_reattach_and_resources(tmp_path):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    first = broker.ensure(_CLAIM)
+    second = broker.ensure(dict(_CLAIM))
+    assert first == second
+    assert len(api.creates) == 1
+    assert first["holder_uid"] == "holder-uid-1"
+    assert first["holder_pod_ip"] == "10.1.2.3"
+    assert first["control_port"] == 55001
+    pod = api.creates[0]
+    assert not pod["metadata"].get("ownerReferences")
+    spec = pod["spec"]
+    assert "nodeName" not in spec
+    affinity = spec["affinity"]["nodeAffinity"][
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ]
+    assert affinity["nodeSelectorTerms"][0]["matchFields"] == [
+        {"key": "metadata.name", "operator": "In", "values": ["node-a"]}
+    ]
+    assert spec["restartPolicy"] == "Never"
+    holder = spec["containers"][0]
+    assert holder["resources"]["requests"]["memory"] == "3172Mi"
+    assert holder["resources"]["limits"]["memory"] == "3172Mi"
+    assert "livenessProbe" not in holder
+    assert not any("gpu" in key for key in holder["resources"]["requests"])
+    assert spec["volumes"][1]["emptyDir"] == {"medium": "Memory", "sizeLimit": "1124Mi"}
+
+
+def test_lost_create_response_reconciles_once(tmp_path):
+    api = FakeAPI()
+    api.lose_create_response = True
+    result = make_broker(tmp_path, api).ensure(_CLAIM)
+    assert result["holder_uid"] == "holder-uid-1"
+    assert len(api.creates) == 1
+
+
+def test_uncertain_create_can_be_released_once_uid_becomes_observable(tmp_path):
+    api = FakeAPI()
+    api.lose_create_response = True
+    api.hide_created_once = True
+    broker = make_broker(tmp_path, api)
+    with pytest.raises(PodAPIError):
+        broker.ensure(_CLAIM)
+    result = broker.release(_CLAIM)
+    assert result["deleted"] is True
+    assert result["holder_uid"] == "holder-uid-1"
+    assert api.deletes[0][1] == "holder-uid-1"
+
+
+def test_integer_and_float_capacities_are_canonical(tmp_path):
+    broker = make_broker(tmp_path)
+    first = broker.ensure({**_CLAIM, "size_gb": 1})
+    assert broker.ensure(_CLAIM) == first
+
+
+def test_broker_restart_preserves_claim_and_pool_identity(tmp_path):
+    api = FakeAPI()
+    first = make_broker(tmp_path, api).ensure(_CLAIM)
+    second = make_broker(tmp_path, api).ensure(_CLAIM)
+    assert first == second
+    assert len(api.creates) == 1
+    changed = make_broker(
+        tmp_path,
+        api,
+        info=lambda _: {
+            "state": "ready",
+            "pool_specs": [{"generation": "reallocated"}],
+            "compatibility_digest": "model-v1",
+        },
+    )
+    with pytest.raises(RuntimeError, match="pool identity changed"):
+        changed.ensure(_CLAIM)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("size_gb", 0.5), ("compatibility_digest", "other")]
+)
+def test_claim_drift_refuses_reallocation(tmp_path, field, value):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    broker.ensure(_CLAIM)
+    with pytest.raises(ValueError, match="differs"):
+        broker.ensure({**_CLAIM, field: value})
+    assert len(api.creates) == 1
+
+
+@pytest.mark.parametrize(
+    "mutation", ["uid", "node", "owner", "nonce", "container", "host-network"]
+)
+def test_adoption_refuses_foreign_or_mutated_pod(tmp_path, mutation):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    descriptor = broker.ensure(_CLAIM)
+    pod = api.pods[descriptor["holder_name"]]
+    if mutation == "uid":
+        pod["metadata"]["uid"] = "foreign"
+    elif mutation == "node":
+        pod["spec"]["nodeName"] = "other"
+    elif mutation == "owner":
+        pod["metadata"]["ownerReferences"] = [{"uid": "daemonset"}]
+    elif mutation == "nonce":
+        pod["metadata"]["annotations"][broker_module._ANNOTATION + "creation-id"] = (
+            "other"
+        )
+    elif mutation == "container":
+        pod["spec"]["containers"].insert(0, {"name": "injected"})
+    else:
+        pod["spec"]["hostNetwork"] = True
+    with pytest.raises(ValueError):
+        broker.inspect(_CLAIM)
+    assert not api.deletes
+
+
+def test_no_worker_or_timeout_ttl_deletes_holder(tmp_path):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    broker.ensure(_CLAIM)
+    for _ in range(4):
+        assert broker.reconcile_releases() == []
+    assert not api.deletes
+    assert broker.inspect(_CLAIM)["state"] == "ready"
+
+
+def test_busy_release_is_durable_then_collected_after_last_reference(tmp_path):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api, drain=lambda _: {"state": "busy"})
+    original = broker.ensure(_CLAIM)
+    assert broker.release(_CLAIM)["state"] == "release_requested"
+    assert not api.deletes
+    with pytest.raises(RuntimeError, match="release intent"):
+        broker.ensure(_CLAIM)
+    restarted = make_broker(tmp_path, api)
+    assert restarted.reconcile_releases() == []
+    assert restarted.inspect(_CLAIM)["state"] == "deleted"
+    assert api.deletes == [(original["holder_name"], original["holder_uid"])]
+    assert restarted.release(_CLAIM)["state"] == "deleted"
+
+
+@pytest.mark.parametrize("result", [{}, {"state": "error"}, {"state": "draining"}])
+def test_unknown_drain_never_authorizes_delete(tmp_path, result):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api, drain=lambda _: result)
+    broker.ensure(_CLAIM)
+    broker.release(_CLAIM)
+    assert not api.deletes
+
+
+def test_drain_transport_error_retains_intent_and_reservation(tmp_path):
+    def failed(_):
+        raise TimeoutError("uncertain")
+
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api, drain=failed)
+    broker.ensure(_CLAIM)
+    with pytest.raises(TimeoutError):
+        broker.release(_CLAIM)
+    state = json.loads(next((tmp_path / "state").glob("*.json")).read_text())
+    assert state["phase"] == "release_requested"
+    assert not api.deletes
+
+
+def test_acknowledged_delete_with_lost_response_is_observed_not_repeated(tmp_path):
+    api = FakeAPI()
+    api.lose_delete_response = True
+    broker = make_broker(tmp_path, api)
+    result = broker.ensure(_CLAIM)
+    with pytest.raises(PodAPIError):
+        broker.release(_CLAIM)
+    observed = broker.inspect(_CLAIM)
+    assert observed["state"] == "deleted"
+    assert observed["deleted"] is True
+    assert observed["holder_uid"] == result["holder_uid"]
+    assert observed["drain"]["state"] == "drained"
+    assert len(api.deletes) == 1
+
+
+def test_abandoned_ensure_can_be_released_after_readiness_recovers(tmp_path):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api, info=lambda _: {"state": "starting"})
+    with pytest.raises(TimeoutError):
+        broker.ensure(_CLAIM, 0.001)
+    restarted = make_broker(tmp_path, api)
+    result = restarted.release(_CLAIM)
+    assert result["state"] == "deleted"
+    assert result["holder_uid"] == "holder-uid-1"
+
+
+def test_wrong_drain_generation_never_deletes_holder(tmp_path):
+    api = FakeAPI()
+    broker = make_broker(
+        tmp_path,
+        api,
+        drain=lambda _: {
+            "state": "drained",
+            "pool_specs": [{"generation": "other"}],
+            "compatibility_digest": "model-v1",
+        },
+    )
+    broker.ensure(_CLAIM)
+    with pytest.raises(RuntimeError, match="identity differs"):
+        broker.release(_CLAIM)
+    assert not api.deletes
+
+
+def test_replacement_during_release_is_preserved(tmp_path):
+    api = FakeAPI()
+    api.keep_deleted = True
+    broker = make_broker(tmp_path, api)
+    result = broker.ensure(_CLAIM)
+    assert broker.release(_CLAIM)["state"] == "deleting"
+    api.pods[result["holder_name"]]["metadata"]["uid"] = "replacement"
+    assert broker.reconcile_releases()
+    assert len(api.deletes) == 1
+    assert api.pods[result["holder_name"]]["metadata"]["uid"] == "replacement"
+
+
+def test_missing_holder_does_not_silently_replace_cache(tmp_path):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    result = broker.ensure(_CLAIM)
+    del api.pods[result["holder_name"]]
+    with pytest.raises(RuntimeError, match="disappeared"):
+        broker.ensure(_CLAIM)
+    assert len(api.creates) == 1
+
+
+def test_terminating_holder_cannot_be_reattached(tmp_path):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    result = broker.ensure(_CLAIM)
+    api.pods[result["holder_name"]]["metadata"]["deletionTimestamp"] = "now"
+    with pytest.raises(ValueError, match="terminating"):
+        broker.ensure(_CLAIM)
+    assert not api.deletes
+
+
+def test_capacity_and_count_budget(tmp_path):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    broker.ensure(_CLAIM)
+    with pytest.raises(ValueError, match="budget"):
+        broker.ensure({**_CLAIM, "pool_id": "pool-b"})
+    broker.ensure({**_CLAIM, "pool_id": "pool-b", "size_gb": 0.5})
+    with pytest.raises(ValueError, match="budget"):
+        broker.ensure({**_CLAIM, "pool_id": "pool-c", "size_gb": 0.5})
+
+
+def test_client_server_roundtrip(tmp_path):
+    # macOS's default pytest temp directory can exceed AF_UNIX's path limit.
+    with tempfile.TemporaryDirectory(prefix="gaas-", dir="/tmp") as short:
+        broker = make_broker(Path(short))
+        stop = threading.Event()
+        path = str(Path(short) / "broker.sock")
+        worker = threading.Thread(target=broker_module.serve, args=(broker, path, stop))
+        worker.start()
+        try:
+            deadline = time.monotonic() + 2
+            while not Path(path).exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            first = broker_module.ensure_pool(path, _CLAIM, 2)
+            assert broker_module.inspect_pool(path, _CLAIM, 2) == first
+            assert broker_module.release_pool(path, _CLAIM, 2)["state"] == "deleted"
+        finally:
+            stop.set()
+            worker.join(3)
+            assert not worker.is_alive()
+        assert not Path(path).exists()
+
+
+def test_uid_precondition_is_in_delete_request(monkeypatch):
+    api = object.__new__(broker_module.InClusterPodAPI)
+    captured = []
+    monkeypatch.setattr(
+        api, "_request", lambda *args, **kwargs: captured.append((args, kwargs))
+    )
+    api.delete("holder-a", "owned-uid")
+    assert captured[0][0][2]["preconditions"] == {"uid": "owned-uid"}
+
+
+def test_release_cli_needs_no_service_account_or_server_configuration(
+    monkeypatch, capsys
+):
+    result = {"state": "deleted", "deleted": True, "holder_uid": "owned-uid"}
+    captured = []
+    monkeypatch.setattr(
+        broker_module,
+        "release_pool",
+        lambda *args: captured.append(args) or result,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kvcr-node-service",
+            "--operation",
+            "release",
+            "--broker-socket",
+            "/tmp/broker.sock",
+            "--claim-json",
+            json.dumps(_CLAIM),
+            "--timeout-seconds",
+            "3",
+        ],
+    )
+    broker_module.main()
+    assert json.loads(capsys.readouterr().out) == result
+    assert captured == [("/tmp/broker.sock", _CLAIM, 3)]
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        {**_CLAIM, "pool_id": "../escape"},
+        {**_CLAIM, "size_gb": 2},
+        {**_CLAIM, "size_gb": True},
+        {**_CLAIM, "compatibility_digest": ""},
+        {**_CLAIM, "node": "other"},
+    ],
+)
+def test_invalid_claim(claim):
+    with pytest.raises(ValueError):
+        PoolClaim.parse(claim)

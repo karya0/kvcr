@@ -163,7 +163,10 @@ def test_health_fails_closed_without_waiting_on_guard(failure):
     service._closed = False
     service._server = SimpleNamespace(_fatal_error=None, _last_progress=now)
     service._registry = SimpleNamespace(
-        _refusing=threading.Event(), _guards={0: guard}, _guard_count=1
+        _refusing=threading.Event(),
+        _draining=threading.Event(),
+        _guards={0: guard},
+        _guard_count=1,
     )
     if failure == "accept_loop":
         service._server._last_progress = now - 31

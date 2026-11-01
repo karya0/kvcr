@@ -49,11 +49,14 @@ from .protocol import (
     PidfdLiveness,
     _Claim,
     _claim_fd_counts,
+    _Drain,
     _Error,
     _Granted,
     _Heartbeat,
     _PoolDescriptor,
     _Released,
+    _ServiceInfo,
+    _ServiceState,
     _TierConfig,
 )
 
@@ -91,8 +94,13 @@ class _PoolRegistry:
         if not self._pool_dir.is_dir():
             raise ValueError(f"KVCR pool directory does not exist: {self._pool_dir}")
         self._guard_count = guard_count
+        self._compatibility_digest = compatibility_digest
         self._guards: dict[int, _Guard] = {}
         self._refusing = threading.Event()
+        self._draining = threading.Event()
+        self._drained = False
+        self._legacy_closing = False
+        self._drain_lock = threading.RLock()
         # Stand-in until the owning server takes over; only it can stop the service.
         self.on_uncontained_failure = functools.partial(
             logger.critical, "Uncontained KVCR pool failure: %s"
@@ -238,7 +246,84 @@ class _PoolRegistry:
             with guard._phase_lock:
                 pass
 
+    def info(self) -> dict[str, Any]:
+        healthy = all(
+            guard._failure is None and guard._thread.is_alive()
+            for guard in self._guards.values()
+        )
+        return {
+            "version": _PROTOCOL_VERSION,
+            "compatibility_digest": self._compatibility_digest,
+            "state": "drained"
+            if self._drained
+            else (
+                "draining"
+                if self._draining.is_set()
+                else ("error" if self._legacy_closing or not healthy else "ready")
+            ),
+            "ready": not self._refusing.is_set() and healthy,
+            "guard_count": self._guard_count,
+            "pool_specs": [
+                {
+                    "guard_index": index,
+                    **{
+                        name: getattr(guard._spec, name)
+                        for name in (
+                            "pool_id",
+                            "path",
+                            "generation",
+                            "device",
+                            "inode",
+                            "mapping_bytes",
+                            "journal_bytes",
+                        )
+                    },
+                }
+                for index, guard in sorted(self._guards.items())
+            ],
+        }
+
+    def drain(self) -> dict[str, Any]:
+        """Refuse claims, quiesce actors, then prove external attachments gone."""
+        self._draining.set()
+        self.refuse_claims()
+        if not self._drain_lock.acquire(blocking=False):
+            return {**self.info(), "state": "busy"}
+        try:
+            if self._drained:
+                return self.info()
+            if self._legacy_closing:
+                raise KVCRServiceError("service shutdown is not a verified drain")
+            guards = list(self._guards.values())
+            for guard in guards:
+                if not guard.begin_drain():
+                    return {**self.info(), "state": "busy"}
+            deadline = time.monotonic() + _REGISTRY_TRANSITION_TIMEOUT_SECONDS
+            for guard in guards:
+                if guard.finish_close(deadline):
+                    return {**self.info(), "state": "busy"}
+            for guard in guards:
+                if not guard.drain_pool():
+                    return {**self.info(), "state": "busy"}
+            self._drained = True
+            return self.info()
+        except Exception as error:
+            logger.warning("KVCR administrative drain retained its pools: %s", error)
+            return {**self.info(), "state": "error", "error": str(error)}
+        finally:
+            self._drain_lock.release()
+
     def close(self) -> None:
+        with self._drain_lock:
+            if self._draining.is_set():
+                result = self.drain()
+                if result["state"] != "drained":
+                    raise KVCRServiceError("KVCR holder still has undrained references")
+                return
+            self._legacy_closing = True
+            self._close_legacy()
+
+    def _close_legacy(self) -> None:
         """Give every pool group back, keeping the first reason one would not go.
 
         A group that will not close keeps only its own file and endpoint and
@@ -328,6 +413,16 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             return
         except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
             self._send_error(error)
+            return
+
+        if isinstance(request, (_ServiceInfo, _Drain)):
+            info = (
+                self.server.registry.drain()
+                if isinstance(request, _Drain)
+                else self.server.registry.info()
+            )
+            with contextlib.suppress(OSError):
+                self.channel.send(_ServiceState(info, _PROTOCOL_VERSION))
             return
 
         liveness: PidfdLiveness | None = None
@@ -586,7 +681,7 @@ class _KVCRService:
 
     def _health_status(self, timeout: float, *, ready: bool = True) -> tuple[int, str]:
         """Observe progress without claiming pools or entering Guard actor locks."""
-        if self._closed or self._registry._refusing.is_set():
+        if self._closed:
             return 503, "service stopping"
         if self._server._fatal_error is not None:
             return 503, "service failed"
@@ -594,6 +689,12 @@ class _KVCRService:
         progress = self._server._last_progress
         if progress is not None and now - progress > timeout:
             return 503, "service stalled"
+        if self._registry._draining.is_set():
+            # Readiness refuses clients; liveness must not restart a holder
+            # whose reservation still protects busy external references.
+            return (503 if ready else 200), "service draining"
+        if self._registry._refusing.is_set():
+            return 503, "service stopping"
         guards = list(self._registry._guards.values())
         if len(guards) != self._registry._guard_count:
             return 503, "guards unavailable"

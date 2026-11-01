@@ -29,6 +29,7 @@ dependencies = [
 
 [project.scripts]
 kvcr-service = "kvcr.service.server:main"
+kvcr-node-service = "kvcr.service.node_service:main"
 
 [project.optional-dependencies]
 profiling = ["nvtx>=0.2.16,<0.3", "numpy>=1.26,<3"]
