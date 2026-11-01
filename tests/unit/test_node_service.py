@@ -72,6 +72,21 @@ class FakeAPI:
         # Kubernetes adds defaults which must not invalidate the intended spec.
         actual["spec"]["securityContext"]["supplementalGroupsPolicy"] = "Merge"
         actual["spec"]["containers"][0]["readinessProbe"]["timeoutSeconds"] = 1
+        actual["spec"]["tolerations"] += [
+            {
+                "key": "node.kubernetes.io/not-ready",
+                "operator": "Exists",
+                "effect": "NoExecute",
+                "tolerationSeconds": 300,
+            },
+            {
+                "key": "node.kubernetes.io/unreachable",
+                "operator": "Exists",
+                "value": "",
+                "effect": "NoExecute",
+                "tolerationSeconds": 300,
+            },
+        ]
         self.pods[name] = actual
         if self.lose_create_response:
             self._hide_next_read = self.hide_created_once
@@ -151,11 +166,11 @@ def test_create_idempotent_reattach_and_resources(tmp_path):
     ]
     assert spec["restartPolicy"] == "Never"
     holder = spec["containers"][0]
-    assert holder["resources"]["requests"]["memory"] == "3172Mi"
-    assert holder["resources"]["limits"]["memory"] == "3172Mi"
+    assert holder["resources"]["requests"]["memory"] == "4296Mi"
+    assert holder["resources"]["limits"]["memory"] == "4296Mi"
     assert "livenessProbe" not in holder
     assert not any("gpu" in key for key in holder["resources"]["requests"])
-    assert spec["volumes"][1]["emptyDir"] == {"medium": "Memory", "sizeLimit": "1124Mi"}
+    assert spec["volumes"][1]["emptyDir"] == {"medium": "Memory", "sizeLimit": "2248Mi"}
 
 
 def test_lost_create_response_reconciles_once(tmp_path):
@@ -452,3 +467,85 @@ def test_release_cli_needs_no_service_account_or_server_configuration(
 def test_invalid_claim(claim):
     with pytest.raises(ValueError):
         PoolClaim.parse(claim)
+
+
+@pytest.mark.parametrize(
+    "size,mapping,backing,memory",
+    [
+        (1, 1124, 2248, 4296),
+        (0.5, 612, 1224, 3272),
+    ],
+)
+def test_snapshot_budget_is_reserved_and_described(
+    tmp_path, size, mapping, backing, memory
+):
+    api = FakeAPI()
+    descriptor = make_broker(tmp_path, api).ensure({**_CLAIM, "size_gb": size})
+    assert {
+        key: descriptor[key] >> 20
+        for key in (
+            "mapping_bytes",
+            "snapshot_budget_bytes",
+            "backing_limit_bytes",
+            "memory_request_bytes",
+        )
+    } == dict(
+        mapping_bytes=mapping,
+        snapshot_budget_bytes=mapping,
+        backing_limit_bytes=backing,
+        memory_request_bytes=memory,
+    )
+    pod = api.creates[0]["spec"]
+    assert pod["volumes"][1]["emptyDir"]["sizeLimit"] == f"{backing}Mi"
+    assert pod["containers"][0]["resources"]["requests"]["memory"] == f"{memory}Mi"
+
+
+@pytest.mark.parametrize(
+    "mutation", ["unknown", "changed-default", "duplicate", "intent"]
+)
+def test_unexpected_tolerations_rejected(tmp_path, mutation):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    broker.ensure(_CLAIM)
+    tolerations = next(iter(api.pods.values()))["spec"]["tolerations"]
+    if mutation == "unknown":
+        tolerations.append(
+            {"key": "other", "operator": "Exists", "effect": "NoExecute"}
+        )
+    elif mutation == "changed-default":
+        tolerations[1]["tolerationSeconds"] = 301
+    elif mutation == "duplicate":
+        tolerations.append(copy.deepcopy(tolerations[1]))
+    else:
+        tolerations[0]["value"] = "false"
+    with pytest.raises(ValueError, match="tolerations"):
+        broker.inspect(_CLAIM)
+    assert api.deletes == []
+
+
+@pytest.mark.parametrize("target", ["memory", "volume"])
+def test_snapshot_reservation_drift_rejected(tmp_path, target):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    broker.ensure(_CLAIM)
+    spec = next(iter(api.pods.values()))["spec"]
+    if target == "memory":
+        spec["containers"][0]["resources"]["requests"]["memory"] = "3172Mi"
+    else:
+        spec["volumes"][1]["emptyDir"]["sizeLimit"] = "1124Mi"
+    with pytest.raises(ValueError, match="mismatch"):
+        broker.inspect(_CLAIM)
+    assert api.deletes == []
+
+
+def test_toleration_intent_accepts_absent_default_operator():
+    expected = [
+        {
+            "key": "nvidia.com/gpu",
+            "operator": "Equal",
+            "value": "true",
+            "effect": "NoSchedule",
+        }
+    ]
+    actual = [{"key": "nvidia.com/gpu", "value": "true", "effect": "NoSchedule"}]
+    assert broker_module._matching_tolerations(actual, expected)
