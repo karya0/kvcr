@@ -194,6 +194,155 @@ def test_uncertain_create_can_be_released_once_uid_becomes_observable(tmp_path):
     assert api.deletes[0][1] == "holder-uid-1"
 
 
+@pytest.fixture
+def unbound_holder(tmp_path, monkeypatch):
+    api = FakeAPI()
+    create = api.create
+
+    def crash_after_accept(pod):
+        created = create(pod)
+        api.pods[created["metadata"]["name"]]["metadata"]["uid"] = (
+            "12345678-1234-4234-8234-123456789abc"
+        )
+        raise SystemExit("broker died after API accepted create")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(api, "create", crash_after_accept)
+        with pytest.raises(SystemExit):
+            make_broker(tmp_path, api).ensure(_CLAIM)
+    broker = make_broker(tmp_path, api)
+    assert broker._load(PoolClaim.parse(_CLAIM))["holder_uid"] is None
+    return api, broker
+
+
+def test_inspect_binds_accepted_create_durably_without_marking_ready(unbound_holder):
+    api, broker = unbound_holder
+    stop = threading.Event()
+    path = str(broker.root / "broker.sock")
+    worker = threading.Thread(target=broker_module.serve, args=(broker, path, stop))
+    worker.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not Path(path).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        first = broker_module.inspect_pool(path, _CLAIM, 2)
+        assert broker_module.inspect_pool(path, _CLAIM, 2) == first
+    finally:
+        stop.set()
+        worker.join(3)
+        assert not worker.is_alive()
+    assert first["holder_uid"] == "12345678-1234-4234-8234-123456789abc"
+    assert first["state"] == "creating"
+    assert first["pool_specs"] == []
+    assert first["holder_pod_ip"] is None
+    restarted = make_broker(broker.root, api)
+    assert restarted.inspect(_CLAIM) == first
+    result = restarted.release(_CLAIM)
+    assert result["state"] == "deleted"
+    assert result["pool_specs"] == _SPECS
+    assert api.deletes == [(first["holder_name"], first["holder_uid"])]
+    assert len(api.creates) == 1
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing", "nonce", "owner", "container", "claim"]
+)
+def test_inspect_unbound_holder_refuses_missing_or_foreign_pod(
+    unbound_holder, mutation
+):
+    api, broker = unbound_holder
+    pod = next(iter(api.pods.values()))
+    if mutation == "missing":
+        api.pods.clear()
+    elif mutation == "nonce":
+        pod["metadata"]["annotations"][broker_module._ANNOTATION + "creation-id"] = (
+            "foreign"
+        )
+    elif mutation == "owner":
+        pod["metadata"]["ownerReferences"] = [{"uid": "foreign"}]
+    elif mutation == "container":
+        pod["spec"]["containers"][0]["image"] = "foreign"
+    else:
+        pod["metadata"]["annotations"][broker_module._ANNOTATION + "claim"] = "{}"
+    with pytest.raises((RuntimeError, ValueError)):
+        broker.inspect(_CLAIM)
+    assert broker._load(PoolClaim.parse(_CLAIM))["holder_uid"] is None
+    assert len(api.creates) == 1
+    assert not api.deletes
+
+
+@pytest.mark.parametrize(
+    "uid",
+    [
+        None,
+        1,
+        "",
+        "malformed",
+        "12345678123442348234123456789abc",
+        "12345678-1234-4234-8234-123456789ABC",
+    ],
+)
+def test_inspect_unbound_holder_refuses_malformed_uid(unbound_holder, uid):
+    api, broker = unbound_holder
+    next(iter(api.pods.values()))["metadata"]["uid"] = uid
+    with pytest.raises(ValueError):
+        broker.inspect(_CLAIM)
+    assert broker._load(PoolClaim.parse(_CLAIM))["holder_uid"] is None
+    assert len(api.creates) == 1
+    assert not api.deletes
+
+
+@pytest.mark.parametrize("failure", ["read", "replace"])
+def test_inspect_bind_uncertainty_fails_closed_and_can_retry(
+    unbound_holder, monkeypatch, failure
+):
+    api, broker = unbound_holder
+
+    def fail(*args):
+        if failure == "read":
+            raise PodAPIError(None, "GET")
+        raise OSError("state persistence failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            api if failure == "read" else broker_module.os,
+            "get" if failure == "read" else "replace",
+            fail,
+        )
+        with pytest.raises((PodAPIError, OSError)):
+            broker.inspect(_CLAIM)
+    assert broker._load(PoolClaim.parse(_CLAIM))["holder_uid"] is None
+    assert make_broker(broker.root, api).inspect(_CLAIM)["holder_uid"] is not None
+    assert len(api.creates) == 1
+    assert not api.deletes
+
+
+def test_inspect_snapshot_bind_never_accepts_later_replacement(
+    unbound_holder, monkeypatch
+):
+    api, broker = unbound_holder
+    get = api.get
+
+    def replace_after_read(name):
+        snapshot = get(name)
+        api.pods[name]["metadata"]["uid"] = "87654321-4321-4321-8321-cba987654321"
+        return snapshot
+
+    with monkeypatch.context() as patch:
+        patch.setattr(api, "get", replace_after_read)
+        original = broker.inspect(_CLAIM)
+    restarted = make_broker(broker.root, api)
+    for operation in (restarted.inspect, restarted.release):
+        with pytest.raises(ValueError, match="UID changed"):
+            operation(_CLAIM)
+        assert (
+            restarted._load(PoolClaim.parse(_CLAIM))["holder_uid"]
+            == original["holder_uid"]
+        )
+    assert len(api.creates) == 1
+    assert not api.deletes
+
+
 def test_integer_and_float_capacities_are_canonical(tmp_path):
     broker = make_broker(tmp_path)
     first = broker.ensure({**_CLAIM, "size_gb": 1})

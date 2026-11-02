@@ -681,9 +681,16 @@ class NodeBroker:
                     state["phase"] = "deleted"
                     self._save(claim, state)
                     return self._descriptor(state)
-                self._verify_pod(
+                uid = self._verify_pod(
                     claim, state, pod, allow_terminating=bool(state.get("drain_ack"))
                 )
+                if state["holder_uid"] is None:
+                    # Recover only the verified creation, without promoting
+                    # readiness or allocating a replacement holder.
+                    if str(uuid.UUID(uid)) != uid:
+                        raise ValueError("holder UID must be a canonical UUID")
+                    state["holder_uid"] = uid
+                    self._save(claim, state)
             return self._descriptor(state)
 
     def release(self, value: dict[str, Any]) -> dict[str, Any]:
