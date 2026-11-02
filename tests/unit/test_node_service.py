@@ -14,7 +14,19 @@ import pytest
 
 # This module has no framework dependencies. Loading it directly also permits
 # its ownership tests on macOS, where the optional NIXL wheel is unavailable.
-_source = Path(__file__).parents[2] / "src/kvcr/service/node_service.py"
+_checkout_source = Path(__file__).parents[2] / "src/kvcr/service/node_service.py"
+_source = _checkout_source
+if not _source.is_file():
+    # Mounted validation tests must exercise the installed image's bytes.
+    # Finding the top-level package does not import its framework dependencies.
+    _package_spec = importlib.util.find_spec("kvcr")
+    if _package_spec is None or _package_spec.origin is None:
+        raise ImportError("cannot resolve installed kvcr package origin")
+    _source = (
+        Path(_package_spec.origin).resolve().parent / "service/node_service.py"
+    ).resolve(strict=True)
+    if not _source.is_file():
+        raise ImportError("installed kvcr node service is not a file")
 _spec = importlib.util.spec_from_file_location("_node_service_test_target", _source)
 broker_module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = broker_module
@@ -28,6 +40,16 @@ _CLAIM = {"pool_id": "pool-a", "size_gb": 1.0, "compatibility_digest": "model-v1
 _SPECS = [
     {"pool_id": "allocation-a", "generation": "generation-a", "device": 1, "inode": 2}
 ]
+
+
+def test_broker_module_origin(record_property):
+    actual = Path(broker_module.__file__).resolve()
+    assert actual == _source.resolve()
+    if not _checkout_source.is_file():
+        installed = importlib.util.find_spec("kvcr")
+        expected = Path(installed.origin).resolve().parent / "service/node_service.py"
+        assert actual == expected.resolve(strict=True)
+    record_property("broker_module_origin", str(actual))
 
 
 @pytest.fixture
