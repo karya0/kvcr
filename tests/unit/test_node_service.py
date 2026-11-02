@@ -555,12 +555,25 @@ def test_terminating_holder_cannot_be_reattached(tmp_path):
 def test_capacity_and_count_budget(tmp_path):
     api = FakeAPI()
     broker = make_broker(tmp_path, api)
-    broker.ensure(_CLAIM)
+    large_claim = {**_CLAIM, "size_gb": 12}
+    broker.ensure(large_claim)
     with pytest.raises(ValueError, match="budget"):
         broker.ensure({**_CLAIM, "pool_id": "pool-b"})
     broker.ensure({**_CLAIM, "pool_id": "pool-b", "size_gb": 0.5})
     with pytest.raises(ValueError, match="budget"):
         broker.ensure({**_CLAIM, "pool_id": "pool-c", "size_gb": 0.5})
+    broker.release(large_claim)
+    broker.ensure({**large_claim, "pool_id": "pool-c"})
+
+
+def test_holder_count_limit_independent_of_capacity(tmp_path):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    broker.ensure({**_CLAIM, "size_gb": 0.5})
+    broker.ensure({**_CLAIM, "pool_id": "pool-b", "size_gb": 0.5})
+    with pytest.raises(ValueError, match="budget"):
+        broker.ensure({**_CLAIM, "pool_id": "pool-c", "size_gb": 0.5})
+    assert len(api.creates) == 2
 
 
 def test_client_server_roundtrip(tmp_path):
@@ -629,7 +642,7 @@ def test_release_cli_needs_no_service_account_or_server_configuration(
     "claim",
     [
         {**_CLAIM, "pool_id": "../escape"},
-        {**_CLAIM, "size_gb": 2},
+        {**_CLAIM, "size_gb": 13},
         {**_CLAIM, "size_gb": True},
         {**_CLAIM, "compatibility_digest": ""},
         {**_CLAIM, "node": "other"},
@@ -641,10 +654,47 @@ def test_invalid_claim(claim):
 
 
 @pytest.mark.parametrize(
+    "size",
+    [
+        0,
+        False,
+        -1,
+        0.499,
+        12.001,
+        0.5001,
+        "1.00000000000000000000000000001",
+        "NaN",
+        "sNaN",
+        "Infinity",
+        "-Infinity",
+        "",
+        "twelve",
+        "12 GiB",
+        None,
+        [],
+        {},
+    ],
+)
+def test_claim_size_rejects_invalid_capacity(size):
+    with pytest.raises(ValueError):
+        PoolClaim.parse({**_CLAIM, "size_gb": size})
+
+
+@pytest.mark.parametrize("size", ["0.5", "1", "12"])
+def test_numeric_string_claim_size_remains_supported(size):
+    claim = PoolClaim.parse({**_CLAIM, "size_gb": size})
+    assert claim.as_dict()["size_gb"] == float(size)
+    assert PoolClaim.parse(claim.as_dict()) == claim
+
+
+@pytest.mark.parametrize(
     "size,mapping,backing,memory",
     [
         (1, 1124, 2248, 4296),
         (0.5, 612, 1224, 3272),
+        (513 / 1024, 613, 1226, 3274),
+        (1.25, 1380, 2760, 4808),
+        (12, 12388, 24776, 26824),
     ],
 )
 def test_snapshot_budget_is_reserved_and_described(
@@ -669,6 +719,11 @@ def test_snapshot_budget_is_reserved_and_described(
     pod = api.creates[0]["spec"]
     assert pod["volumes"][1]["emptyDir"]["sizeLimit"] == f"{backing}Mi"
     assert pod["containers"][0]["resources"]["requests"]["memory"] == f"{memory}Mi"
+    assert pod["containers"][0]["resources"]["limits"]["memory"] == f"{memory}Mi"
+    args = pod["containers"][0]["args"]
+    assert float(args[args.index("--pool-sizes-gb") + 1]) == size
+    claim = PoolClaim.parse({**_CLAIM, "size_gb": size})
+    assert PoolClaim.parse(claim.as_dict()).size_gb == size
 
 
 @pytest.mark.parametrize(

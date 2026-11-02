@@ -67,8 +67,12 @@ class PoolClaim:
             size = Decimal(str(value["size_gb"]))
         except InvalidOperation as error:
             raise ValueError("invalid size_gb") from error
-        if size not in (Decimal("0.5"), Decimal(1)):
-            raise ValueError("H7 holder size must be 0.5 or 1.0 GiB")
+        if (
+            not size.is_finite()
+            or not Decimal("0.5") <= size <= 12
+            or size != Decimal(int(size * 1024)) / 1024
+        ):
+            raise ValueError("holder size must be 0.5 to 12 GiB in whole MiB")
         return cls(name, size.normalize(), digest)
 
     def as_dict(self) -> dict[str, Any]:
@@ -565,7 +569,7 @@ class NodeBroker:
             len(active) >= 2
             or sum(PoolClaim.parse(s["claim"]).data_bytes for s in active)
             + claim.data_bytes
-            > 3 * _GIB // 2
+            > 25 * _GIB // 2
         ):
             raise ValueError("H7 holder count or capacity budget exceeded")
 
