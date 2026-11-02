@@ -4,6 +4,8 @@
 
 import contextlib
 import logging
+import os
+import threading
 from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import TYPE_CHECKING
 
@@ -128,6 +130,12 @@ class KVCR:
             raise
         self._core = core
         self._pool_hold = pool_hold
+        self._metadata_owner = threading.current_thread()
+        self._metadata_owner_pid = os.getpid()
+        self._metadata_observation_active = True
+        self._metadata_compatibility_digest = (
+            guard_config.compatibility_digest if guard_config is not None else None
+        )
 
     @property
     def config(self) -> KVCRConfig:
@@ -213,12 +221,41 @@ class KVCR:
         """Return telemetry state when telemetry is enabled."""
         return self._core.get_stats()
 
+    def observe_metadata(
+        self,
+        *,
+        max_entries: int = 256,
+        max_bytes: int = 1 << 20,
+        timeout_s: float = 0.1,
+    ) -> dict:
+        """Copy bounded caller-owned metadata on the constructing thread.
+
+        This neither polls nor observes native progress, source readers or data.
+        READY is a raw state, including partially written residencies. Concurrent
+        or reentrant lifecycle/API use remains unsupported. No global quiescence,
+        data validity, filesystem identity or HTTP key correlation is certified.
+        ``max_bytes`` bounds compact ASCII JSON; limits return an explicitly
+        truncated view. Collections are capped at 4096 items. The deadline is
+        cooperative; Python execution can still delay other Python threads.
+        """
+        if (
+            getattr(self, "_metadata_owner", None) is not threading.current_thread()
+            or self._metadata_owner_pid != os.getpid()
+        ):
+            raise RuntimeError("metadata observation requires the constructing owner")
+        if not self._metadata_observation_active or self._core._closed:
+            raise RuntimeError("cannot observe an inactive KVCR instance")
+        from .runtime.observation import _observe_metadata
+
+        return _observe_metadata(self, max_entries, max_bytes, timeout_s)
+
     def close(self) -> None:
         """Stop progress and release controller-held resources.
 
         A core that failed to close but reached quiescence still gives the pool
         back: nothing is moving through it.
         """
+        self._metadata_observation_active = False
         try:
             self._core.close()
         except BaseException:
