@@ -41,6 +41,7 @@ _HEADROOM_BYTES = 2 * _GIB
 _LABEL = "kvcr.nvidia.com/manager"
 _ANNOTATION = "kvcr.nvidia.com/"
 _MAX_MESSAGE = 65536
+_TOUCHER_OVERHEAD_BYTES = 128 << 20
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 logger = logging.getLogger(__name__)
 
@@ -283,6 +284,7 @@ class NodeBroker:
         info=None,
         drain=None,
         poll_interval: float = 0.25,
+        toucher: bool = False,
     ):
         if not _NAME.fullmatch(namespace) or not _NAME.fullmatch(manager_id):
             raise ValueError("invalid namespace or manager ID")
@@ -319,6 +321,9 @@ class NodeBroker:
         self._drain = drain or self._drain_service
         self._lock = threading.RLock()
         self.poll_interval = poll_interval
+        # v2: the holder is a Guaranteed toucher fed by the supervisor, not a
+        # kvcr-service pool holder.
+        self.toucher = toucher
 
     @staticmethod
     def _service_info(path: str) -> dict[str, Any]:
@@ -381,7 +386,31 @@ class NodeBroker:
             raise RuntimeError("holder pool identity changed")
         state["pool_specs"] = info["pool_specs"]
 
+    @staticmethod
+    def holder_socket_path(state: dict[str, Any]) -> str:
+        return str(Path(state["socket_path"]).with_name("holder.sock"))
+
+    def _toucher_pod(
+        self, pod: dict[str, Any], claim: PoolClaim, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Guaranteed QoS: fractional CPU, memory = pool maximum + overhead."""
+        memory = f"{(claim.data_bytes + _TOUCHER_OVERHEAD_BYTES) >> 20}Mi"
+        spec = pod["spec"]
+        container = spec["containers"][0]
+        container["command"] = ["python", "-m", "kvcr.service.holder"]
+        container["args"] = ["--socket", self.holder_socket_path(state)]
+        container.pop("readinessProbe")
+        container["volumeMounts"] = container["volumeMounts"][:1]
+        spec["volumes"] = spec["volumes"][:1]
+        resources = {"cpu": "100m", "memory": memory}
+        container["resources"] = {"requests": dict(resources), "limits": resources}
+        return pod
+
     def _pod(self, claim: PoolClaim, state: dict[str, Any]) -> dict[str, Any]:
+        pod = self._service_pod(claim, state)
+        return self._toucher_pod(pod, claim, state) if self.toucher else pod
+
+    def _service_pod(self, claim: PoolClaim, state: dict[str, Any]) -> dict[str, Any]:
         resources = claim.resources()
         memory = f"{resources['memory_request_bytes'] >> 20}Mi"
         backing_size = f"{resources['backing_limit_bytes'] >> 20}Mi"
@@ -639,6 +668,10 @@ class NodeBroker:
                         raise ValueError(
                             "running holder has not been assigned to its node"
                         )
+                    if self.toucher:
+                        state.update(phase="ready", holder_pod_ip=status["podIP"])
+                        self._save(claim, state)
+                        return self._descriptor(state)
                     try:
                         info = self._info(state["socket_path"])
                     except (OSError, RuntimeError):
@@ -736,6 +769,9 @@ class NodeBroker:
         if state["holder_uid"] is None:
             state["holder_uid"] = uid
             self._save(claim, state)
+        if self.toucher and not state.get("drain_ack"):
+            state.update(phase="drained", drain_ack={"state": "drained"})
+            self._save(claim, state)
         if not state.get("drain_ack"):
             if not state.get("pool_specs"):
                 self._record_info(claim, state, self._info(state["socket_path"]))
@@ -816,6 +852,9 @@ class _Slot:
     peer: Any = None
     owner_alive: Callable[[], bool] | None = None
     claim_id: str | None = None
+    holder_conn: socket.socket | None = None
+    touched_bytes: int = 0
+    layout_generation: int = -1
 
     @property
     def held(self) -> bool:
@@ -922,10 +961,16 @@ class SlotTable:
                     )
                 pool = RegionPool.create(effective)
                 holder = self._new_holder(name, effective, digest)
+                slot = None
                 try:
                     pool.grow(min(size, effective))
                     self.broker.ensure(holder, self.ensure_timeout_s)
+                    slot = _Slot(name, digest, pool, effective, holder)
+                    if self.broker.toucher:
+                        self._feed_holder(slot)
                 except BaseException as error:
+                    if slot is not None and slot.holder_conn is not None:
+                        slot.holder_conn.close()
                     pool.close()
                     with contextlib.suppress(Exception):
                         self.broker.release(holder)
@@ -938,7 +983,7 @@ class SlotTable:
                             INTERNAL, f"holder for {name}: {error}"
                         ) from error
                     raise
-                slot = self._slots[name] = _Slot(name, digest, pool, effective, holder)
+                self._slots[name] = slot
             slot.peer, slot.owner_alive, slot.claim_id = peer, owner_alive, claim_id
             return slot
 
@@ -948,6 +993,51 @@ class SlotTable:
             slot = self._slots.get(name)
             if slot is not None and slot.peer == peer:
                 slot.owner_alive = None
+
+    def _send_layout(self, slot: _Slot) -> None:
+        """Send the whole layout plus the pool fds; store the holder's report."""
+        conn = slot.holder_conn
+        layout = {
+            "regions": [
+                {"index": r.index, "offset": r.offset, "size": r.size, "fd_index": 0}
+                for r in slot.pool.regions
+            ],
+            "layout_generation": slot.pool.layout_generation,
+        }
+        conn.settimeout(self.ensure_timeout_s)
+        socket.send_fds(
+            conn, [json.dumps(layout).encode() + b"\n"], slot.pool.pass_fd_list()
+        )
+        line = b""
+        while not line.endswith(b"\n"):
+            chunk = conn.recv(_MAX_MESSAGE)
+            if not chunk or len(line) > _MAX_MESSAGE:
+                raise RuntimeError("holder closed before reporting")
+            line += chunk
+        report = json.loads(line)
+        slot.touched_bytes = report["touched_bytes"]
+        slot.layout_generation = report["layout_generation"]
+
+    def _feed_holder(self, slot: _Slot) -> None:
+        """Accept the toucher on its private socket and hand it the layout."""
+        path = self.broker.holder_socket_path(
+            self.broker._load(PoolClaim.parse(slot.holder))
+        )
+        if slot.holder_conn is not None:
+            slot.holder_conn.close()
+            slot.holder_conn = None
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(path)
+            listener.listen(1)
+            listener.settimeout(self.ensure_timeout_s)
+            try:
+                slot.holder_conn, _ = listener.accept()
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
+        self._send_layout(slot)
 
     def _holder_dead(self, slot: _Slot) -> bool:
         pod = self.broker.api.get(
@@ -976,6 +1066,8 @@ class SlotTable:
             )
             try:
                 self.broker.ensure(slot.holder, self.ensure_timeout_s)
+                if self.broker.toucher:
+                    self._feed_holder(slot)
             except (OSError, RuntimeError, ValueError, TimeoutError) as error:
                 raise SlotError(
                     INTERNAL, f"holder recreate for {name}: {error}"
@@ -993,7 +1085,7 @@ class SlotTable:
         return slot
 
     def grow(self, name: str, peer: Any, additional_bytes: int, split: int | None):
-        from .protocol import CAPACITY_BELOW_MINIMUM
+        from .protocol import CAPACITY_BELOW_MINIMUM, INTERNAL
         from .regions import CapacityError
 
         with self._lock:
@@ -1002,6 +1094,11 @@ class SlotTable:
                 regions = slot.pool.grow(additional_bytes, split)
             except CapacityError as error:
                 raise SlotError(CAPACITY_BELOW_MINIMUM, str(error)) from error
+            if slot.holder_conn is not None:
+                try:
+                    self._send_layout(slot)
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise SlotError(INTERNAL, f"holder layout: {error}") from error
             return regions, slot.pool.layout_generation
 
     def shrink(self, name: str, peer: Any, indices: tuple[int, ...]):
@@ -1028,6 +1125,8 @@ class SlotTable:
             slot = self._slots.get(name)
             if slot is None:
                 raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
+            if slot.holder_conn is not None:
+                slot.holder_conn.close()
             slot.pool.close()
             if self._holder_dead(slot):
                 self.broker.abandon(slot.holder)

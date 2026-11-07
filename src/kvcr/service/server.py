@@ -518,7 +518,12 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             # No timeout: a held connection must wait as long as the lease lives.
             # Inside the try: shutdown may have landed; listener_fd closes either way.
             self.request.settimeout(None)
-            self.channel.send_with_fd(response, pool_fd, listener_fd)
+            region_fds = (
+                []
+                if response.slot_name is None or self.server.slots is None
+                else self.server.slots.get(response.slot_name).pool.pass_fd_list()
+            )
+            self.channel.send_with_fd(response, pool_fd, listener_fd, *region_fds)
         # The lease is already granted and the send may have partially
         # crossed: releasing could double-grant a pool a claimant just mapped.
         # Hold it instead, under the same fencing as any lease: the claimant's

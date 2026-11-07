@@ -250,8 +250,15 @@ def _claim_fd_counts(
 
 
 def _response_fd_counts(response: "_Granted | _Error") -> tuple[int, ...]:
-    """An error carries none; a grant the pool, then the control listener."""
-    return (0,) if isinstance(response, _Error) else (2,)
+    """An error carries none; a grant the pool, then the control listener.
+
+    A v2 grant (slot present) appends one region memfd per distinct fd_index.
+    """
+    if isinstance(response, _Error):
+        return (0,)
+    if response.slot_name is None:
+        return (2,)
+    return (2 + len({region.fd_index or 0 for region in response.regions} or {0}),)
 
 
 _CLAIM_DECODER = msgspec.msgpack.Decoder(
@@ -500,7 +507,9 @@ class KVCRClient:
             )
             if isinstance(response, _Error):
                 raise KVCRServiceError(response.message)
-            pool_fd, listener_fd = received_fds
+            pool_fd, listener_fd, *region_fds = received_fds
+            for region_fd in region_fds:  # v2 region memfds: not mapped by v1 code
+                os.close(region_fd)
             grant_received = True
             spec, granted_pools = _grant_layout(
                 response, guard_index, request.tier_config
