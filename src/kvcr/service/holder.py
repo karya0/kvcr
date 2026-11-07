@@ -47,21 +47,28 @@ def _receive(connection: socket.socket) -> tuple[dict[str, Any], list[int]] | No
     """One JSON line and its fds; None on EOF."""
     data = b""
     fds = array.array("i")
-    while not data.endswith(b"\n"):
-        chunk, ancillary, _flags, _ = connection.recvmsg(
-            65536, socket.CMSG_SPACE(fds.itemsize * _MAX_FDS), socket.MSG_CMSG_CLOEXEC
-        )
-        for level, kind, payload in ancillary:
-            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                fds.frombytes(payload[: len(payload) - len(payload) % fds.itemsize])
-        if not chunk:
-            for fd in fds:
-                os.close(fd)
-            return None
-        data += chunk
-        if len(data) > _MAX_LINE:
-            raise ValueError("holder layout line too large")
-    return json.loads(data), list(fds)
+    try:
+        while not data.endswith(b"\n"):
+            chunk, ancillary, _flags, _ = connection.recvmsg(
+                65536,
+                socket.CMSG_SPACE(fds.itemsize * _MAX_FDS),
+                socket.MSG_CMSG_CLOEXEC,
+            )
+            for level, kind, payload in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    fds.frombytes(payload[: len(payload) - len(payload) % fds.itemsize])
+            if not chunk:
+                for fd in fds:
+                    os.close(fd)
+                return None
+            data += chunk
+            if len(data) > _MAX_LINE:
+                raise ValueError("holder layout line too large")
+        return json.loads(data), list(fds)
+    except BaseException:
+        for fd in fds:
+            os.close(fd)
+        raise
 
 
 def handle_layout(
@@ -149,7 +156,10 @@ def serve(
     mappings: dict[int, tuple[mmap.mmap, int]],
 ) -> None:
     """Hold the mappings; on EOF reconnect with backoff rather than sleeping forever."""
-    connection = connect(path, connect_timeout_s)
+    try:
+        connection = connect(path, connect_timeout_s, stop)
+    except InterruptedError:
+        return
     reset = False
     while not stop.is_set():
         if select.select([connection], [], [], 1.0)[0]:

@@ -295,3 +295,21 @@ def test_successor_pod_claims_free_slot_not_held_slot(tmp_path):
             table.grow("t/l/0", (100, 1000, "pod-a"), PAGE, None)
     finally:
         table.release("t/l/0")
+
+
+def test_receive_closes_fds_when_the_line_is_bad():
+    supervisor, holder_end = socket.socketpair()
+    fd = os.memfd_create("t")
+    seen = []
+    real_close = os.close
+    try:
+        socket.send_fds(supervisor, [b"not json\n"], [fd])
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(os, "close", lambda f: (seen.append(f), real_close(f)))
+            with pytest.raises(ValueError):
+                holder._receive(holder_end)
+        assert len(seen) == 1  # the received duplicate, not the original
+    finally:
+        os.close(fd)
+        supervisor.close()
+        holder_end.close()
