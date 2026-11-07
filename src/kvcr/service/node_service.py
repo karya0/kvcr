@@ -599,7 +599,8 @@ class NodeBroker:
         states = [_read_json(path) for path in self.state_dir.glob("*.json")]
         active = [state for state in states if state["phase"] != "deleted"]
         pods = self.api.list(self.manager)
-        known = {state["pod_name"] for state in active}
+        # An abandoned (deleted-phase) holder still being terminated is reconciled.
+        known = {state["pod_name"] for state in states}
         if any(pod["metadata"]["name"] not in known for pod in pods):
             raise RuntimeError(
                 "unreconciled holder exists; retain it and refuse allocation"

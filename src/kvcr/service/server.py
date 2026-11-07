@@ -670,8 +670,9 @@ class _ThreadingUnixServer(
         liveness.incarnation = request.incarnation
         # v2 claims (tenant and lineage) take a slot first; v1 claims skip it.
         slot = None
-        if self.slots is not None and request.tenant and request.lineage:
-            slot = self.slots.claim(
+        slots = getattr(self, "slots", None)  # absent on v1-only servers
+        if slots is not None and request.tenant and request.lineage:
+            slot = slots.claim(
                 request.tenant,
                 request.lineage,
                 total=request.total_bytes,
@@ -696,7 +697,7 @@ class _ThreadingUnixServer(
                 raise KVCRServiceError("KVCR claim succeeded without a Guard")
         except BaseException:
             if slot is not None:
-                self.slots.vacate(slot.name, peer)
+                slots.vacate(slot.name, peer)
             raise
         slot_fields = (
             {}

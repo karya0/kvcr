@@ -87,7 +87,7 @@ def test_state_agent_and_placement_defaults():
 
 def _granted_wire() -> dict:
     spec = KVCRPoolSpec(
-        "p", "/x/" + _pool_filename("p", "0" * 32), "0" * 32, 1, 2, 8192, 4096
+        "p", "/x/" + _pool_filename("p", "0" * 32), "0" * 32, 1, 2, 16384, 8192
     )
     return {
         "type": "granted",

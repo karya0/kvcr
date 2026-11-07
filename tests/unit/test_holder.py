@@ -180,7 +180,7 @@ def _claim_as(table, peer, claim_id="a", alive=lambda: True):
         "l",
         total=4 * PAGE,
         minimum=2 * PAGE,
-        maximum=None,
+        maximum=8 * PAGE,  # room above the grant to grow into
         digest=DIGEST,
         claim_id=claim_id,
         peer=peer,

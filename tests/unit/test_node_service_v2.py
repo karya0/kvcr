@@ -4,6 +4,7 @@
 
 import mmap
 import os
+import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -13,12 +14,14 @@ import pytest
 if sys.platform != "linux":
     pytest.skip("memfd and MAP_FIXED regions are Linux-only", allow_module_level=True)
 
-from test_kvcr_service import _running_server, _send_raw_request
+from test_kvcr_service import _running_server
 from test_node_service import _SPECS, FakeAPI, make_broker
 
+from kvcr.runtime.control_channels import FramedConnection
 from kvcr.service import node_service
 from kvcr.service.node_service import SlotError, SlotTable, effective_grant
 from kvcr.service.protocol import (
+    _RESIZE_RESPONSE_DECODER,
     CAPACITY_BELOW_MINIMUM,
     IDENTITY_MISMATCH,
     INTERNAL,
@@ -204,7 +207,14 @@ def test_resize_round_trip_and_identity(tmp_path, pools):
     _claim(table, total=2, minimum=2, maximum=8)
     with _running_server(tmp_path) as harness:
         harness.server._server.slots = table
-        send = lambda r: _send_raw_request(harness.server.socket_path, r)  # noqa: E731
+
+        def send(request):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.connect(str(harness.server.socket_path))
+                channel = FramedConnection(connection)
+                channel.send(request)
+                return channel.receive(_RESIZE_RESPONSE_DECODER)
+
         grown = send(_Grow(1, "t/l", 2 * PAGE))
         assert isinstance(grown, _Grown) and grown.layout_generation == 2
         assert [r.index for r in grown.regions] == [1]
