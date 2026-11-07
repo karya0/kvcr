@@ -7,7 +7,9 @@ import logging
 import mmap
 import os
 import sys
+import tempfile
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -20,7 +22,6 @@ from test_claimant import (  # noqa: F401 - fixtures
     _attach,
     _claim,
     _serve,
-    tmp_path as claim_tmp_path,
 )
 from test_kvcr_service import _channels_are_taken  # noqa: F401 - autouse fixture
 from test_node_service_v2 import pools  # noqa: F401 - used through pytestmark
@@ -34,8 +35,13 @@ from kvcr.service.protocol import (
 )
 from kvcr.service.regions import RegionMapping
 
-
 pytestmark = pytest.mark.usefixtures("pools")
+
+
+@pytest.fixture
+def short_dir():  # a short path: the service sockets live under it
+    with tempfile.TemporaryDirectory(prefix="gaas-dp-", dir="/tmp") as directory:
+        yield Path(directory)
 
 
 def _memfd(pages: int) -> int:
@@ -81,9 +87,9 @@ def test_region_mapping_refuses_a_layout_it_cannot_make_contiguous(regions, fds)
 
 
 def test_client_pool_is_the_regions_and_the_journal_records_their_digest(
-    claim_tmp_path,
+    short_dir,
 ):
-    server, table = _serve(claim_tmp_path)
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         hold = _claim(harness)
@@ -100,10 +106,8 @@ def test_client_pool_is_the_regions_and_the_journal_records_their_digest(
             hold.release()
 
 
-def test_partial_grant_fails_closed_and_frees_the_slot(claim_tmp_path):
-    server, table = _serve(
-        claim_tmp_path, pages=3
-    )  # 3 pages free, 4 requested, 2 minimum
+def test_partial_grant_fails_closed_and_frees_the_slot(short_dir):
+    server, table = _serve(short_dir, pages=3)  # 3 pages free, 4 requested, 2 minimum
     with server as harness:
         _attach(harness, table)
         with pytest.raises(KVCRServiceReasonError) as refused:
@@ -116,8 +120,8 @@ def test_partial_grant_fails_closed_and_frees_the_slot(claim_tmp_path):
         assert not table.get("t/l/0").held
 
 
-def test_two_pool_tier_fails_closed(claim_tmp_path):
-    server, table = _serve(claim_tmp_path)
+def test_two_pool_tier_fails_closed(short_dir):
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         from test_kvcr_service import _TEST_DIGEST, _control_bind
@@ -136,8 +140,8 @@ def test_two_pool_tier_fails_closed(claim_tmp_path):
         assert refused.value.reason == DATA_POOL_LAYOUT
 
 
-def test_guard_registers_the_regions_not_pool_rank(claim_tmp_path):
-    server, table = _serve(claim_tmp_path)
+def test_guard_registers_the_regions_not_pool_rank(short_dir):
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         guard = harness.server._server.registry._guards[0]
@@ -163,11 +167,11 @@ def test_guard_registers_the_regions_not_pool_rank(claim_tmp_path):
 
 @pytest.mark.parametrize("skew", [False, True])
 def test_guard_refuses_records_written_under_another_layout(
-    claim_tmp_path,
+    short_dir,
     caplog,
     skew,
 ):
-    server, table = _serve(claim_tmp_path)
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         guard = harness.server._server.registry._guards[0]
@@ -198,11 +202,11 @@ def test_region_digest_names_the_backing_not_only_the_geometry():
 
 
 def test_guard_drops_records_when_the_slot_backing_changed(
-    claim_tmp_path,
+    short_dir,
     caplog,
 ):
     """Slot A's journal over slot B's memfd of identical geometry is cold."""
-    server, table = _serve(claim_tmp_path)
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         guard = harness.server._server.registry._guards[0]
@@ -225,10 +229,10 @@ def test_guard_drops_records_when_the_slot_backing_changed(
 
 
 def test_shrink_after_claim_changes_the_live_digest_and_drops_records(
-    claim_tmp_path,
+    short_dir,
     caplog,
 ):
-    server, table = _serve(claim_tmp_path)
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         guard = harness.server._server.registry._guards[0]
@@ -248,11 +252,11 @@ def test_shrink_after_claim_changes_the_live_digest_and_drops_records(
 
 
 def test_an_unwritten_header_does_not_drop_the_mirror(
-    claim_tmp_path,
+    short_dir,
     caplog,
 ):
     """A claim that failed before writing its digest leaves zeros and no records."""
-    server, table = _serve(claim_tmp_path)
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         guard = harness.server._server.registry._guards[0]
