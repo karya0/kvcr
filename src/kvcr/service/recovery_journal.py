@@ -521,6 +521,13 @@ def claim_guarded_pool(
             len(hold.regions),
             hold.guard_endpoint,
         )
+    if hold.slot_name is not None:
+        logger.info(
+            "gaas data pool regions=%d bytes=%d base=%#x",
+            len(hold.regions),
+            hold.local_dram.pools[0][2],
+            hold.local_dram.pools[0][1],
+        )
     # The lease is live from here, and the caller cannot release what it has not
     # been handed yet: anything that fails before this returns has to give the pool
     # back itself or leave it held until the process exits.

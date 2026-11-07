@@ -22,6 +22,9 @@ _POOL_PREFIX = "kvcr"
 
 
 _JOURNAL_HEADER_BYTES = 4096
+# Past the ring cursors (recovery_journal.py): the digest of the region table the
+# claimant mapped as its data pool; zero until a v2 claimant writes it.
+_LAYOUT_DIGEST_OFFSET, LAYOUT_DIGEST_BYTES = 256, 32
 # The errnos that mean "another holder has this lock" rather than "locking is
 # broken here". Anything outside this set must propagate.
 _CONTENTION_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
@@ -138,6 +141,19 @@ class KVCRPoolAttachment:
         """Return the base address of the mapped pool."""
         mapping = self._require_mapping()
         return ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+
+    def layout_digest(self) -> bytes:
+        """The region-table digest in the journal header (zeros if none written)."""
+        self._require_mapping()
+        return ctypes.string_at(
+            self.address + _LAYOUT_DIGEST_OFFSET, LAYOUT_DIGEST_BYTES
+        )
+
+    def set_layout_digest(self, digest: bytes) -> None:
+        self._require_mapping()
+        if len(digest) != LAYOUT_DIGEST_BYTES:
+            raise ValueError("layout digest must be 32 bytes")
+        ctypes.memmove(self.address + _LAYOUT_DIGEST_OFFSET, digest, len(digest))
 
     @contextlib.contextmanager
     def snapshot_region(self, size: int) -> Iterator[memmap.Region]:

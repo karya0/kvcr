@@ -7,6 +7,7 @@ import logging
 import mmap
 import os
 import types
+from math import gcd
 
 from kvcr.service.memmap import round_up
 from kvcr.service.protocol import PoolRegion
@@ -292,3 +293,60 @@ class RegionPool:
         tb: types.TracebackType | None,
     ) -> None:
         self.close()
+
+
+class RegionMapping:
+    """Granted regions mapped contiguously into one reserved range: the data pool.
+
+    Region ``offset`` is the offset in both the memfd and the range, so offset 0
+    is region 0 offset 0. Any failure unmaps the reservation: no partial pool.
+    """
+
+    def __init__(self, fds: list[int], regions: tuple[PoolRegion, ...]) -> None:
+        ordered = sorted(regions, key=lambda region: region.offset)
+        end = 0
+        for region in ordered:
+            if region.offset != end or (region.fd_index or 0) >= len(fds):
+                raise ValueError(f"region {region.index} does not continue the pool")
+            end += region.size
+        if not end:
+            raise ValueError("no regions to map")
+        # MAP_FIXED of a hugetlb memfd needs the address aligned to its page size.
+        common = gcd(*(region.size for region in ordered))
+        align = min(1 << 30, max(mmap.PAGESIZE, common & -common))
+        self.size_bytes = end
+        self._libc = _libc()
+        self._reserve = end + align
+        self._raw = _check(
+            self._libc.mmap(
+                None,
+                self._reserve,
+                _PROT_NONE,
+                mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_NORESERVE,
+                -1,
+                0,
+            ),
+            "data pool reservation",
+        )
+        self.address = round_up(self._raw, align)
+        try:
+            for region in ordered:
+                _check(
+                    self._libc.mmap(
+                        self.address + region.offset,
+                        region.size,
+                        mmap.PROT_READ | mmap.PROT_WRITE,
+                        mmap.MAP_SHARED | _MAP_FIXED,
+                        fds[region.fd_index or 0],
+                        region.offset,
+                    ),
+                    f"data pool region {region.index}",
+                )
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._raw:
+            self._libc.munmap(self._raw, self._reserve)
+            self._raw = 0

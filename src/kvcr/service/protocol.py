@@ -4,6 +4,7 @@
 
 import contextlib
 import errno
+import hashlib
 import logging
 import mmap
 import os
@@ -14,7 +15,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from math import gcd
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import msgspec
 
@@ -28,6 +29,9 @@ from ..runtime.control_channels import (
 )
 from ..types import PoolBlockLayouts
 from .memory import KVCRPoolAttachment, KVCRPoolSpec, _compute_pool_geometry
+
+if TYPE_CHECKING:
+    from .regions import RegionMapping
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +136,13 @@ class PoolRegion(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     fd_index: Annotated[int, msgspec.Meta(ge=0)] | None = None
 
 
+def region_table_digest(regions: tuple[PoolRegion, ...]) -> bytes:
+    """Names the layout of a v2 data pool; the claimant records it in the journal
+    header and the Guard refuses to adopt records written under another one."""
+    table = [(r.index, r.offset, r.size, r.fd_index or 0) for r in regions]
+    return hashlib.sha256(msgspec.msgpack.encode(table)).digest()
+
+
 # Reason codes carried by _Error; a client branches on these, not on message.
 CAPACITY_BELOW_MINIMUM = "capacity_below_minimum"
 SLOT_HELD = "slot_held"
@@ -141,6 +152,7 @@ UNKNOWN_SLOT = "unknown_slot"
 REGION_BUSY = "region_busy"
 NOT_IMPLEMENTED = "not_implemented"
 INTERNAL = "internal"
+DATA_POOL_LAYOUT = "data_pool_layout"
 ERROR_REASONS = frozenset(
     {
         CAPACITY_BELOW_MINIMUM,
@@ -151,6 +163,7 @@ ERROR_REASONS = frozenset(
         REGION_BUSY,
         NOT_IMPLEMENTED,
         INTERNAL,
+        DATA_POOL_LAYOUT,
     }
 )
 
@@ -469,6 +482,7 @@ class KVCRPoolHold:
     _incarnation: str | None = None
     _dead_incarnations: tuple[str, ...] = ()
     _heartbeat_enabled: bool = False
+    _data_map: "RegionMapping | None" = None
     # v2 grants only: the slot and its regions; region fds are owned by the hold.
     slot_name: str | None = None
     claim_generation: int | None = None
@@ -506,6 +520,8 @@ class KVCRPoolHold:
         self._control_listener_fd = None
 
     def _stop_local_access(self) -> None:
+        if self._data_map is not None:
+            self._data_map.close()
         self._attachment.close()
         self._heartbeat_stop.set()
         for fd in (self._control_listener_fd, *self.region_fds):
@@ -621,6 +637,7 @@ class KVCRClient:
                 else claim_wait_s(gaas.maximum_bytes or gaas.total_bytes or 0)
             )
         attachment: KVCRPoolAttachment | None = None
+        data_map: RegionMapping | None = None
         listener_fd: int | None = None
         pool_fd: int | None = None
         region_fds: list[int] = []
@@ -651,18 +668,22 @@ class KVCRClient:
             )
             fd, pool_fd = pool_fd, None
             attachment = KVCRPoolAttachment.attach_fd(fd, spec)
+            dram_pools = [
+                (pool.name, attachment.address + pool.offset_bytes, pool.size_bytes)
+                for pool in granted_pools
+            ]
+            if v2:
+                # The data pool is the granted regions; pool_fd keeps the journal.
+                data_map = _map_data_pool(response, gaas, region_fds)
+                attachment.set_layout_digest(region_table_digest(response.regions))
+                dram_pools = [
+                    (granted_pools[0].name, data_map.address, data_map.size_bytes)
+                ]
             return KVCRPoolHold(
                 local_dram=LocalDramOptions(
-                    [
-                        (
-                            pool.name,
-                            attachment.address + pool.offset_bytes,
-                            pool.size_bytes,
-                        )
-                        for pool in granted_pools
-                    ],
-                    request.tier_config.remote_fw_dram_backend,
+                    dram_pools, request.tier_config.remote_fw_dram_backend
                 ),
+                _data_map=data_map,
                 _pools=granted_pools,
                 _attachment=attachment,
                 _connection=connection,
@@ -680,6 +701,8 @@ class KVCRClient:
                     with contextlib.suppress(OSError):
                         os.close(leftover)
             local_access_stopped = True
+            if data_map is not None:
+                data_map.close()
             if attachment is not None:
                 try:
                     attachment.close()
@@ -744,6 +767,31 @@ class KVCRClient:
         return response
 
 
+def _map_data_pool(
+    response: "_GrantedV2", gaas: GaaSSettings, region_fds: list[int]
+) -> "RegionMapping":
+    """Map the granted regions as the one data pool, or fail the claim closed.
+
+    The engine sized its block pool before claiming, so a partial grant cannot
+    be used: specs set minimum = maximum = total and anything else is refused.
+    """
+    from .regions import RegionMapping
+
+    granted = sum(region.size for region in response.regions)
+    if len(response.pools) != 1:
+        problem = f"{len(response.pools)} pools; a v2 data pool is one pool"
+    elif granted != gaas.total_bytes:
+        problem = f"granted {granted} bytes, requested total {gaas.total_bytes}"
+    elif granted % response.pools[0].block_size_bytes:
+        problem = f"{granted} bytes is not a whole number of blocks"
+    else:
+        try:
+            return RegionMapping(region_fds, response.regions)
+        except (OSError, ValueError) as error:
+            problem = f"cannot map the regions: {error}"
+    raise KVCRServiceReasonError(f"v2 data pool refused: {problem}", DATA_POOL_LAYOUT)
+
+
 def _slot_fields(response: _GrantedV2, region_fds: list[int]) -> dict[str, Any]:
     return {
         "slot_name": response.slot_name,
@@ -783,7 +831,10 @@ def _grant_layout(
         ):
             raise KVCRGuardProtocolError(f"claim pool {index} layout mismatch")
         expected_offset += pool.size_bytes
-    if expected_offset != response.spec.mapping_bytes:
+    # A v2 data pool is the regions, not pool_{rank}'s own pools.
+    if expected_offset != response.spec.mapping_bytes and not isinstance(
+        response, _GrantedV2
+    ):
         raise KVCRGuardProtocolError("claim pool sizes do not fill the allocation")
     return response.spec, pools
 
