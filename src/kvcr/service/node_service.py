@@ -47,10 +47,15 @@ _TOUCHER_OVERHEAD_BYTES = 128 << 20
 
 
 def _toucher_overhead_bytes(data_bytes: int) -> int:
-    """Fixed holder RSS plus kernel memory charged per shmem page: page tables
-    (data / 512) and page-cache xarray slab (~data / 430), measured as 210 MB for
-    46 GiB; data / 256 covers both."""
-    return _TOUCHER_OVERHEAD_BYTES + -(-data_bytes // 256)
+    """Fixed holder RSS plus kernel memory charged to the holder's memcg.
+
+    Populating N bytes of 4 KiB shmem pages charges about N / 235 of page tables
+    and page-cache slab (210 MB for 46 GiB, c5-repro-memcg-20261107.txt); N / 200
+    leaves margin. The fixed 128 MiB covers the holder's own RSS (~46 MiB).
+    """
+    return _TOUCHER_OVERHEAD_BYTES + -(-data_bytes // 200)
+
+
 _LINEAGE_LABEL = "nvidia.com/dynamo-graph-deployment-name"
 _DYNAMO_NAMESPACE_LABEL = "nvidia.com/dynamo-namespace"
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
@@ -1369,6 +1374,10 @@ class SlotTable:
                 if not chunk or len(line) > _MAX_MESSAGE:
                     raise EOFError
                 line += chunk
+        except TimeoutError as error:
+            raise RuntimeError(
+                f"holder did not report within {self.ensure_timeout_s:.0f} s"
+            ) from error
         except (EOFError, OSError) as error:
             reason = self._holder_exit_reason(slot)
             raise RuntimeError(
@@ -1380,7 +1389,7 @@ class SlotTable:
 
     def _holder_exit_reason(self, slot: _Slot) -> str | None:
         """The holder container's terminated reason (e.g. OOMKilled), if readable."""
-        try:
+        try:  # api.get has a 10 s timeout (InClusterPodAPI._request)
             pod = self.broker.api.get(
                 "gaas-pool-" + self.broker._key(PoolClaim.parse(slot.holder))
             )

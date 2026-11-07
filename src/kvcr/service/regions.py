@@ -215,7 +215,9 @@ class RegionPool:
             error = ctypes.get_errno()
             raise OSError(error, f"cannot release regions: {os.strerror(error)}")
         if removed:
-            logger.info("punched regions offset=%d length=%d", removed[0].offset, length)
+            logger.info(
+                "punched regions offset=%d length=%d", removed[0].offset, length
+            )
         self._unmap(removed)
         if removed:
             self._generation += 1

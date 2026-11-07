@@ -415,15 +415,20 @@ def test_stale_release_does_not_free_the_new_owner(tmp_path, pools):
 
 
 def test_failed_holder_ack_rolls_the_grow_back(tmp_path, pools):
-    table, _ = _table(tmp_path)
+    table, api = _table(tmp_path)
     slot = _claim(table, total=2, minimum=2, maximum=8)
     before = (slot.pool.regions, slot.pool.layout_generation)
     supervisor_end, holder_end = socket.socketpair()
     holder_end.close()  # the holder is gone: EOF/EPIPE on the layout
     slot.holder_conn = supervisor_end
+    for pod in api.pods.values():
+        pod["status"]["containerStatuses"] = [
+            {"lastState": {"terminated": {"reason": "OOMKilled"}}}
+        ]
     with pytest.raises(SlotError) as raised:
         table.grow("t/l/0", ME, 2 * PAGE, None)
     assert raised.value.reason == INTERNAL
+    assert str(raised.value).endswith("(OOMKilled)")
     assert (slot.pool.regions, slot.pool.layout_generation) == before
     assert slot.holder_conn is None
     regions, generation = table.grow("t/l/0", ME, 2 * PAGE, None)  # retry grows once

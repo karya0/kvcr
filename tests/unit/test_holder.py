@@ -188,15 +188,21 @@ def test_toucher_pod_is_guaranteed_and_v1_unchanged(tmp_path):
 def test_toucher_memory_covers_page_tables(tmp_path):
     v2 = make_broker(tmp_path, _ToucherAPI())
     v2.toucher = True
-    state = {"pod_name": "gaas-pool-x", "creation_id": "c", "socket_path": "/n/p/s.sock"}
+    state = {
+        "pod_name": "gaas-pool-x",
+        "creation_id": "c",
+        "socket_path": "/n/p/s.sock",
+    }
 
     def limit_mib(gib):
         pod = v2._pod(PoolClaim("p1", gib, DIGEST), state)
         return int(pod["spec"]["containers"][0]["resources"]["limits"]["memory"][:-2])
 
-    # shmem page tables (92 MiB) and page-cache slab (~108 MiB) are charged to the
-    # holder; the 46 GiB c5 pool was OOM-killed at +128 MiB.
-    assert 46 * 1024 + 92 + 128 <= limit_mib(46) <= 46 * 1024 + 128 + 184
+    # Measured in c5-repro-memcg-20261107.txt: 46 GiB needs 47352 MiB (the 47324 MiB
+    # sizing was OOM-killed); kernel charge is data / 235, holder anon about 46 MiB.
+    assert limit_mib(46) >= 47352
+    for gib in (46, 256):
+        assert limit_mib(gib) - gib * 1024 >= gib * 1024 // 235 + 46 + 32
     assert limit_mib(1) <= 1024 + 136
 
 
