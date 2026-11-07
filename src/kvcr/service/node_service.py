@@ -29,6 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -97,6 +98,15 @@ class PoolClaim:
             "backing_limit_bytes": 2 * mapping,
             "memory_request_bytes": 2 * mapping + _HEADROOM_BYTES,
         }
+
+
+def effective_grant(
+    total: int, minimum: int, maximum: int | None, available: int
+) -> int | None:
+    """Bytes to grant a claim, or None when less than its minimum is available."""
+    if available < minimum:
+        return None
+    return min(maximum or total, available)
 
 
 def _matching_tolerations(actual: Any, intended: list[dict[str, Any]]) -> bool:
@@ -751,6 +761,25 @@ class NodeBroker:
             self._verify_pod(claim, state, remaining, allow_terminating=True)
         return self._descriptor(state)
 
+    def abandon(self, value: dict[str, Any]) -> None:
+        """Retire a holder that died (gone, terminating or finished) so a
+        replacement can be created under a new claim identity."""
+        claim = PoolClaim.parse(value)
+        with self._lock:
+            state = self._load(claim)
+            if state is None or state["phase"] == "deleted":
+                return
+            pod = self.api.get(state["pod_name"])
+            if pod is not None:
+                terminating = bool(pod["metadata"].get("deletionTimestamp"))
+                if pod.get("status", {}).get("phase") not in ("Failed", "Succeeded"):
+                    if not terminating:
+                        raise RuntimeError("holder is alive; refusing to abandon it")
+                if not terminating and pod["metadata"].get("uid"):
+                    self.api.delete(state["pod_name"], pod["metadata"]["uid"])
+            state["phase"] = "deleted"
+            self._save(claim, state)
+
     def reconcile_releases(self) -> list[str]:
         errors = []
         with self._lock:
@@ -766,6 +795,246 @@ class NodeBroker:
                     except (OSError, RuntimeError, ValueError) as error:
                         errors.append(f"{state['pod_name']}: {type(error).__name__}")
         return errors
+
+
+class SlotError(Exception):
+    """A v2 claim or resize refused with a protocol reason code."""
+
+    def __init__(self, reason: str, message: str):
+        self.reason = reason
+        super().__init__(message)
+
+
+@dataclass
+class _Slot:
+    name: str
+    digest: str
+    pool: Any  # RegionPool
+    effective_maximum_bytes: int
+    holder: dict[str, Any]
+    incarnation: int = 0
+    peer: Any = None
+    owner_alive: Callable[[], bool] | None = None
+    claim_id: str | None = None
+
+    @property
+    def held(self) -> bool:
+        return self.owner_alive is not None and self.owner_alive()
+
+
+class SlotTable:
+    """v2 slots keyed ``tenant/lineage``: capacity, queueing and holder upkeep.
+
+    A slot outlives its worker: death frees the claim (``owner_alive`` turns
+    false) but keeps the region pool and holder so a successor reuses them.
+    ``release`` is the teardown. ``_waiters`` is the per-slot queue of pending
+    claim ids; the head is next to be granted, others get SLOT_HELD.
+    """
+
+    def __init__(
+        self,
+        broker: NodeBroker,
+        cap_bytes: int,
+        local_requests: Callable[[str], int] = lambda tenant: 0,
+        headroom_bytes: int = _HEADROOM_BYTES,
+        ensure_timeout_s: float = 180,
+    ):
+        self.broker, self.cap_bytes = broker, cap_bytes
+        self.local_requests, self.headroom_bytes = local_requests, headroom_bytes
+        self.ensure_timeout_s = ensure_timeout_s
+        self._slots: dict[str, _Slot] = {}
+        self._waiters: dict[str, list[str]] = {}
+        self._epochs: dict[str, int] = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def slot_name(tenant: str, lineage: str) -> str:
+        return f"{tenant}/{lineage}"
+
+    def waiters(self, name: str) -> list[str]:
+        return list(self._waiters.get(name, ()))
+
+    def get(self, name: str) -> _Slot | None:
+        return self._slots.get(name)
+
+    def _available(self, tenant: str, name: str) -> int:
+        others = sum(
+            s.effective_maximum_bytes for n, s in self._slots.items() if n != name
+        )
+        return (
+            self.cap_bytes + self.local_requests(tenant) - self.headroom_bytes - others
+        )
+
+    def _new_holder(self, name: str, effective: int, digest: str) -> dict[str, Any]:
+        # A fresh pool_id per holder: the broker keeps a deleted claim terminal.
+        epoch = self._epochs[name] = self._epochs.get(name, -1) + 1
+        stem = "s" + hashlib.sha256(name.encode()).hexdigest()[:12]
+        mib = max(512, -(-effective // (1 << 20)))
+        return PoolClaim(f"{stem}-{epoch}", Decimal(mib) / 1024, digest).as_dict()
+
+    def claim(
+        self,
+        tenant: str,
+        lineage: str,
+        *,
+        total: int | None,
+        minimum: int | None,
+        maximum: int | None,
+        digest: str,
+        claim_id: str,
+        peer: Any,
+        owner_alive: Callable[[], bool],
+    ) -> _Slot:
+        from .protocol import (
+            CAPACITY_BELOW_MINIMUM,
+            INCOMPATIBLE_LINEAGE,
+            INTERNAL,
+            SLOT_HELD,
+        )
+        from .regions import CapacityError, RegionPool
+
+        name = self.slot_name(tenant, lineage)
+        with self._lock:
+            slot = self._slots.get(name)
+            queue = self._waiters.setdefault(name, [])
+            if (slot is not None and slot.held) or (queue and queue[0] != claim_id):
+                if claim_id not in queue:
+                    queue.append(claim_id)
+                raise SlotError(SLOT_HELD, f"slot {name} is held")
+            if queue:
+                queue.pop(0)
+            if slot is not None:
+                if slot.digest != digest:
+                    raise SlotError(
+                        INCOMPATIBLE_LINEAGE, f"slot {name} lineage differs"
+                    )
+                self.check_holder(name)
+            else:
+                size = total or maximum or minimum
+                if not size:
+                    raise SlotError(INTERNAL, "claim carries no size")
+                effective = effective_grant(
+                    size, minimum or size, maximum, self._available(tenant, name)
+                )
+                if effective is None:
+                    raise SlotError(
+                        CAPACITY_BELOW_MINIMUM, f"capacity below minimum for {name}"
+                    )
+                pool = RegionPool.create(effective)
+                holder = self._new_holder(name, effective, digest)
+                try:
+                    pool.grow(min(size, effective))
+                    self.broker.ensure(holder, self.ensure_timeout_s)
+                except BaseException as error:
+                    pool.close()
+                    with contextlib.suppress(Exception):
+                        self.broker.release(holder)
+                    if isinstance(error, CapacityError):
+                        raise SlotError(CAPACITY_BELOW_MINIMUM, str(error)) from error
+                    if isinstance(
+                        error, (OSError, RuntimeError, ValueError, TimeoutError)
+                    ):
+                        raise SlotError(
+                            INTERNAL, f"holder for {name}: {error}"
+                        ) from error
+                    raise
+                slot = self._slots[name] = _Slot(name, digest, pool, effective, holder)
+            slot.peer, slot.owner_alive, slot.claim_id = peer, owner_alive, claim_id
+            return slot
+
+    def vacate(self, name: str, peer: Any) -> None:
+        """The claimant released its lease: free the slot, keep pool and holder."""
+        with self._lock:
+            slot = self._slots.get(name)
+            if slot is not None and slot.peer == peer:
+                slot.owner_alive = None
+
+    def _holder_dead(self, slot: _Slot) -> bool:
+        pod = self.broker.api.get(
+            "gaas-pool-" + self.broker._key(PoolClaim.parse(slot.holder))
+        )
+        return (
+            pod is None
+            or bool(pod["metadata"].get("deletionTimestamp"))
+            or pod.get("status", {}).get("phase") in ("Failed", "Succeeded")
+        )
+
+    def check_holder(self, name: str) -> bool:
+        """Recreate the holder once if it is gone or terminating; True if it was."""
+        from .protocol import INTERNAL, UNKNOWN_SLOT
+
+        with self._lock:
+            slot = self._slots.get(name)
+            if slot is None:
+                raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
+            if not self._holder_dead(slot):
+                return False
+            self.broker.abandon(slot.holder)
+            slot.incarnation += 1
+            slot.holder = self._new_holder(
+                name, slot.effective_maximum_bytes, slot.digest
+            )
+            try:
+                self.broker.ensure(slot.holder, self.ensure_timeout_s)
+            except (OSError, RuntimeError, ValueError, TimeoutError) as error:
+                raise SlotError(
+                    INTERNAL, f"holder recreate for {name}: {error}"
+                ) from error
+            return True
+
+    def _owned(self, name: str, peer: Any) -> _Slot:
+        from .protocol import IDENTITY_MISMATCH, UNKNOWN_SLOT
+
+        slot = self._slots.get(name)
+        if slot is None:
+            raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
+        if slot.peer != peer:
+            raise SlotError(IDENTITY_MISMATCH, f"slot {name} belongs to another peer")
+        return slot
+
+    def grow(self, name: str, peer: Any, additional_bytes: int, split: int | None):
+        from .protocol import CAPACITY_BELOW_MINIMUM
+        from .regions import CapacityError
+
+        with self._lock:
+            slot = self._owned(name, peer)
+            try:
+                regions = slot.pool.grow(additional_bytes, split)
+            except CapacityError as error:
+                raise SlotError(CAPACITY_BELOW_MINIMUM, str(error)) from error
+            return regions, slot.pool.layout_generation
+
+    def shrink(self, name: str, peer: Any, indices: tuple[int, ...]):
+        from .protocol import REGION_BUSY, UNKNOWN_SLOT
+        from .regions import RegionBusy, UnknownRegion
+
+        with self._lock:
+            slot = self._owned(name, peer)
+            try:
+                for index in indices:
+                    slot.pool.mark_quiescent(index)
+                removed = slot.pool.shrink(indices)
+            except RegionBusy as error:
+                raise SlotError(REGION_BUSY, str(error)) from error
+            except UnknownRegion as error:
+                raise SlotError(UNKNOWN_SLOT, f"unknown region {error}") from error
+            return removed, slot.pool.layout_generation
+
+    def release(self, name: str) -> list[str]:
+        """PoC teardown: close pool, drain and delete holder; returns waiters."""
+        from .protocol import UNKNOWN_SLOT
+
+        with self._lock:
+            slot = self._slots.get(name)
+            if slot is None:
+                raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
+            slot.pool.close()
+            if self._holder_dead(slot):
+                self.broker.abandon(slot.holder)
+            else:
+                self.broker.release(slot.holder)
+            del self._slots[name]
+            return self.waiters(name)
 
 
 def _rpc(

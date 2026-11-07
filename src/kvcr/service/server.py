@@ -9,10 +9,12 @@ import logging
 import mmap
 import os
 import re
+import select
 import signal
 import socket
 import socketserver
 import stat
+import struct
 import sys
 import threading
 import time
@@ -41,12 +43,14 @@ from .memory import (
     _reclaim_pool_if_orphaned,
     _unlink_if_identity,
 )
+from .node_service import SlotError, SlotTable
 from .protocol import (
-    NOT_IMPLEMENTED,
     _CLAIM_DECODER,
     _HOLD_DECODER,
     _MIN_HEARTBEAT_TIMEOUT_SECONDS,
     _PROTOCOL_VERSION,
+    INTERNAL,
+    NOT_IMPLEMENTED,
     PidfdLiveness,
     _Claim,
     _claim_fd_counts,
@@ -54,6 +58,7 @@ from .protocol import (
     _Error,
     _Granted,
     _Grow,
+    _Grown,
     _Heartbeat,
     _PoolDescriptor,
     _reason_error,
@@ -61,6 +66,7 @@ from .protocol import (
     _ServiceInfo,
     _ServiceState,
     _Shrink,
+    _Shrunk,
     _TierConfig,
 )
 
@@ -400,12 +406,53 @@ def _open_pool_fd(spec: KVCRPoolSpec) -> int:
     return pool_fd
 
 
+def _peer_identity(connection: socket.socket) -> tuple[int, int]:
+    """(pid, uid) of the connected peer, as the kernel saw it at connect."""
+    pid, uid, _gid = struct.unpack(
+        "3i",
+        connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        ),
+    )
+    return pid, uid
+
+
+def _pidfd_alive(liveness: PidfdLiveness) -> bool:
+    try:
+        return not select.select([liveness], [], [], 0)[0]
+    except (OSError, ValueError):  # closed pidfd: the lease is gone
+        return False
+
+
 class _RequestHandler(socketserver.BaseRequestHandler):
     server: "_ThreadingUnixServer"
     request: socket.socket
 
     def setup(self) -> None:
         self.channel = FramedConnection(self.request)
+        self._slot_name: str | None = None
+        self._peer: tuple[int, int] | None = None
+
+    def _resize(self, request: "_Grow | _Shrink") -> "_Grown | _Shrunk | _Error":
+        slots = self.server.slots
+        if slots is None:
+            return _reason_error(NOT_IMPLEMENTED, "resize is not implemented")
+        try:
+            peer = _peer_identity(self.request)
+            if isinstance(request, _Grow):
+                regions, generation = slots.grow(
+                    request.slot_name, peer, request.additional_bytes, request.split
+                )
+                return _Grown(_PROTOCOL_VERSION, regions, generation)
+            removed, generation = slots.shrink(
+                request.slot_name, peer, request.region_indices
+            )
+            return _Shrunk(_PROTOCOL_VERSION, removed, generation)
+        except SlotError as error:
+            return _reason_error(error.reason, str(error))
+        except Exception:  # noqa: BLE001 - report internal resize failures
+            logger.exception("Unexpected failure while handling KVCR resize")
+            return _reason_error(INTERNAL, "internal KVCR service error")
 
     def handle(self) -> None:
         try:
@@ -430,18 +477,19 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             return
 
         if isinstance(request, (_Grow, _Shrink)):
-            # The supervisor that owns slots arrives with the resize logic.
             with contextlib.suppress(OSError):
-                self.channel.send(
-                    _reason_error(NOT_IMPLEMENTED, "resize is not implemented")
-                )
+                self.channel.send(self._resize(request))
             return
 
         liveness: PidfdLiveness | None = None
         grant: "tuple[int, int, _Lease] | None" = None
         try:
             liveness = PidfdLiveness.from_peer_socket(self.request, worker_pidfd)
-            response, grant = self.server.dispatch(request, liveness)
+            response, grant = self.server.dispatch(
+                request, liveness, _peer_identity(self.request)
+            )
+        except SlotError as error:
+            response = _reason_error(error.reason, str(error))
         except KVCRServiceError as error:
             response = _Error(str(error), _PROTOCOL_VERSION)
         except Exception:  # noqa: BLE001 - report internal claim failures
@@ -456,6 +504,8 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             return
 
         guard_index, listener_fd, lease = grant
+        self._slot_name = response.slot_name
+        self._peer = _peer_identity(self.request)
         try:
             pool_fd = _open_pool_fd(response.spec)
         except Exception:  # noqa: BLE001 - nothing sent yet: take the grant back
@@ -501,6 +551,8 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 self.server.registry.heartbeat(guard_index, lease)
                 continue
             if self._release_or_fail(guard_index, lease, message.activated):
+                if self._slot_name and self.server.slots is not None:
+                    self.server.slots.vacate(self._slot_name, self._peer)
                 with contextlib.suppress(OSError):
                     self.channel.send(_Released(_PROTOCOL_VERSION))
             return
@@ -545,8 +597,10 @@ class _ThreadingUnixServer(
         socket_path: str | os.PathLike[str],
         registry: _PoolRegistry,
         compatibility_digest: str,
+        slots: "SlotTable | None" = None,
     ) -> None:
         self.registry = registry
+        self.slots = slots
         registry.on_uncontained_failure = self.fail
         self.compatibility_digest = compatibility_digest
         self._fatal_error: BaseException | None = None
@@ -573,22 +627,55 @@ class _ThreadingUnixServer(
         self,
         request: _Claim,
         liveness: PidfdLiveness,
+        peer: tuple[int, int] | None = None,
     ) -> "tuple[_Granted, tuple[int, int, _Lease]]":
         if request.compatibility_digest != self.compatibility_digest:
             raise KVCRServiceError(
                 "KVCR compatibility digest does not match the service"
             )
         liveness.incarnation = request.incarnation
-        # Retain the Guard across a concurrent close; claim validates the request.
-        guard = self.registry._guards.get(request.guard_index)
-        spec, pools, listener_fd, lease = self.registry.claim(
-            request.guard_index,
-            request.tier_config,
-            liveness,
-            (request.control_host, request.control_port),
+        # v2 claims (tenant and lineage) take a slot first; v1 claims skip it.
+        slot = None
+        if self.slots is not None and request.tenant and request.lineage:
+            slot = self.slots.claim(
+                request.tenant,
+                request.lineage,
+                total=request.total_bytes,
+                minimum=request.minimum_bytes,
+                maximum=request.maximum_bytes,
+                digest=request.compatibility_digest,
+                claim_id=request.incarnation
+                or f"{request.control_host}:{request.control_port}",
+                peer=peer,
+                owner_alive=lambda: _pidfd_alive(liveness),
+            )
+        try:
+            # Retain the Guard across a concurrent close; claim validates the request.
+            guard = self.registry._guards.get(request.guard_index)
+            spec, pools, listener_fd, lease = self.registry.claim(
+                request.guard_index,
+                request.tier_config,
+                liveness,
+                (request.control_host, request.control_port),
+            )
+            if guard is None:
+                raise KVCRServiceError("KVCR claim succeeded without a Guard")
+        except BaseException:
+            if slot is not None:
+                self.slots.vacate(slot.name, peer)
+            raise
+        slot_fields = (
+            {}
+            if slot is None
+            else {
+                "slot_name": slot.name,
+                "effective_maximum_bytes": slot.effective_maximum_bytes,
+                "regions": slot.pool.regions,
+                "layout_generation": slot.pool.layout_generation,
+                # The Guard binds the claimant-requested control address.
+                "guard_endpoint": f"{request.control_host}:{request.control_port}",
+            }
         )
-        if guard is None:
-            raise KVCRServiceError("KVCR claim succeeded without a Guard")
         return (
             _Granted(
                 request.guard_index,
@@ -598,6 +685,7 @@ class _ThreadingUnixServer(
                 _PROTOCOL_VERSION,
                 dead_incarnations=guard.dead_incarnations,
                 heartbeat_enabled=guard.heartbeat_enabled,
+                **slot_fields,
             ),
             (request.guard_index, listener_fd, lease),
         )
@@ -646,6 +734,7 @@ class _KVCRService:
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
         heartbeat_timeout_seconds: float | None = None,
         startup_timeout_seconds: int | None = None,
+        slots: SlotTable | None = None,
     ) -> None:
         try:
             probe_pidfd = os.pidfd_open(os.getpid())
@@ -673,7 +762,7 @@ class _KVCRService:
         )
         try:
             self._server = _ThreadingUnixServer(
-                self.socket_path, self._registry, compatibility_digest
+                self.socket_path, self._registry, compatibility_digest, slots
             )
             socket_stat = self.socket_path.stat(follow_symlinks=False)
             self._socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
