@@ -137,3 +137,20 @@ def test_restore_remaps_a_persisted_layout(pool):
         other.restore(list(regions), pool.next_index, pool.layout_generation)
         assert other.regions == regions
         assert other.grow(PAGE)[0].offset == 2 * PAGE
+
+
+def test_failed_split_grow_leaves_the_layout_untouched(pool, monkeypatch):
+    pool.grow(PAGE)
+    layout = (pool.regions, pool.layout_generation, pool.next_index)
+    real, calls = pool._libc.mmap, []
+
+    def mmap_fails_second_region(*args):
+        calls.append(args)
+        return ctypes.c_void_p(-1).value if len(calls) == 2 else real(*args)
+
+    monkeypatch.setattr(pool._libc, "mmap", mmap_fails_second_region)
+    with pytest.raises(OSError):
+        pool.grow(4 * PAGE, split=2)
+    monkeypatch.undo()
+    assert (pool.regions, pool.layout_generation, pool.next_index) == layout
+    assert pool.grow(PAGE)[0].index == layout[2]

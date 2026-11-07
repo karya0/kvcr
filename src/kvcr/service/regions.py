@@ -155,22 +155,29 @@ class RegionPool:
                 f"grow of {size * count} bytes exceeds maximum {self._max}"
                 f" ({offset} used)"
             )
-        added = []
-        for _ in range(count):
-            addr = self._libc.mmap(
-                self._base + offset,
-                size,
-                mmap.PROT_READ | mmap.PROT_WRITE,
-                mmap.MAP_SHARED | _MAP_FIXED,
-                self._fd,
-                offset,
-            )
-            _check(addr, "region mmap")
-            region = PoolRegion(self._next_index, offset, size, 0)
-            self._next_index += 1
-            self._regions.append(region)
-            added.append(region)
-            offset += size
+        added: list[PoolRegion] = []
+        next_index = self._next_index
+        try:
+            for _ in range(count):
+                addr = self._libc.mmap(
+                    self._base + offset,
+                    size,
+                    mmap.PROT_READ | mmap.PROT_WRITE,
+                    mmap.MAP_SHARED | _MAP_FIXED,
+                    self._fd,
+                    offset,
+                )
+                _check(addr, "region mmap")
+                region = PoolRegion(self._next_index, offset, size, 0)
+                self._next_index += 1
+                self._regions.append(region)
+                added.append(region)
+                offset += size
+        except BaseException:
+            # A later region failed: drop the earlier ones, no generation bump.
+            self._unmap(added)
+            self._next_index = next_index
+            raise
         self._generation += 1
         return tuple(added)
 
