@@ -235,8 +235,16 @@ def test_release_drops_queued_waiters(tmp_path, pools):
 def test_abort_claim_drops_queued_waiters(tmp_path, pools):
     table, _ = _table(tmp_path)
     slot, generation = table.claim_with_generation(
-        "t", "l", 0, total=4 * PAGE, minimum=2 * PAGE, maximum=None,
-        digest=DIGEST, claim_id="a", peer=ME, owner_alive=lambda: True,
+        "t",
+        "l",
+        0,
+        total=4 * PAGE,
+        minimum=2 * PAGE,
+        maximum=None,
+        digest=DIGEST,
+        claim_id="a",
+        peer=ME,
+        owner_alive=lambda: True,
     )
     fds: list[int] = []
     _queue_waiter(table, "b", fds)
@@ -416,7 +424,7 @@ def test_failed_holder_ack_rolls_the_grow_back(tmp_path, pools):
     assert len(slot.pool.regions) == 2
 
 
-def test_shrink_fallocate_failure_is_region_busy(tmp_path, pools, monkeypatch):
+def test_shrink_fallocate_failure_is_internal(tmp_path, pools, monkeypatch):
     table, _ = _table(tmp_path)
     slot = _claim(table, total=2, minimum=2, maximum=8)
     table.grow("t/l/0", ME, 2 * PAGE, None)
@@ -424,7 +432,7 @@ def test_shrink_fallocate_failure_is_region_busy(tmp_path, pools, monkeypatch):
     monkeypatch.setattr(slot.pool._libc, "fallocate", lambda *args: -1)
     with pytest.raises(SlotError) as raised:
         table.shrink("t/l/0", ME, (1,))
-    assert raised.value.reason == REGION_BUSY
+    assert raised.value.reason == INTERNAL
     assert (slot.pool.regions, slot.pool.layout_generation) == layout
 
 
@@ -590,8 +598,14 @@ def test_claim_returns_its_own_generation(tmp_path, pools):
     table, _ = _table(tmp_path)
     alive = {"a": True, "b": True}
     kwargs = dict(
-        tenant="t", lineage="l", guard_index=0, total=4 * PAGE, minimum=2 * PAGE,
-        maximum=None, digest=DIGEST, peer=ME,
+        tenant="t",
+        lineage="l",
+        guard_index=0,
+        total=4 * PAGE,
+        minimum=2 * PAGE,
+        maximum=None,
+        digest=DIGEST,
+        peer=ME,
     )
     slot, gen_a = table.claim_with_generation(
         claim_id="a", owner_alive=lambda: alive["a"], **kwargs
@@ -629,7 +643,9 @@ def test_failed_grow_is_never_persisted(tmp_path, pools, monkeypatch):
 
 
 @pytest.mark.parametrize("op", ["shrink", "grow"])
-def test_resize_rechecks_ownership_under_the_slot_lock(tmp_path, pools, monkeypatch, op):
+def test_resize_rechecks_ownership_under_the_slot_lock(
+    tmp_path, pools, monkeypatch, op
+):
     table, _ = _table(tmp_path)
     alive = {"a": True, "b": True}
     slot = _claim(table, "a", total=2, minimum=2, maximum=8, alive=lambda: alive["a"])

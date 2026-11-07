@@ -203,15 +203,16 @@ class RegionPool:
         removed = [r for r in self._regions if r.index in wanted]
         if removed != self._regions[len(self._regions) - len(removed) :]:
             raise RegionBusy("only the highest regions can be removed")
-        # Punch first: a failure leaves the layout and generation untouched.
-        for region in removed:
-            if self._libc.fallocate(
-                self._fd, _FALLOC_PUNCH, region.offset, region.size
-            ):
-                error = ctypes.get_errno()
-                raise RegionBusy(
-                    f"cannot release region {region.index}: {os.strerror(error)}"
-                )
+        # Punch the whole suffix in one call, before any metadata change: a
+        # failure (an I/O error, not busyness) leaves layout and generation as is.
+        if removed and self._libc.fallocate(
+            self._fd,
+            _FALLOC_PUNCH,
+            removed[0].offset,
+            sum(region.size for region in removed),
+        ):
+            error = ctypes.get_errno()
+            raise OSError(error, f"cannot release regions: {os.strerror(error)}")
         self._unmap(removed)
         if removed:
             self._generation += 1

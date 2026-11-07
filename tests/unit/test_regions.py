@@ -117,7 +117,7 @@ def test_shrink_fallocate_failure_changes_nothing(pool, monkeypatch):
     pool.mark_quiescent(high.index)
     generation = pool.layout_generation
     monkeypatch.setattr(pool._libc, "fallocate", lambda *args: -1)
-    with pytest.raises(RegionBusy):
+    with pytest.raises(OSError):
         pool.shrink([high.index])
     assert pool.regions == (low, high) and pool.layout_generation == generation
 

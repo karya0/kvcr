@@ -1488,7 +1488,7 @@ class SlotTable:
         return regions, generation
 
     def shrink(self, name: str, peer: Any, indices: tuple[int, ...]):
-        from .protocol import REGION_BUSY, UNKNOWN_SLOT
+        from .protocol import INTERNAL, REGION_BUSY, UNKNOWN_SLOT
         from .regions import RegionBusy, UnknownRegion
 
         slot, generation_seen = self._owned(name, peer)
@@ -1502,6 +1502,8 @@ class SlotTable:
                 raise SlotError(REGION_BUSY, str(error)) from error
             except UnknownRegion as error:
                 raise SlotError(UNKNOWN_SLOT, f"unknown region {error}") from error
+            except OSError as error:  # the punch failed; the layout is untouched
+                raise SlotError(INTERNAL, str(error)) from error
             if slot.holder_conn is not None:
                 try:
                     self._send_layout(slot)
