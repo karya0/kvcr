@@ -1355,18 +1355,39 @@ class SlotTable:
             "layout_generation": slot.pool.layout_generation,
         }
         conn.settimeout(self.ensure_timeout_s)
-        socket.send_fds(
-            conn, [json.dumps(layout).encode() + b"\n"], slot.pool.pass_fd_list()
-        )
         line = b""
-        while not line.endswith(b"\n"):
-            chunk = conn.recv(_MAX_MESSAGE)
-            if not chunk or len(line) > _MAX_MESSAGE:
-                raise RuntimeError("holder closed before reporting")
-            line += chunk
+        try:
+            socket.send_fds(
+                conn, [json.dumps(layout).encode() + b"\n"], slot.pool.pass_fd_list()
+            )
+            while not line.endswith(b"\n"):
+                chunk = conn.recv(_MAX_MESSAGE)
+                if not chunk or len(line) > _MAX_MESSAGE:
+                    raise EOFError
+                line += chunk
+        except (EOFError, OSError) as error:
+            reason = self._holder_exit_reason(slot)
+            raise RuntimeError(
+                f"holder closed before reporting{f' ({reason})' if reason else ''}"
+            ) from error
         report = json.loads(line)
         slot.touched_bytes = report["touched_bytes"]
         slot.layout_generation = report["layout_generation"]
+
+    def _holder_exit_reason(self, slot: _Slot) -> str | None:
+        """The holder container's terminated reason (e.g. OOMKilled), if readable."""
+        try:
+            pod = self.broker.api.get(
+                "gaas-pool-" + self.broker._key(PoolClaim.parse(slot.holder))
+            )
+            for status in (pod or {}).get("status", {}).get("containerStatuses", []):
+                for key in ("state", "lastState"):
+                    reason = (status.get(key) or {}).get("terminated", {}).get("reason")
+                    if reason:
+                        return str(reason)
+        except Exception:  # best effort; never mask the original failure
+            pass
+        return None
 
     def _feed_holder(self, slot: _Slot) -> None:
         """Accept the toucher on its private socket and hand it the layout."""
