@@ -26,7 +26,9 @@ _FRAME_HEADER = struct.Struct("!I")
 _MAX_FRAME_BYTES = 1 << 20
 _TIMEOUT_SECONDS = 60.0
 _MAX_RECV_BATCH = 64
-_MAX_FDS = 2
+# Room for a v2 grant: pool, listener and region memfds. The expected count is
+# derived from the decoded message, so a larger buffer admits nothing extra.
+_MAX_FDS = 8
 _ENCODER = msgspec.msgpack.Encoder()
 _T = TypeVar("_T")
 

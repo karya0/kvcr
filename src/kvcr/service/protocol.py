@@ -132,8 +132,17 @@ ERROR_REASONS = frozenset(
 )
 
 
-# omit_defaults keeps a v1 claim byte-identical on the wire.
-class _Claim(msgspec.Struct, frozen=True, tag="claim", omit_defaults=True):
+def _require_literal_ipv4(host: str) -> None:
+    # A literal address, because the service binds this holding the lock
+    # every other pool needs, and resolving a name there would stall all
+    # of them for as long as the resolver takes.
+    try:
+        socket.inet_pton(socket.AF_INET, host)
+    except OSError as error:
+        raise ValueError(f"not a literal IPv4 address: {host}") from error
+
+
+class _Claim(msgspec.Struct, frozen=True, tag="claim"):
     guard_index: Annotated[int, msgspec.Meta(ge=0)]
     compatibility_digest: str
     tier_config: _TierConfig
@@ -141,8 +150,23 @@ class _Claim(msgspec.Struct, frozen=True, tag="claim", omit_defaults=True):
     control_port: Annotated[int, msgspec.Meta(ge=1, le=65535)]
     version: ProtocolVersion
     incarnation: Annotated[str, msgspec.Meta(min_length=1)] | None = None
-    tenant: str | None = None
-    lineage: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_literal_ipv4(self.control_host)
+
+
+class _ClaimV2(msgspec.Struct, frozen=True, tag="claim2"):
+    """A GaaS claim: a tenant/lineage slot with a byte budget. v1 stays _Claim."""
+
+    guard_index: Annotated[int, msgspec.Meta(ge=0)]
+    compatibility_digest: str
+    tier_config: _TierConfig
+    control_host: str
+    control_port: Annotated[int, msgspec.Meta(ge=1, le=65535)]
+    version: ProtocolVersion
+    tenant: Annotated[str, msgspec.Meta(min_length=1)]
+    lineage: Annotated[str, msgspec.Meta(min_length=1)]
+    incarnation: Annotated[str, msgspec.Meta(min_length=1)] | None = None
     total_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
     minimum_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
     maximum_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
@@ -150,15 +174,7 @@ class _Claim(msgspec.Struct, frozen=True, tag="claim", omit_defaults=True):
     state_agent: StateAgentSettings | None = None
 
     def __post_init__(self) -> None:
-        # A literal address, because the service binds this holding the lock
-        # every other pool needs, and resolving a name there would stall all
-        # of them for as long as the resolver takes.
-        try:
-            socket.inet_pton(socket.AF_INET, self.control_host)
-        except OSError as error:
-            raise ValueError(
-                f"not a literal IPv4 address: {self.control_host}"
-            ) from error
+        _require_literal_ipv4(self.control_host)
 
 
 class _Release(msgspec.Struct, frozen=True, tag="release"):
@@ -173,7 +189,7 @@ class _Heartbeat(msgspec.Struct, frozen=True, tag="heartbeat"):
     version: ProtocolVersion
 
 
-class _Granted(msgspec.Struct, frozen=True, tag="granted", omit_defaults=True):
+class _Granted(msgspec.Struct, frozen=True, tag="granted"):
     guard_index: int
     spec: KVCRPoolSpec
     tier_config: _TierConfig
@@ -181,11 +197,22 @@ class _Granted(msgspec.Struct, frozen=True, tag="granted", omit_defaults=True):
     version: ProtocolVersion
     dead_incarnations: tuple[str, ...] = ()
     heartbeat_enabled: bool = False
-    slot_name: str | None = None
-    effective_maximum_bytes: int | None = None
-    regions: tuple[PoolRegion, ...] = ()
-    layout_generation: int = 0
-    guard_endpoint: str | None = None
+
+
+class _GrantedV2(msgspec.Struct, frozen=True, tag="granted2"):
+    guard_index: int
+    spec: KVCRPoolSpec
+    tier_config: _TierConfig
+    pools: tuple[_PoolDescriptor, ...]
+    version: ProtocolVersion
+    slot_name: str
+    effective_maximum_bytes: int
+    regions: tuple[PoolRegion, ...]
+    layout_generation: int
+    claim_generation: int
+    guard_endpoint: str
+    dead_incarnations: tuple[str, ...] = ()
+    heartbeat_enabled: bool = False
 
 
 class _Grow(msgspec.Struct, frozen=True, tag="grow"):
@@ -218,16 +245,26 @@ class _Released(msgspec.Struct, frozen=True, tag="released"):
     version: ProtocolVersion
 
 
-class _Error(msgspec.Struct, frozen=True, tag="error", omit_defaults=True):
+class _Error(msgspec.Struct, frozen=True, tag="error"):
+    message: str
+    version: ProtocolVersion
+
+
+class _ErrorV2(msgspec.Struct, frozen=True, tag="error2"):
+    """An error with a reason code, sent only on v2 paths; v1 keeps _Error."""
+
     message: str
     version: ProtocolVersion
     reason: str = INTERNAL
 
 
-def _reason_error(reason: str, message: str) -> _Error:
+_ERRORS = (_Error, _ErrorV2)
+
+
+def _reason_error(reason: str, message: str) -> _ErrorV2:
     if reason not in ERROR_REASONS:
         raise ValueError(f"unknown error reason: {reason}")
-    return _Error(message, _PROTOCOL_VERSION, reason)
+    return _ErrorV2(message, _PROTOCOL_VERSION, reason)
 
 
 class _ServiceInfo(msgspec.Struct, frozen=True, tag="service_info"):
@@ -244,31 +281,33 @@ class _ServiceState(msgspec.Struct, frozen=True, tag="service_state"):
 
 
 def _claim_fd_counts(
-    request: "_Claim | _ServiceInfo | _Drain | _Grow | _Shrink",
+    request: "_Claim | _ClaimV2 | _ServiceInfo | _Drain | _Grow | _Shrink",
 ) -> tuple[int, ...]:
-    return (0, 1) if isinstance(request, _Claim) else (0,)
+    return (0, 1) if isinstance(request, (_Claim, _ClaimV2)) else (0,)
 
 
-def _response_fd_counts(response: "_Granted | _Error") -> tuple[int, ...]:
+def _response_fd_counts(response: "_Granted | _GrantedV2 | _Error | _ErrorV2"):
     """An error carries none; a grant the pool, then the control listener.
 
-    A v2 grant (slot present) appends one region memfd per distinct fd_index.
+    A v2 grant appends one region memfd per distinct fd_index.
     """
-    if isinstance(response, _Error):
+    if isinstance(response, _ERRORS):
         return (0,)
-    if response.slot_name is None:
+    if isinstance(response, _Granted):
         return (2,)
     return (2 + len({region.fd_index or 0 for region in response.regions} or {0}),)
 
 
 _CLAIM_DECODER = msgspec.msgpack.Decoder(
-    _Claim | _ServiceInfo | _Drain | _Grow | _Shrink
+    _Claim | _ClaimV2 | _ServiceInfo | _Drain | _Grow | _Shrink
 )
 _HOLD_DECODER = msgspec.msgpack.Decoder(_Heartbeat | _Release)
-_CLAIM_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Granted | _Error)
-_RESIZE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Grown | _Shrunk | _Error)
-_RELEASE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Released | _Error)
-_SERVICE_STATE_DECODER = msgspec.msgpack.Decoder(_ServiceState | _Error)
+_CLAIM_RESPONSE_DECODER = msgspec.msgpack.Decoder(
+    _Granted | _GrantedV2 | _Error | _ErrorV2
+)
+_RESIZE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Grown | _Shrunk | _Error | _ErrorV2)
+_RELEASE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Released | _Error | _ErrorV2)
+_SERVICE_STATE_DECODER = msgspec.msgpack.Decoder(_ServiceState | _Error | _ErrorV2)
 
 
 def _service_request(
@@ -282,7 +321,7 @@ def _service_request(
         channel = FramedConnection(connection)
         channel.send(request)
         response = channel.receive(_SERVICE_STATE_DECODER)
-    if isinstance(response, _Error):
+    if isinstance(response, _ERRORS):
         raise KVCRServiceError(response.message)
     return response.info
 
@@ -505,7 +544,7 @@ class KVCRClient:
             response, received_fds = connection.receive_with_fd(
                 _CLAIM_RESPONSE_DECODER, _response_fd_counts
             )
-            if isinstance(response, _Error):
+            if isinstance(response, _ERRORS):
                 raise KVCRServiceError(response.message)
             pool_fd, listener_fd, *region_fds = received_fds
             for region_fd in region_fds:  # v2 region memfds: not mapped by v1 code
@@ -597,7 +636,7 @@ def _grant_layout(
 def _send_release(connection: FramedConnection, *, activated: bool = True) -> None:
     connection.send(_Release(_PROTOCOL_VERSION, activated))
     response = connection.receive(_RELEASE_RESPONSE_DECODER)
-    if isinstance(response, _Error):
+    if isinstance(response, _ERRORS):
         raise KVCRServiceError(response.message)
 
 
