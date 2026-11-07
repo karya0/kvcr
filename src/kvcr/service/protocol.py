@@ -799,6 +799,8 @@ def _map_data_pool(
     granted = sum(region.size for region in response.regions)
     if len(response.pools) != 1:
         problem = f"{len(response.pools)} pools; a v2 data pool is one pool"
+    elif gaas.total_bytes is None:
+        problem = "no total_bytes requested"
     elif granted != gaas.total_bytes:
         problem = f"granted {granted} bytes, requested total {gaas.total_bytes}"
     elif granted % response.pools[0].block_size_bytes:

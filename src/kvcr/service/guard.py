@@ -264,9 +264,12 @@ class _RecoveryState:
             logger.warning("KVCR pool has no recovered state to promote")
         else:
             try:
+                header = self.attachment.layout_digest()
+                # All zeros: the claimant wrote no digest, so no records either.
                 if (
                     self.layout_digest is not None
-                    and self.attachment.layout_digest() != self.layout_digest()
+                    and header != bytes(LAYOUT_DIGEST_BYTES)
+                    and header != self.layout_digest()
                 ):
                     raise RecoveryJournalError(
                         "data pool layout differs from the claimant's; "
