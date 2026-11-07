@@ -30,6 +30,7 @@ from ..runtime.control_channels import KVCRServiceError, ZmqPeerControlChannel
 from ..runtime.core import _BlockRecord, _KVCRCore
 from ..types import BlockKey, PoolBlockLayouts
 from .memory import (
+    LAYOUT_DIGEST_BYTES,
     KVCRPoolAttachment,
     KVCRPoolSpec,
     _KVCRPoolOwner,
@@ -194,6 +195,10 @@ class _RecoveryState:
         self.mirror: _RecoveryMirror | None = None
         # Recovered half a Guard cannot serve; kept for the next primary, which can.
         self._g3_records: dict[BlockKey, tuple[_G3Residency, int]] = {}
+        # v2: digest of the region table this Guard registered; the claimant must
+        # have written the same one in the journal header, or its records are not
+        # at the offsets this Guard serves.
+        self.layout_digest: bytes | None = None
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
@@ -225,6 +230,8 @@ class _RecoveryState:
         if self.mirror is None:
             self.mirror = _RecoveryMirror(tuple(pool.name for pool in self.pools))
         self._journal.reset()
+        if self.layout_digest is not None:  # until the claimant writes its own
+            self.attachment.set_layout_digest(bytes(LAYOUT_DIGEST_BYTES))
 
     def poll(self) -> bool:
         """Mirror one bounded journal batch; True if more may remain."""
@@ -255,6 +262,14 @@ class _RecoveryState:
             logger.warning("KVCR pool has no recovered state to promote")
         else:
             try:
+                if (
+                    self.layout_digest is not None
+                    and self.attachment.layout_digest() != self.layout_digest
+                ):
+                    raise RecoveryJournalError(
+                        "data pool layout differs from the claimant's; "
+                        "refusing its records (stale_layout)"
+                    )
                 # The primary is gone, so there is no more journal traffic coming.
                 for frame in self._journal.drain():
                     mirror.apply(*frame)
@@ -400,6 +415,7 @@ class _Guard:
         # Owned by the current primary.
         self._control: ZmqPeerControlChannel | None = None
         self._configured: _TierConfig | None = None
+        self._data_pool: tuple[int, int, bytes] | None = None
         self._recovery = _RecoveryState(spec, compatibility_digest, pool_sizes_bytes)
         self._core = None
         # Released cores still registering; _poll closes each once registered.
@@ -458,14 +474,21 @@ class _Guard:
         self._thread.start()
 
     def claim(
-        self, liveness: PidfdLiveness, tier_config: _TierConfig, bind: tuple[str, int]
+        self,
+        liveness: PidfdLiveness,
+        tier_config: _TierConfig,
+        bind: tuple[str, int],
+        data_pool: tuple[int, int, bytes] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give this pool group to a primary, with its Guard's endpoint.
         Reserved on the requesting thread: a mid-transition pool answers busy
-        immediately instead of queueing the claimant.
+        immediately instead of queueing the claimant. ``data_pool`` is a v2 slot's
+        (address, bytes, region-table digest) already mapped in this process.
         """
         self._reserve_claim()
-        return self._submit(_Command("claim", (liveness, tier_config, bind)))
+        return self._submit(
+            _Command("claim", (liveness, tier_config, bind, data_pool))
+        )
 
     def release(self, lease: "_Lease") -> None:
         """End a lease. The pool keeps its Guard, and the Guard its records."""
@@ -812,7 +835,11 @@ class _Guard:
         return True
 
     def _claim(
-        self, liveness: PidfdLiveness, tier_config: _TierConfig, bind: tuple[str, int]
+        self,
+        liveness: PidfdLiveness,
+        tier_config: _TierConfig,
+        bind: tuple[str, int],
+        data_pool: tuple[int, int, bytes] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give the pool to a primary, and take up the endpoint it named.
         All fallible work runs before the lease exists, and commit and refusal
@@ -821,6 +848,10 @@ class _Guard:
         listener, bound_here = self._pool_lease.bind(bind)
         granted_fd = -1
         try:
+            if data_pool is not None and len(tier_config.pool_layouts) != 1:
+                raise KVCRServiceError("a v2 data pool is one pool")
+            self._data_pool = data_pool
+            self._recovery.layout_digest = data_pool and data_pool[2]
             granted_fd = os.dup(listener.fileno())
             # from_shared_listener detaches its argument; give it a duplicate.
             duplicate = socket.socket(fileno=os.dup(listener.fileno()))
@@ -1100,17 +1131,19 @@ class _Guard:
     def _prepare_core(self) -> None:
         """Register the Guard's pool without accepting control traffic."""
 
-        dram = LocalDramOptions(
-            [
+        if self._data_pool is not None:
+            address, size, _digest = self._data_pool
+            pools = [(self._recovery.pools[0].name, address, size)]
+        else:
+            pools = [
                 (
                     pool.name,
                     self._recovery.attachment.address + pool.offset_bytes,
                     pool.size_bytes,
                 )
                 for pool in self._recovery.pools
-            ],
-            self._configured.remote_fw_dram_backend,
-        )
+            ]
+        dram = LocalDramOptions(pools, self._configured.remote_fw_dram_backend)
         self._log_promotion_stage("core_init_start")
         core = _KVCRCore(
             KVCRConfig(

@@ -70,6 +70,7 @@ from .protocol import (
     _Shrink,
     _Shrunk,
     _TierConfig,
+    region_table_digest,
 )
 
 logger = logging.getLogger(__name__)
@@ -226,6 +227,7 @@ class _PoolRegistry:
         tier_config: _TierConfig,
         liveness: PidfdLiveness,
         control_bind: tuple[str, int],
+        data_pool: tuple[int, int, bytes] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give a pool group to a primary and return its Guard endpoint.
 
@@ -234,7 +236,9 @@ class _PoolRegistry:
         """
         if self._refusing.is_set():
             raise KVCRServiceError("KVCR pool registry is closed")
-        return self._guard(guard_index).claim(liveness, tier_config, control_bind)
+        return self._guard(guard_index).claim(
+            liveness, tier_config, control_bind, data_pool
+        )
 
     def release(self, guard_index: int, lease: "_Lease") -> None:
         self._guard(guard_index).release(lease)
@@ -732,6 +736,14 @@ class _ThreadingUnixServer(
                 request.tier_config,
                 liveness,
                 (request.control_host, request.control_port),
+                # The Guard serves this slot's regions, already mapped here.
+                None
+                if slot is None
+                else (
+                    slot.pool.address(slot.pool.regions[0]),
+                    slot.pool.used_bytes,
+                    region_table_digest(slot.pool.regions),
+                ),
             )
             if guard is None:
                 raise KVCRServiceError("KVCR claim succeeded without a Guard")
