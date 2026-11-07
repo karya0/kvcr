@@ -3,12 +3,13 @@
 """Synthetic v2 claimant against an in-process service (Linux only)."""
 
 import json
+import logging
 import mmap
 import sys
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -24,9 +25,30 @@ from test_kvcr_service import (  # noqa: F401 - _channels_are_taken is an autous
 from test_node_service import _SPECS, make_broker
 from test_node_service_v2 import HEADROOM, pools  # noqa: F401 - fixture
 
-from kvcr.runtime.control_channels import KVCRMsgFramingError
+from kvcr.config import (
+    GaaSSettings,
+    KVCRBackendConfigs,
+    KVCRConfig,
+    KVCRGuardConfig,
+    RemoteFWDramOptions,
+)
+from kvcr.runtime.control_channels import (
+    FramedConnection,
+    KVCRMsgFramingError,
+    KVCRServiceError,
+)
 from kvcr.service import claimant
 from kvcr.service.node_service import SlotTable
+from kvcr.service.protocol import (
+    KVCRClient,
+    KVCRServiceReasonError,
+    _Claim,
+    _ClaimV2,
+    _Error,
+    _ErrorV2,
+    _service_error,
+)
+from kvcr.service.recovery_journal import claim_guarded_pool
 
 PAGE = mmap.PAGESIZE
 
@@ -175,3 +197,146 @@ def test_readiness_wait_is_shared_by_service_and_protocol():
     from kvcr.service.protocol import READINESS_WAIT_S
 
     assert broker_module.READINESS_WAIT_S == READINESS_WAIT_S == 180.0
+
+
+def _claim(harness, pages=(4, 2, 8)):
+    total, minimum, maximum = pages
+    return harness.client.claim(
+        0,
+        [("pool0", 1024)],
+        _TEST_DIGEST,
+        _control_bind(0),
+        gaas=GaaSSettings("t", "l", total * PAGE, minimum * PAGE, maximum * PAGE),
+        receive_timeout_s=10,
+    )
+
+
+def test_client_v2_claim_keeps_the_slot_and_regions(tmp_path, pools):  # noqa: F811
+    server, table = _serve(tmp_path)
+    with server as harness:
+        _attach(harness, table)
+        hold = _claim(harness)
+        try:
+            assert hold.slot_name == "t/l/0"
+            assert (hold.claim_generation, hold.layout_generation) == (1, 1)
+            assert hold.effective_maximum_bytes >= 8 * PAGE
+            assert sum(r.size for r in hold.regions) == 4 * PAGE
+            # The descriptors: one memfd per distinct fd_index.
+            assert len(hold.region_fds) == len({r.fd_index or 0 for r in hold.regions})
+            assert hold.guard_endpoint == "%s:%d" % _control_bind(0)
+            # The same mapping path as v1: the pool is attached and described.
+            assert [name for name, _, _ in hold.local_dram.pools] == ["pool0"]
+        finally:
+            hold.release()
+        assert not table.get("t/l/0").held
+        assert hold.region_fds == []
+
+
+def test_client_without_tenant_and_lineage_sends_the_v1_claim(tmp_path):
+    sent = []
+    real = FramedConnection.send_with_fd
+
+    def spy(self, message, *fds):
+        sent.append(type(message))
+        return real(self, message, *fds)
+
+    with _running_server(tmp_path) as harness, patch.object(
+        FramedConnection, "send_with_fd", spy
+    ):
+        for gaas in (None, GaaSSettings()):
+            hold = harness.client.claim(
+                0, [("pool0", 1024)], _TEST_DIGEST, _control_bind(0), gaas=gaas
+            )
+            assert hold.slot_name is None and hold.regions == ()
+            hold.release()
+    assert sent == [_Claim, _Claim]
+
+
+def test_client_v2_claim_is_a_claim_v2_and_v1_server_refuses_it(tmp_path):
+    sent = []
+    real = FramedConnection.send_with_fd
+
+    def spy(self, message, *fds):
+        sent.append(type(message))
+        return real(self, message, *fds)
+
+    with _running_server(tmp_path) as harness, patch.object(
+        FramedConnection, "send_with_fd", spy
+    ):
+        with pytest.raises(KVCRServiceReasonError) as refused:
+            _claim(harness)
+    assert sent == [_ClaimV2]
+    assert refused.value.reason == "not_implemented"
+
+
+def test_client_surfaces_the_error_reason(tmp_path, pools):  # noqa: F811
+    server, table = _serve(tmp_path, pages=3)
+    with server as harness:
+        _attach(harness, table)
+        with pytest.raises(KVCRServiceReasonError) as refused:
+            _claim(harness, pages=(8, 4, 8))
+    assert refused.value.reason == "capacity_below_minimum"
+    assert "capacity_below_minimum" in str(refused.value)
+    assert isinstance(refused.value, KVCRServiceError)
+
+
+def test_service_error_keeps_v1_errors_plain():
+    error = _service_error(_ErrorV2("m", 1, "slot_held"))
+    assert (error.reason, error.message) == ("slot_held", "m")
+    assert not isinstance(_service_error(_Error("m", 1)), KVCRServiceReasonError)
+
+
+def test_client_grow_and_shrink_bump_the_layout_generation(tmp_path, pools):  # noqa: F811
+    server, table = _serve(tmp_path)
+    with server as harness:
+        _attach(harness, table)
+        hold = _claim(harness)
+        try:
+            grown = harness.client.grow("t/l/0", 2 * PAGE, hold.claim_generation)
+            assert grown.layout_generation == 2
+            assert sum(r.size for r in grown.regions) == 2 * PAGE
+            shrunk = harness.client.shrink(
+                "t/l/0",
+                tuple(r.index for r in grown.regions),
+                hold.claim_generation,
+            )
+            assert shrunk.layout_generation == 3
+            with pytest.raises(KVCRServiceReasonError) as refused:
+                harness.client.grow("nobody/x/0", PAGE, 1)
+            assert refused.value.reason == "unknown_slot"
+        finally:
+            hold.release()
+
+
+def test_claim_guarded_pool_logs_the_v2_grant(tmp_path, pools, caplog):  # noqa: F811
+    server, table = _serve(tmp_path)
+    host, port = _control_bind(0)
+    framework = Mock(control_bind_address=lambda: (host, port))
+    with server as harness:
+        _attach(harness, table)
+        guard_config = KVCRGuardConfig(
+            str(harness.server.socket_path),
+            0,
+            _TEST_DIGEST,
+            gaas=GaaSSettings("t", "l", 4 * PAGE, 2 * PAGE, 8 * PAGE),
+        )
+        with (
+            patch("kvcr.service.recovery_journal.read_handback"),
+            caplog.at_level(logging.INFO, logger="kvcr.service.recovery_journal"),
+        ):
+            claimed = claim_guarded_pool(
+                KVCRConfig("agent", [("pool0", 1024)]),
+                guard_config,
+                Mock(framework_control=framework),
+                KVCRBackendConfigs(remote_fw_dram=RemoteFWDramOptions()),
+            )
+        try:
+            assert claimed.hold.slot_name == "t/l/0"
+        finally:
+            claimed.hold.release()
+    messages = [r.getMessage() for r in caplog.records if "gaas claim" in r.getMessage()]
+    assert len(messages) == 1
+    assert messages[0].startswith(
+        "gaas claim granted slot=t/l/0 claim_gen=1 layout_gen=1 effective_max="
+    )
+    assert messages[0].endswith(f"regions=1 guard={host}:{port}")

@@ -4,7 +4,7 @@
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import msgspec
 
@@ -132,7 +132,44 @@ class KVCRConfig(msgspec.Struct, frozen=True):
     startup_timeout_seconds: int | None = None
 
 
+class GaaSSettings(msgspec.Struct, frozen=True):
+    """GaaS claim settings; names mirror the v2 claim.
+
+    The v2 claim is selected iff tenant and lineage are both set; otherwise the
+    claim stays v1. state_agent and placement are mappings validated when the
+    claim is built.
+    """
+
+    tenant: str | None = None
+    lineage: str | None = None
+    total_bytes: int | None = None
+    minimum_bytes: int | None = None
+    maximum_bytes: int | None = None
+    state_agent: dict[str, Any] | None = None
+    placement: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if (self.tenant is None) != (self.lineage is None):
+            raise ValueError("GaaS tenant and lineage must be set together")
+        if self.tenant is None and any(
+            value is not None
+            for value in (
+                self.total_bytes,
+                self.minimum_bytes,
+                self.maximum_bytes,
+                self.state_agent,
+                self.placement,
+            )
+        ):
+            raise ValueError("GaaS settings need tenant and lineage")
+
+    @property
+    def is_v2(self) -> bool:
+        return self.tenant is not None
+
+
 class KVCRGuardConfig(msgspec.Struct, frozen=True):
     kvcr_service_socket_path: str
     guard_index: int
     compatibility_digest: str
+    gaas: GaaSSettings | None = None

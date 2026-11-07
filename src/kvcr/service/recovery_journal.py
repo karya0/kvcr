@@ -508,7 +508,19 @@ def claim_guarded_pool(
         bind_address(),
         backend_configs.g3,
         backend_configs.remote_fw_dram.backend,
+        gaas=guard_config.gaas,
     )
+    if hold.slot_name is not None:
+        logger.info(
+            "gaas claim granted slot=%s claim_gen=%d layout_gen=%d "
+            "effective_max=%d regions=%d guard=%s",
+            hold.slot_name,
+            hold.claim_generation,
+            hold.layout_generation,
+            hold.effective_maximum_bytes,
+            len(hold.regions),
+            hold.guard_endpoint,
+        )
     # The lease is live from here, and the caller cannot release what it has not
     # been handed yet: anything that fails before this returns has to give the pool
     # back itself or leave it held until the process exits.

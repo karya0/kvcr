@@ -19,7 +19,7 @@ from typing import Annotated, Any, Literal
 import msgspec
 
 from ..backends.local_disk import _normalize_g3_backend_options
-from ..config import G3Options, LocalDramOptions, _validate_pool_layouts
+from ..config import G3Options, GaaSSettings, LocalDramOptions, _validate_pool_layouts
 from ..runtime.control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
@@ -54,6 +54,15 @@ def populate_wait_s(data_bytes: int, base_s: float = READINESS_WAIT_S) -> float:
     so the floor is about 40% of the 1-CPU rate.
     """
     return base_s + data_bytes / POPULATE_RATE_FLOOR_BYTES_PER_S
+
+
+def claim_wait_s(data_bytes: int) -> float:
+    """How long a v2 claimant waits for its grant.
+
+    The service spends up to READINESS_WAIT_S on the holder pod, then
+    populate_wait_s() on its report; wait 20 s longer than both.
+    """
+    return READINESS_WAIT_S + populate_wait_s(data_bytes) + 20
 
 
 class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -278,6 +287,20 @@ class _ErrorV2(msgspec.Struct, frozen=True, tag="error2"):
 _ERRORS = (_Error, _ErrorV2)
 
 
+class KVCRServiceReasonError(KVCRServiceError):
+    """A v2 refusal; ``reason`` is one of ERROR_REASONS, ``message`` the service's."""
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(f"{message} (reason: {reason})")
+        self.message, self.reason = message, reason
+
+
+def _service_error(response: "_Error | _ErrorV2") -> KVCRServiceError:
+    if isinstance(response, _ErrorV2):
+        return KVCRServiceReasonError(response.message, response.reason)
+    return KVCRServiceError(response.message)
+
+
 def _reason_error(reason: str, message: str) -> _ErrorV2:
     if reason not in ERROR_REASONS:
         raise ValueError(f"unknown error reason: {reason}")
@@ -446,6 +469,14 @@ class KVCRPoolHold:
     _incarnation: str | None = None
     _dead_incarnations: tuple[str, ...] = ()
     _heartbeat_enabled: bool = False
+    # v2 grants only: the slot and its regions; region fds are owned by the hold.
+    slot_name: str | None = None
+    claim_generation: int | None = None
+    layout_generation: int | None = None
+    effective_maximum_bytes: int | None = None
+    regions: tuple[PoolRegion, ...] = ()
+    region_fds: list[int] = field(default_factory=list, repr=False)
+    guard_endpoint: str | None = None
     _release_attempted: bool = field(default=False, init=False, repr=False)
     _heartbeat_stop: threading.Event = field(
         default_factory=threading.Event, init=False
@@ -474,6 +505,27 @@ class KVCRPoolHold:
         adopt(self._control_listener_fd)
         self._control_listener_fd = None
 
+    def _stop_local_access(self) -> None:
+        self._attachment.close()
+        self._heartbeat_stop.set()
+        for fd in (self._control_listener_fd, *self.region_fds):
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        self._control_listener_fd = None
+        self.region_fds.clear()
+
+    def close_local(self) -> None:
+        """Stop local access and drop the connection without releasing the lease.
+
+        The service frees the lease when this process dies, as on a crash.
+        """
+        if self._release_attempted:
+            return
+        self._stop_local_access()
+        self._release_attempted = True
+        _close_quietly(self._connection)
+
     def release(self, *, activated: bool = True) -> None:
         """Stop local access before releasing the connection-scoped lease.
 
@@ -482,12 +534,7 @@ class KVCRPoolHold:
         """
         if self._release_attempted:
             return
-        self._attachment.close()
-        self._heartbeat_stop.set()
-        if self._control_listener_fd is not None:
-            with contextlib.suppress(OSError):
-                os.close(self._control_listener_fd)
-            self._control_listener_fd = None
+        self._stop_local_access()
         self._release_attempted = True
 
         try:
@@ -517,8 +564,16 @@ class KVCRClient:
         control_bind: tuple[str, int],
         g3: G3Options | None = None,
         remote_fw_dram_backend: str = "UCX",
+        *,
+        gaas: GaaSSettings | None = None,
+        receive_timeout_s: float | None = None,
     ) -> KVCRPoolHold:
-        """Claim and map one Guard-owned pool group."""
+        """Claim and map one Guard-owned pool group.
+
+        With ``gaas`` carrying tenant and lineage this sends the v2 claim and the
+        returned hold also names the slot and its regions; otherwise the v1 claim
+        goes out unchanged. ``receive_timeout_s`` overrides the v2 grant wait.
+        """
         g3_config = g3 and {
             "paths": [str(path.expanduser().resolve()) for path in g3.paths],
             "capacity_bytes_per_file": g3.capacity_bytes_per_file,
@@ -527,26 +582,48 @@ class KVCRClient:
         }
         # msgspec.convert validates where __init__ would not: bad pool layout,
         # port or G3 path fails here, not at the service.
-        request = msgspec.convert(
-            {
-                "guard_index": guard_index,
-                "compatibility_digest": compatibility_digest,
-                "tier_config": {
-                    "pool_layouts": pool_layouts,
-                    "g3": g3_config,
-                    "remote_fw_dram_backend": remote_fw_dram_backend,
-                },
-                "control_host": control_bind[0],
-                "control_port": control_bind[1],
-                "version": _PROTOCOL_VERSION,
-                "incarnation": uuid.uuid4().hex,
+        fields: dict[str, Any] = {
+            "guard_index": guard_index,
+            "compatibility_digest": compatibility_digest,
+            "tier_config": {
+                "pool_layouts": pool_layouts,
+                "g3": g3_config,
+                "remote_fw_dram_backend": remote_fw_dram_backend,
             },
-            type=_Claim,
-        )
+            "control_host": control_bind[0],
+            "control_port": control_bind[1],
+            "version": _PROTOCOL_VERSION,
+            "incarnation": uuid.uuid4().hex,
+        }
+        v2 = gaas is not None and gaas.is_v2
+        if v2:
+            fields.update(
+                {
+                    name: getattr(gaas, name)
+                    for name in (
+                        "tenant",
+                        "lineage",
+                        "total_bytes",
+                        "minimum_bytes",
+                        "maximum_bytes",
+                        "state_agent",
+                        "placement",
+                    )
+                }
+            )
+        request = msgspec.convert(fields, type=_ClaimV2 if v2 else _Claim)
         connection = FramedConnection.connect(self._socket_path)
+        if v2:
+            # connect() leaves its short timeout.
+            connection._connection.settimeout(
+                receive_timeout_s
+                if receive_timeout_s is not None
+                else claim_wait_s(gaas.maximum_bytes or gaas.total_bytes or 0)
+            )
         attachment: KVCRPoolAttachment | None = None
         listener_fd: int | None = None
         pool_fd: int | None = None
+        region_fds: list[int] = []
         grant_received = False
         try:
             try:
@@ -562,10 +639,12 @@ class KVCRClient:
                 _CLAIM_RESPONSE_DECODER, _response_fd_counts
             )
             if isinstance(response, _ERRORS):
-                raise KVCRServiceError(response.message)
+                raise _service_error(response)
             pool_fd, listener_fd, *region_fds = received_fds
-            for region_fd in region_fds:  # v2 region memfds: not mapped by v1 code
-                os.close(region_fd)
+            if not isinstance(response, _GrantedV2):  # v1 maps none of them
+                for region_fd in region_fds:
+                    os.close(region_fd)
+                region_fds = []
             grant_received = True
             spec, granted_pools = _grant_layout(
                 response, guard_index, request.tier_config
@@ -591,11 +670,12 @@ class KVCRClient:
                 _incarnation=request.incarnation,
                 _dead_incarnations=response.dead_incarnations,
                 _heartbeat_enabled=response.heartbeat_enabled,
+                **(_slot_fields(response, region_fds) if v2 else {}),
             )
         except BaseException as error:
             # Release the lease only after local access has stopped, or the
             # next claimant could map bytes this process can still reach.
-            for leftover in (listener_fd, pool_fd):
+            for leftover in (listener_fd, pool_fd, *region_fds):
                 if leftover is not None:
                     with contextlib.suppress(OSError):
                         os.close(leftover)
@@ -618,8 +698,60 @@ class KVCRClient:
             raise
 
 
+    def grow(
+        self,
+        slot_name: str,
+        additional_bytes: int,
+        claim_generation: int,
+        split: int | None = None,
+    ) -> _Grown:
+        """Add bytes to a slot as new regions; the new regions' fds are not sent."""
+        return self._resize(
+            _Grow(
+                _PROTOCOL_VERSION,
+                slot_name,
+                additional_bytes,
+                claim_generation,
+                split,
+            )
+        )
+
+    def shrink(
+        self, slot_name: str, region_indices: tuple[int, ...], claim_generation: int
+    ) -> _Shrunk:
+        """Drop regions from a slot; each must be unmapped by the caller first."""
+        return self._resize(
+            _Shrink(_PROTOCOL_VERSION, slot_name, tuple(region_indices), claim_generation)
+        )
+
+    def _resize(self, request: "_Grow | _Shrink") -> Any:
+        # A fresh connection per call: the claim's own connection carries only
+        # the lease.
+        connection = FramedConnection.connect(self._socket_path)
+        try:
+            connection.send(request)
+            response = connection.receive(_RESIZE_RESPONSE_DECODER)
+        finally:
+            connection.close()
+        if isinstance(response, _ERRORS):
+            raise _service_error(response)
+        return response
+
+
+def _slot_fields(response: _GrantedV2, region_fds: list[int]) -> dict[str, Any]:
+    return {
+        "slot_name": response.slot_name,
+        "claim_generation": response.claim_generation,
+        "layout_generation": response.layout_generation,
+        "effective_maximum_bytes": response.effective_maximum_bytes,
+        "regions": response.regions,
+        "region_fds": region_fds,
+        "guard_endpoint": response.guard_endpoint,
+    }
+
+
 def _grant_layout(
-    response: _Granted,
+    response: "_Granted | _GrantedV2",
     requested_guard_index: int,
     requested_tier_config: _TierConfig,
 ) -> tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...]]:
