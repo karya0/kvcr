@@ -1360,6 +1360,13 @@ class SlotTable:
 
     # -- holder upkeep (caller holds slot.lock) -----------------------------
 
+    def _holder_wait_s(self, slot: _Slot) -> float:
+        """Holder wait: readiness base plus populate time for the whole layout."""
+        from .protocol import populate_wait_s
+
+        total = sum(r.size for r in slot.pool.regions)
+        return populate_wait_s(total, self.ensure_timeout_s)
+
     def _send_layout(self, slot: _Slot) -> None:
         """Send the whole layout plus the pool fds; store the holder's report."""
         conn = slot.holder_conn
@@ -1370,7 +1377,8 @@ class SlotTable:
             ],
             "layout_generation": slot.pool.layout_generation,
         }
-        conn.settimeout(self.ensure_timeout_s)
+        wait_s = self._holder_wait_s(slot)
+        conn.settimeout(wait_s)
         line = b""
         try:
             socket.send_fds(
@@ -1383,7 +1391,7 @@ class SlotTable:
                 line += chunk
         except TimeoutError as error:
             raise RuntimeError(
-                f"holder did not report within {self.ensure_timeout_s:.0f} s"
+                f"holder did not report within {wait_s:.0f} s"
             ) from error
         except (EOFError, OSError) as error:
             reason = self._holder_exit_reason(slot)
@@ -1425,7 +1433,7 @@ class SlotTable:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
             listener.bind(path)
             listener.listen(1)
-            listener.settimeout(self.ensure_timeout_s)
+            listener.settimeout(self._holder_wait_s(slot))
             try:
                 slot.holder_conn, _ = listener.accept()
             finally:

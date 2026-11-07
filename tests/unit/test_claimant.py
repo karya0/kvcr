@@ -131,7 +131,7 @@ def test_mapping_failure_frees_the_claim_and_exits_2(
         assert not table.get("t/l/0").held
 
 
-def test_default_receive_timeout_covers_the_service_ensure(monkeypatch):
+def test_receive_timeout_defaults_to_computed_wait(monkeypatch):
     seen = {}
 
     def capture(self, argv=None, namespace=None):
@@ -141,7 +141,7 @@ def test_default_receive_timeout_covers_the_service_ensure(monkeypatch):
     monkeypatch.setattr(claimant.argparse.ArgumentParser, "parse_args", capture)
     with pytest.raises(SystemExit):
         claimant.main([])
-    assert seen["actions"]["receive_timeout_s"].default >= 180
+    assert seen["actions"]["receive_timeout_s"].default is None
 
 
 @pytest.mark.parametrize("error", [EOFError("eof"), KVCRMsgFramingError("bad frame")])
@@ -153,3 +153,17 @@ def test_eof_and_framing_errors_exit_2_as_transport(error, capsys, monkeypatch):
     code = claimant.main(["--socket", "s", "--tenant", "t", "--lineage", "l"])
     assert code == 2
     assert '"reason": "transport"' in capsys.readouterr().out.replace('":"', '": "')
+
+
+def test_receive_timeout_default_outlasts_the_server_wait():
+    def args(**kw):
+        base = {"receive_timeout_s": None, "total_bytes": 0, "maximum_bytes": 0}
+        return claimant.argparse.Namespace(**{**base, **kw})
+
+    gib = 1 << 30
+    assert claimant._receive_timeout_s(args(maximum_bytes=150 * gib)) == 500
+    assert claimant._receive_timeout_s(args(total_bytes=62 * gib)) == 324
+    assert (
+        claimant._receive_timeout_s(args(maximum_bytes=150 * gib, receive_timeout_s=7))
+        == 7
+    )
