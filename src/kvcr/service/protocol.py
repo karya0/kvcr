@@ -41,6 +41,19 @@ _HEARTBEAT_SECONDS = 0.05
 # A missed deadline SIGKILLs the primary, so keep the floor clear of GC pauses.
 _MIN_HEARTBEAT_TIMEOUT_SECONDS = 20 * _HEARTBEAT_SECONDS
 
+POPULATE_RATE_FLOOR_BYTES_PER_S = 512 << 20
+
+
+def populate_wait_s(data_bytes: int, base_s: float = 180.0) -> float:
+    """Seconds to wait for a holder to populate ``data_bytes`` of pool memory.
+
+    ``base_s`` covers pod readiness and handshake; the rest assumes the holder
+    populates (MADV_POPULATE_WRITE) at no less than 0.5 GiB/s. Measured in
+    c5-repro-cpuquota-20261107.txt: 1.23 GiB/s at 1 CPU, 0.115 GiB/s at 0.1 CPU,
+    so the floor is about 40% of the 1-CPU rate.
+    """
+    return base_s + data_bytes / POPULATE_RATE_FLOOR_BYTES_PER_S
+
 
 class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     # Constrained here because the claimant that opens G3 under these terms is a

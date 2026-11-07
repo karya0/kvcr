@@ -21,7 +21,7 @@ if sys.platform != "linux":
 from test_node_service import FakeAPI, make_broker
 from test_node_service_v2 import DIGEST, HEADROOM, PAGE, _claim
 
-from kvcr.service import holder
+from kvcr.service import holder, protocol
 from kvcr.service.memory import KVCRPoolSpec, _pool_filename
 from kvcr.service.node_service import PoolClaim, SlotError, SlotTable
 from kvcr.service.protocol import (
@@ -242,6 +242,59 @@ def test_slot_claim_feeds_toucher(tmp_path):
     finally:
         thread.join(10)
         table.release("t/l/0")
+
+
+def test_slow_holder_wait_is_size_aware(tmp_path, monkeypatch):
+    # 4 pages at this floor add 1 s to the 1 s base, so the report wait is 2 s.
+    monkeypatch.setattr(protocol, "POPULATE_RATE_FLOOR_BYTES_PER_S", 4 * PAGE)
+    api = _ToucherAPI()
+    broker = make_broker(tmp_path, api)
+    broker.toucher = True
+    table = SlotTable(
+        broker, HEADROOM + 64 * PAGE, ensure_timeout_s=1, require_pod_identity=False
+    )
+    done = threading.Event()
+
+    def silent_holder():
+        while not api.creates:
+            time.sleep(0.01)
+        args = api.creates[0]["spec"]["containers"][0]["args"]
+        conn = holder.connect(args[1], 10)
+        done.wait(10)  # takes the layout but never reports
+        conn.close()
+
+    thread = threading.Thread(target=silent_holder)
+    thread.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(Exception, match=r"holder did not report within 2 s"):
+            _claim(table)
+        assert time.monotonic() - started >= 1.9
+    finally:
+        done.set()
+        thread.join(10)
+
+
+def test_populate_falls_back_when_madvise_fails(capsys, monkeypatch):
+    monkeypatch.setattr(holder, "_MADV_POPULATE_WRITE", 9999)  # EINVAL
+    fd = os.memfd_create("t")
+    os.ftruncate(fd, 2 * PAGE)
+    supervisor, worker = socket.socketpair()
+    mappings = {}
+    region = {"index": 0, "offset": 0, "size": 2 * PAGE, "fd_index": 0}
+    _send_layout(supervisor, [region], 1, [fd])
+    assert holder.handle_layout(worker, mappings) is True
+    assert _read_report(supervisor) == {
+        "touched_bytes": 2 * PAGE,
+        "layout_generation": 1,
+    }
+    events = [json.loads(x)["holder"] for x in capsys.readouterr().err.splitlines()]
+    assert events == ["populate_start", "populate_fallback", "populate_end"]
+    for view, _size in mappings.values():
+        view.close()
+    os.close(fd)
+    supervisor.close()
+    worker.close()
 
 
 UID = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"

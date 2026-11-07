@@ -39,6 +39,7 @@ from kvcr.service.protocol import (
     _send_release,
     _Shrink,
     _TierConfig,
+    populate_wait_s,
 )
 
 _STRIDE = 1 << 20
@@ -117,6 +118,12 @@ def _tier_config(text: str) -> _TierConfig:
     return _TierConfig(layouts, None)
 
 
+def _receive_timeout_s(args: argparse.Namespace) -> float:
+    if args.receive_timeout_s is not None:
+        return args.receive_timeout_s
+    return populate_wait_s(args.maximum_bytes or args.total_bytes) + 20
+
+
 def run(args: argparse.Namespace) -> None:
     request = _ClaimV2(
         args.guard_index,
@@ -133,9 +140,9 @@ def run(args: argparse.Namespace) -> None:
         maximum_bytes=args.maximum_bytes,
     )
     connection = FramedConnection.connect(args.socket)
-    # connect() leaves its 60 s timeout; a queued claim waits up to the
-    # service's 180 s ensure, so the grant is awaited with a longer one (200 s).
-    connection._connection.settimeout(args.receive_timeout_s)
+    # connect() leaves its 60 s timeout; the service waits populate_wait_s() for
+    # the holder, so the grant is awaited 20 s longer unless set explicitly.
+    connection._connection.settimeout(_receive_timeout_s(args))
     fds: list[int] = []
     views: dict = {}
     try:
@@ -250,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tier-config", default="pool0:1024", help="NAME:BLOCK,...")
     parser.add_argument("--control-host", default="127.0.0.1")
     parser.add_argument("--control-port", type=int, default=5555)
-    parser.add_argument("--receive-timeout-s", type=float, default=200)
+    parser.add_argument("--receive-timeout-s", type=float, default=None)
     parser.add_argument(
         "--mode", choices=("write", "verify", "grow-shrink"), default="write"
     )

@@ -250,3 +250,13 @@ def test_server_rejects_resize_with_a_reason(tmp_path, request_):
         response = _send_raw_request(harness.server.socket_path, request_)
     assert isinstance(response, _ErrorV2)
     assert response.reason == NOT_IMPLEMENTED
+
+
+@pytest.mark.parametrize(
+    ("gib", "seconds"), [(0, 180), (62, 304), (150, 480), (256, 692)]
+)
+def test_populate_wait_s(gib, seconds):
+    from kvcr.service.protocol import populate_wait_s
+
+    assert populate_wait_s(gib << 30) == seconds
+    assert populate_wait_s(gib << 30, 10) == seconds - 170

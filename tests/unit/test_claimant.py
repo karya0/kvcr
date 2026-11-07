@@ -153,3 +153,17 @@ def test_eof_and_framing_errors_exit_2_as_transport(error, capsys, monkeypatch):
     code = claimant.main(["--socket", "s", "--tenant", "t", "--lineage", "l"])
     assert code == 2
     assert '"reason": "transport"' in capsys.readouterr().out.replace('":"', '": "')
+
+
+def test_receive_timeout_default_outlasts_the_server_wait():
+    def args(**kw):
+        base = {"receive_timeout_s": None, "total_bytes": 0, "maximum_bytes": 0}
+        return claimant.argparse.Namespace(**{**base, **kw})
+
+    gib = 1 << 30
+    assert claimant._receive_timeout_s(args(maximum_bytes=150 * gib)) == 500
+    assert claimant._receive_timeout_s(args(total_bytes=62 * gib)) == 324
+    assert (
+        claimant._receive_timeout_s(args(maximum_bytes=150 * gib, receive_timeout_s=7))
+        == 7
+    )
