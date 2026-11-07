@@ -25,7 +25,6 @@ from test_claimant import (  # noqa: F401 - fixtures
 from test_kvcr_service import _channels_are_taken  # noqa: F401 - autouse fixture
 from test_node_service_v2 import pools  # noqa: F401 - fixture
 
-from kvcr.runtime.control_channels import KVCRServiceError
 from kvcr.service import guard as guard_module
 from kvcr.service.protocol import (
     DATA_POOL_LAYOUT,
@@ -119,7 +118,7 @@ def test_two_pool_tier_fails_closed(tmp_path, pools):  # noqa: F811
 
         from kvcr.config import GaaSSettings
 
-        with pytest.raises(KVCRServiceError, match="one pool"):
+        with pytest.raises(KVCRServiceReasonError, match="one pool") as refused:
             harness.client.claim(
                 0,
                 [("a", 1024), ("b", 1024)],
@@ -128,6 +127,7 @@ def test_two_pool_tier_fails_closed(tmp_path, pools):  # noqa: F811
                 gaas=GaaSSettings("t", "l", 4 * PAGE, 4 * PAGE, 4 * PAGE),
                 receive_timeout_s=10,
             )
+        assert refused.value.reason == DATA_POOL_LAYOUT
 
 
 def test_guard_registers_the_regions_not_pool_rank(tmp_path, pools):  # noqa: F811
@@ -138,12 +138,8 @@ def test_guard_registers_the_regions_not_pool_rank(tmp_path, pools):  # noqa: F8
         hold = _claim(harness)
         try:
             slot_pool = table.get("t/l/0").pool
-            expected = (
-                slot_pool.address(slot_pool.regions[0]),
-                4 * PAGE,
-                region_table_digest(slot_pool.regions),
-            )
-            assert guard._data_pool == expected
+            expected = (slot_pool.address(slot_pool.regions[0]), 4 * PAGE)
+            assert guard._data_pool[:2] == expected
             # The real _prepare_core, with the core mocked: which range it registers.
             del guard._prepare_core
             with patch.object(guard_module, "_KVCRCore") as core:
@@ -179,5 +175,70 @@ def test_guard_refuses_records_written_under_another_layout(
             assert records == {}
             refused = any("stale_layout" in m for m in caplog.messages)
             assert refused is skew
+        finally:
+            hold.release()
+
+
+def test_region_digest_names_the_backing_not_only_the_geometry():
+    regions = (PoolRegion(0, 0, PAGE, 0),)
+    first, second = _memfd(1), _memfd(1)
+    try:
+        same = region_table_digest(regions, [first])
+        assert same == region_table_digest(regions, [first])
+        assert same != region_table_digest(regions, [second])  # same geometry
+        assert same != region_table_digest(regions, [first], "other-slot")
+    finally:
+        os.close(first)
+        os.close(second)
+
+
+def test_guard_drops_records_when_the_slot_backing_changed(
+    tmp_path,
+    pools,  # noqa: F811
+    caplog,
+):
+    """Slot A's journal over slot B's memfd of identical geometry is cold."""
+    server, table = _serve(tmp_path)
+    with server as harness:
+        _attach(harness, table)
+        guard = harness.server._server.registry._guards[0]
+        hold = _claim(harness)
+        try:
+            other = _memfd(4)
+            try:
+                hold._attachment.set_layout_digest(
+                    region_table_digest(
+                        hold.regions, [other], hold.slot_name, hold.claim_generation
+                    )
+                )
+                with caplog.at_level(logging.WARNING):
+                    assert guard._recovery.take_for_promotion() == {}
+                assert any("stale_layout" in m for m in caplog.messages)
+            finally:
+                os.close(other)
+        finally:
+            hold.release()
+
+
+def test_shrink_after_claim_changes_the_live_digest_and_drops_records(
+    tmp_path,
+    pools,  # noqa: F811
+    caplog,
+):
+    server, table = _serve(tmp_path)
+    with server as harness:
+        _attach(harness, table)
+        guard = harness.server._server.registry._guards[0]
+        hold = _claim(harness)
+        try:
+            slot = table.get("t/l/0")
+            claim_time = guard._recovery.layout_digest()
+            assert hold._attachment.layout_digest() == claim_time
+            slot.pool.mark_quiescent(slot.pool.regions[-1].index)
+            slot.pool.shrink((slot.pool.regions[-1].index,))
+            assert guard._recovery.layout_digest() != claim_time
+            with caplog.at_level(logging.WARNING):
+                assert guard._recovery.take_for_promotion() == {}
+            assert any("stale_layout" in m for m in caplog.messages)
         finally:
             hold.release()

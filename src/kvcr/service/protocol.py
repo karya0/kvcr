@@ -136,11 +136,23 @@ class PoolRegion(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     fd_index: Annotated[int, msgspec.Meta(ge=0)] | None = None
 
 
-def region_table_digest(regions: tuple[PoolRegion, ...]) -> bytes:
-    """Names the layout of a v2 data pool; the claimant records it in the journal
-    header and the Guard refuses to adopt records written under another one."""
+def region_table_digest(
+    regions: tuple[PoolRegion, ...],
+    fds: list[int],
+    slot_name: str = "",
+    claim_generation: int = 0,
+) -> bytes:
+    """Names the layout and backing of a v2 data pool; the claimant records it in
+    the journal header and the Guard refuses to adopt records written under
+    another one. ``fds`` are the region memfds by fd_index: their (st_dev, st_ino)
+    tell one slot's memory from another's of the same geometry."""
+    backing = []
+    for fd in fds:
+        stat = os.fstat(fd)
+        backing.append((stat.st_dev, stat.st_ino))
     table = [(r.index, r.offset, r.size, r.fd_index or 0) for r in regions]
-    return hashlib.sha256(msgspec.msgpack.encode(table)).digest()
+    packed = msgspec.msgpack.encode((table, backing, slot_name, claim_generation))
+    return hashlib.sha256(packed).digest()
 
 
 # Reason codes carried by _Error; a client branches on these, not on message.
@@ -675,7 +687,14 @@ class KVCRClient:
             if v2:
                 # The data pool is the granted regions; pool_fd keeps the journal.
                 data_map = _map_data_pool(response, gaas, region_fds)
-                attachment.set_layout_digest(region_table_digest(response.regions))
+                attachment.set_layout_digest(
+                    region_table_digest(
+                        response.regions,
+                        region_fds,
+                        response.slot_name,
+                        response.claim_generation,
+                    )
+                )
                 dram_pools = [
                     (granted_pools[0].name, data_map.address, data_map.size_bytes)
                 ]

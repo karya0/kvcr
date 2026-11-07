@@ -18,6 +18,7 @@ import struct
 import sys
 import threading
 import time
+from collections.abc import Callable
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from types import FrameType
@@ -51,6 +52,7 @@ from .protocol import (
     _PROTOCOL_VERSION,
     INTERNAL,
     NOT_IMPLEMENTED,
+    KVCRServiceReasonError,
     PidfdLiveness,
     _Claim,
     _claim_fd_counts,
@@ -227,7 +229,7 @@ class _PoolRegistry:
         tier_config: _TierConfig,
         liveness: PidfdLiveness,
         control_bind: tuple[str, int],
-        data_pool: tuple[int, int, bytes] | None = None,
+        data_pool: tuple[int, int, Callable[[], bytes]] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give a pool group to a primary and return its Guard endpoint.
 
@@ -398,6 +400,15 @@ class _PoolRegistry:
         self.on_uncontained_failure(error)
 
 
+def _live_layout_digest(slot: Any, claim_generation: int) -> bytes:
+    """The slot's layout now, so a Grow or Shrink after the claim changes it."""
+    pool = slot.pool
+    try:
+        return region_table_digest(pool.regions, [pool.fd], slot.name, claim_generation)
+    except OSError:  # the pool is closed: nothing matches
+        return b""
+
+
 def _open_pool_fd(spec: KVCRPoolSpec) -> int:
     """A fresh open-file-description of the pool: flock belongs to it, so the
     claimant's lock stays independent of the Guard's, as with a path open."""
@@ -539,6 +550,8 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 response, grant = self.server.dispatch(request, liveness)
         except SlotError as error:
             response = _reason_error(error.reason, str(error))
+        except KVCRServiceReasonError as error:
+            response = _reason_error(error.reason, error.message)
         except KVCRServiceError as error:
             response = _Error(str(error), _PROTOCOL_VERSION)
         except Exception:  # noqa: BLE001 - report internal claim failures
@@ -742,7 +755,7 @@ class _ThreadingUnixServer(
                 else (
                     slot.pool.address(slot.pool.regions[0]),
                     slot.pool.used_bytes,
-                    region_table_digest(slot.pool.regions),
+                    lambda: _live_layout_digest(slot, generation),
                 ),
             )
             if guard is None:

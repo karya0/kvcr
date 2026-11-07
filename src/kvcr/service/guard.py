@@ -37,6 +37,8 @@ from .memory import (
 )
 from .protocol import (
     _MIN_HEARTBEAT_TIMEOUT_SECONDS,
+    DATA_POOL_LAYOUT,
+    KVCRServiceReasonError,
     PidfdLiveness,
     _PoolDescriptor,
     _TierConfig,
@@ -198,7 +200,7 @@ class _RecoveryState:
         # v2: digest of the region table this Guard registered; the claimant must
         # have written the same one in the journal header, or its records are not
         # at the offsets this Guard serves.
-        self.layout_digest: bytes | None = None
+        self.layout_digest: Callable[[], bytes] | None = None
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
@@ -264,7 +266,7 @@ class _RecoveryState:
             try:
                 if (
                     self.layout_digest is not None
-                    and self.attachment.layout_digest() != self.layout_digest
+                    and self.attachment.layout_digest() != self.layout_digest()
                 ):
                     raise RecoveryJournalError(
                         "data pool layout differs from the claimant's; "
@@ -415,7 +417,7 @@ class _Guard:
         # Owned by the current primary.
         self._control: ZmqPeerControlChannel | None = None
         self._configured: _TierConfig | None = None
-        self._data_pool: tuple[int, int, bytes] | None = None
+        self._data_pool: tuple[int, int, Callable[[], bytes]] | None = None
         self._recovery = _RecoveryState(spec, compatibility_digest, pool_sizes_bytes)
         self._core = None
         # Released cores still registering; _poll closes each once registered.
@@ -478,7 +480,7 @@ class _Guard:
         liveness: PidfdLiveness,
         tier_config: _TierConfig,
         bind: tuple[str, int],
-        data_pool: tuple[int, int, bytes] | None = None,
+        data_pool: tuple[int, int, Callable[[], bytes]] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give this pool group to a primary, with its Guard's endpoint.
         Reserved on the requesting thread: a mid-transition pool answers busy
@@ -837,7 +839,7 @@ class _Guard:
         liveness: PidfdLiveness,
         tier_config: _TierConfig,
         bind: tuple[str, int],
-        data_pool: tuple[int, int, bytes] | None = None,
+        data_pool: tuple[int, int, Callable[[], bytes]] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give the pool to a primary, and take up the endpoint it named.
         All fallible work runs before the lease exists, and commit and refusal
@@ -847,7 +849,9 @@ class _Guard:
         granted_fd = -1
         try:
             if data_pool is not None and len(tier_config.pool_layouts) != 1:
-                raise KVCRServiceError("a v2 data pool is one pool")
+                raise KVCRServiceReasonError(
+                    "a v2 data pool is one pool", DATA_POOL_LAYOUT
+                )
             self._data_pool = data_pool
             self._recovery.layout_digest = data_pool and data_pool[2]
             granted_fd = os.dup(listener.fileno())
