@@ -43,7 +43,7 @@ from .memory import (
     _reclaim_pool_if_orphaned,
     _unlink_if_identity,
 )
-from .node_service import SlotError, SlotTable
+from .node_service import InClusterPodAPI, NodeBroker, SlotError, SlotTable
 from .protocol import (
     _CLAIM_DECODER,
     _HOLD_DECODER,
@@ -1031,6 +1031,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="never place pools on hugetlbfs",
     )
     parser.add_argument(
+        "--slot-cap-bytes",
+        type=int,
+        help="enable the v2 slot server with this node capacity (bytes)",
+    )
+    parser.add_argument("--holder-image", help="digest-pinned holder image")
+    parser.add_argument("--namespace", default=os.environ.get("POD_NAMESPACE"))
+    parser.add_argument("--node-name", default=os.environ.get("NODE_NAME"))
+    parser.add_argument("--manager-id", default="gaas")
+    parser.add_argument(
+        "--slot-root",
+        help="private holder socket/state dir (default: the socket's directory)",
+    )
+    parser.add_argument(
+        "--require-pod-identity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="slots: pod UID from /proc/<pid>/cgroup (needs hostPID)",
+    )
+    parser.add_argument(
         "--log-level",
         type=str.upper,
         choices=_LOG_LEVELS,
@@ -1065,7 +1084,43 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--heartbeat-timeout-ms must be at least 1000 and finite")
     if args.startup_timeout_seconds is not None and args.startup_timeout_seconds <= 0:
         parser.error("--startup-timeout-seconds must be positive")
+    if args.slot_cap_bytes is not None:
+        if args.slot_cap_bytes <= 0:
+            parser.error("--slot-cap-bytes must be positive")
+        if not (args.holder_image and args.namespace and args.node_name):
+            parser.error("slots require --holder-image, --namespace and --node-name")
+        if args.require_pod_identity and not _host_proc_visible():
+            parser.error(
+                "pod identity needs hostPID (/proc/1/cgroup is not the host's); "
+                "set hostPID or pass --no-require-pod-identity"
+            )
     return args
+
+
+def _host_proc_visible() -> bool:
+    """True when /proc shows host processes: pid 1 is outside our own cgroup."""
+    try:
+        with open("/proc/1/cgroup", encoding="utf-8") as init:
+            with open("/proc/self/cgroup", encoding="utf-8") as own:
+                return init.read() != own.read()
+    except OSError:
+        return False
+
+
+def _build_slots(args: argparse.Namespace) -> SlotTable | None:
+    if args.slot_cap_bytes is None:
+        return None
+    broker = NodeBroker(
+        namespace=args.namespace,
+        node_name=args.node_name,
+        manager_id=args.manager_id,
+        image=args.holder_image,
+        socket_root=args.slot_root or Path(args.socket_path).resolve().parent,
+        api=InClusterPodAPI(args.namespace),
+    )
+    return SlotTable(
+        broker, args.slot_cap_bytes, require_pod_identity=args.require_pod_identity
+    )
 
 
 def main() -> None:
@@ -1111,6 +1166,7 @@ def main() -> None:
                         else None
                     ),
                     startup_timeout_seconds=args.startup_timeout_seconds,
+                    slots=_build_slots(args),
                 )
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                 logger.info(

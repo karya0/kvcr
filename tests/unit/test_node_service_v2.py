@@ -22,7 +22,7 @@ from test_kvcr_service import _running_server
 from test_node_service import _CLAIM, _SPECS, FakeAPI, make_broker
 
 from kvcr.runtime.control_channels import FramedConnection
-from kvcr.service import holder, node_service
+from kvcr.service import holder, node_service, server
 from kvcr.service.node_service import SlotError, SlotTable, effective_grant
 from kvcr.service.protocol import (
     _RESIZE_RESPONSE_DECODER,
@@ -689,3 +689,29 @@ def test_v1_claim_is_refused_on_a_slot_service(tmp_path, pools):
     with pytest.raises(SlotError) as raised:
         _ThreadingUnixServer.dispatch(server, request, SimpleNamespace())
     assert raised.value.reason == NOT_IMPLEMENTED
+
+
+_SLOT_ARGS = (
+    "--socket-path s --pool-dir d --guard-count 1 --pool-sizes-gb 1 "
+    "--compatibility-digest g --slot-cap-bytes 1048576 --namespace bench "
+    "--node-name node-a --no-require-pod-identity"
+).split()
+_HOLDER = "reg/holder@sha256:" + "a" * 64
+
+
+def test_service_main_builds_the_slot_table(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "InClusterPodAPI", lambda namespace: FakeAPI())
+    args = server._parse_args(
+        _SLOT_ARGS + ["--holder-image", _HOLDER, "--slot-root", str(tmp_path)]
+    )
+    args.socket_path = str(tmp_path / "service.sock")
+    table = server._build_slots(args)
+    assert isinstance(table, SlotTable)
+    assert table.cap_bytes == 1048576 and not table.require_pod_identity
+    assert table.broker.image == _HOLDER and table.broker.node_name == "node-a"
+    assert server._build_slots(server._parse_args(_SLOT_ARGS[:10])) is None
+
+
+def test_service_slots_require_a_holder_image():
+    with pytest.raises(SystemExit):
+        server._parse_args(_SLOT_ARGS)
