@@ -185,6 +185,20 @@ def test_toucher_pod_is_guaranteed_and_v1_unchanged(tmp_path):
     assert "readinessProbe" not in container
 
 
+def test_toucher_memory_covers_page_tables(tmp_path):
+    v2 = make_broker(tmp_path, _ToucherAPI())
+    v2.toucher = True
+    state = {"pod_name": "gaas-pool-x", "creation_id": "c", "socket_path": "/n/p/s.sock"}
+
+    def limit_mib(gib):
+        pod = v2._pod(PoolClaim("p1", gib, DIGEST), state)
+        return int(pod["spec"]["containers"][0]["resources"]["limits"]["memory"][:-2])
+
+    # shmem page tables cost data / 512; the 46 GiB c5 pool was OOM-killed at +128 MiB.
+    assert 46 * 1024 + 92 + 128 <= limit_mib(46) <= 46 * 1024 + 92 + 128 + 1
+    assert limit_mib(1) <= 1024 + 131
+
+
 def test_slot_claim_feeds_toucher(tmp_path):
     api = _ToucherAPI()
     broker = make_broker(tmp_path, api)

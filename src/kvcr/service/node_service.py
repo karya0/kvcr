@@ -43,6 +43,11 @@ _LABEL = "kvcr.nvidia.com/manager"
 _ANNOTATION = "kvcr.nvidia.com/"
 _MAX_MESSAGE = 65536
 _TOUCHER_OVERHEAD_BYTES = 128 << 20
+
+
+def _toucher_overhead_bytes(data_bytes: int) -> int:
+    """Fixed holder RSS plus the page tables for 4 KiB shmem pages (data / 512)."""
+    return _TOUCHER_OVERHEAD_BYTES + -(-data_bytes // 512)
 _LINEAGE_LABEL = "nvidia.com/dynamo-graph-deployment-name"
 _DYNAMO_NAMESPACE_LABEL = "nvidia.com/dynamo-namespace"
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
@@ -404,8 +409,13 @@ class NodeBroker:
     def _toucher_pod(
         self, pod: dict[str, Any], claim: PoolClaim, state: dict[str, Any]
     ) -> dict[str, Any]:
-        """Guaranteed QoS: fractional CPU, memory = pool maximum + overhead."""
-        memory = f"{(claim.data_bytes + _TOUCHER_OVERHEAD_BYTES) >> 20}Mi"
+        """Guaranteed QoS: fractional CPU, memory = pool maximum + overhead.
+
+        The overhead is a fixed part plus page tables, which the holder's memcg is
+        charged for; sized any lower, populating a full pool is OOM-killed.
+        """
+        total = claim.data_bytes + _toucher_overhead_bytes(claim.data_bytes)
+        memory = f"{-(-total // (1 << 20))}Mi"
         spec = pod["spec"]
         container = spec["containers"][0]
         container["command"] = ["python", "-m", "kvcr.service.holder"]
