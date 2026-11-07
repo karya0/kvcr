@@ -80,6 +80,24 @@ def test_shrink_highest_only_and_reuse(pool):
     assert again.index not in (low.index, high.index)
 
 
+def test_shrink_punches_the_suffix_in_one_fallocate(pool, monkeypatch):
+    first, second, third = pool.grow(3 * PAGE, split=3)
+    for region in (second, third):
+        pool.mark_quiescent(region.index)
+    calls = []
+    real = pool._libc.fallocate
+
+    def fallocate(*args):
+        calls.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(pool._libc, "fallocate", fallocate)
+    pool.shrink([second.index, third.index])
+    assert len(calls) == 1
+    assert calls[0][2:] == (second.offset, second.size + third.size)
+    assert pool.regions == (first,)
+
+
 def test_close_frees_fd():
     pool = RegionPool.create(2 * PAGE)
     fd = pool.fd

@@ -715,3 +715,14 @@ def test_service_main_builds_the_slot_table(tmp_path, monkeypatch):
 def test_service_slots_require_a_holder_image():
     with pytest.raises(SystemExit):
         server._parse_args(_SLOT_ARGS)
+
+
+def test_resize_recheck_rejects_a_slot_vacated_after_the_check(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    granted = _claim_raw(table)
+    slot = table.get("t/l/0")
+    table._recheck_owner(slot, ME, granted.claim_generation)  # still held: fine
+    slot.owner_alive = None  # released between _owned and slot.lock
+    with pytest.raises(SlotError) as error:
+        table._recheck_owner(slot, ME, granted.claim_generation)
+    assert error.value.reason == IDENTITY_MISMATCH

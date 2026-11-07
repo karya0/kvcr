@@ -1438,7 +1438,11 @@ class SlotTable:
         """Under ``slot.lock``: the validated claim must still own the slot."""
         from .protocol import IDENTITY_MISMATCH
 
-        if slot.claim_generation != generation or not same_peer(slot.peer, peer):
+        if (
+            slot.claim_generation != generation
+            or not slot.held
+            or not same_peer(slot.peer, peer)
+        ):
             raise SlotError(
                 IDENTITY_MISMATCH, f"slot {slot.name} changed owner during the resize"
             )

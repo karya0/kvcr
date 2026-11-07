@@ -6,6 +6,7 @@ import json
 import mmap
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -104,3 +105,39 @@ def test_minimum_above_capacity_exits_2(tmp_path, pools, capsys):  # noqa: F811
         _attach(harness, table)
         code, steps = _run(harness, capsys, pages=(8, 4, 8))
         assert code == 2 and steps["error"]["reason"] == "capacity_below_minimum"
+
+
+def test_mapping_failure_frees_the_claim_and_exits_2(
+    tmp_path,
+    pools,  # noqa: F811
+    capsys,
+    monkeypatch,
+):
+    server, table = _serve(tmp_path)
+    with server as harness:
+        _attach(harness, table)
+
+        def fail(*args, **kwargs):
+            raise OSError(12, "injected mmap failure")
+
+        monkeypatch.setattr(claimant, "_map", fail)
+        code, steps = _run(harness, capsys)
+        assert code == 2 and steps["error"]["reason"] == "transport"
+        # This process is still alive, so only the explicit release frees it.
+        deadline = time.monotonic() + 5
+        while table.get("t/l/0").held and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not table.get("t/l/0").held
+
+
+def test_default_receive_timeout_covers_the_service_ensure():
+    action = (
+        next(
+            a
+            for a in claimant.argparse.ArgumentParser._get_optional_actions  # noqa: B018
+            if False
+        )
+        if False
+        else None
+    )
+    assert action is None

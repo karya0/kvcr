@@ -21,6 +21,7 @@ import json
 import mmap
 import os
 import signal
+import socket
 import struct
 import sys
 import uuid
@@ -135,6 +136,8 @@ def run(args: argparse.Namespace) -> None:
     # connect() leaves its 60 s timeout; a queued claim waits up to the
     # service's 180 s ensure, so the grant is awaited with a longer one (200 s).
     connection._connection.settimeout(args.receive_timeout_s)
+    fds: list[int] = []
+    views: dict = {}
     try:
         # The worker pidfd lets the service watch this process, as the v1 client does.
         pidfd = os.pidfd_open(os.getpid())
@@ -157,7 +160,8 @@ def run(args: argparse.Namespace) -> None:
             layout_generation=grant.layout_generation,
             claim_generation=grant.claim_generation,
         )
-        views = {r.index: (_map(region_fds, r), r) for r in grant.regions}
+        for r in grant.regions:
+            views[r.index] = (_map(region_fds, r), r)
         _mode(args, grant, region_fds, views)
         if args.release:
             _send_release(connection)
@@ -169,6 +173,11 @@ def run(args: argparse.Namespace) -> None:
             connection.send(_Release(_PROTOCOL_VERSION, False))
         raise
     finally:
+        for view, _region in views.values():
+            view.close()
+        for fd in fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
         connection.close()
 
 
@@ -255,6 +264,12 @@ def main(argv: list[str] | None = None) -> int:
     except _Failure as failure:
         _step("error", reason=failure.reason, message=str(failure))
         return failure.code
+    except (TimeoutError, socket.timeout) as error:
+        _step("error", reason="timeout", message=str(error))
+        return 2
+    except OSError as error:  # includes ConnectionError
+        _step("error", reason="transport", message=str(error))
+        return 2
     return 0
 
 
