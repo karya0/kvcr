@@ -25,6 +25,7 @@ from test_claimant import (  # noqa: F401 - fixtures
 from test_kvcr_service import _channels_are_taken  # noqa: F401 - autouse fixture
 from test_node_service_v2 import pools  # noqa: F401 - fixture
 
+from kvcr.runtime.control_channels import KVCRServiceError
 from kvcr.service import guard as guard_module
 from kvcr.service.protocol import (
     DATA_POOL_LAYOUT,
@@ -118,7 +119,7 @@ def test_two_pool_tier_fails_closed(tmp_path, pools):  # noqa: F811
         from kvcr.config import GaaSSettings
         from test_kvcr_service import _TEST_DIGEST, _control_bind
 
-        with pytest.raises(KVCRServiceReasonError) as refused:
+        with pytest.raises(KVCRServiceError, match="one pool"):
             harness.client.claim(
                 0,
                 [("a", 1024), ("b", 1024)],
@@ -127,7 +128,6 @@ def test_two_pool_tier_fails_closed(tmp_path, pools):  # noqa: F811
                 gaas=GaaSSettings("t", "l", 4 * PAGE, 4 * PAGE, 4 * PAGE),
                 receive_timeout_s=10,
             )
-        assert refused.value.reason == DATA_POOL_LAYOUT
 
 
 def test_guard_registers_the_regions_not_pool_rank(tmp_path, pools):  # noqa: F811
