@@ -661,9 +661,11 @@ class _ThreadingUnixServer(
         registry: _PoolRegistry,
         compatibility_digest: str,
         slots: "SlotTable | None" = None,
+        advertise_host: str | None = None,
     ) -> None:
         self.registry = registry
         self.slots = slots
+        self.advertise_host = advertise_host
         registry.on_uncontained_failure = self.fail
         self.compatibility_digest = compatibility_digest
         self._fatal_error: BaseException | None = None
@@ -751,6 +753,7 @@ class _ThreadingUnixServer(
                 heartbeat_enabled=guard.heartbeat_enabled,
             )
         else:
+            host = getattr(self, "advertise_host", None) or request.control_host
             granted = _GrantedV2(
                 *common,
                 slot_name=slot.name,
@@ -758,8 +761,9 @@ class _ThreadingUnixServer(
                 regions=slot.pool.regions,
                 layout_generation=slot.pool.layout_generation,
                 claim_generation=generation,
-                # The Guard binds the claimant-requested control address.
-                guard_endpoint=f"{request.control_host}:{request.control_port}",
+                # The Guard binds the claimant-requested control address; the
+                # grant advertises a reachable host when one is configured.
+                guard_endpoint=f"{host}:{request.control_port}",
                 dead_incarnations=guard.dead_incarnations,
                 heartbeat_enabled=guard.heartbeat_enabled,
             )
@@ -810,6 +814,7 @@ class _KVCRService:
         heartbeat_timeout_seconds: float | None = None,
         startup_timeout_seconds: int | None = None,
         slots: SlotTable | None = None,
+        advertise_host: str | None = None,
     ) -> None:
         try:
             probe_pidfd = os.pidfd_open(os.getpid())
@@ -837,7 +842,11 @@ class _KVCRService:
         )
         try:
             self._server = _ThreadingUnixServer(
-                self.socket_path, self._registry, compatibility_digest, slots
+                self.socket_path,
+                self._registry,
+                compatibility_digest,
+                slots,
+                advertise_host,
             )
             socket_stat = self.socket_path.stat(follow_symlinks=False)
             self._socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
@@ -1038,6 +1047,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--holder-image", help="digest-pinned holder image")
     parser.add_argument("--namespace", default=os.environ.get("POD_NAMESPACE"))
     parser.add_argument("--node-name", default=os.environ.get("NODE_NAME"))
+    parser.add_argument(
+        "--advertise-host",
+        default=os.environ.get("KVCR_ADVERTISE_HOST"),
+        help="host in v2 grants' guard_endpoint (default: the claim's control host)",
+    )
     parser.add_argument("--manager-id", default="gaas")
     parser.add_argument(
         "--slot-root",
@@ -1168,6 +1182,7 @@ def main() -> None:
                     ),
                     startup_timeout_seconds=args.startup_timeout_seconds,
                     slots=_build_slots(args),
+                    advertise_host=args.advertise_host,
                 )
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                 logger.info(

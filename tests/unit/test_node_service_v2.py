@@ -623,6 +623,53 @@ def test_server_path_waiters_keep_fifo_after_slot_held_replies(tmp_path, pools):
     assert server_claim("b") == "admitted"
 
 
+def test_server_path_grant_advertises_a_reachable_guard_endpoint(tmp_path, pools):
+    from types import SimpleNamespace
+
+    from kvcr.service.protocol import PidfdLiveness, _ClaimV2, _TierConfig
+    from kvcr.service.server import _ThreadingUnixServer
+
+    table, _ = _table(tmp_path)
+    guard = SimpleNamespace(dead_incarnations=(), heartbeat_enabled=False)
+
+    class Registry:
+        _guards = {0: guard}
+
+        def claim(self, *args):
+            return None, None, -1, None
+
+    def endpoint(advertise_host, incarnation):
+        server = SimpleNamespace(
+            compatibility_digest=DIGEST,
+            slots=table,
+            registry=Registry(),
+            advertise_host=advertise_host,
+        )
+        request = _ClaimV2(
+            0,
+            DIGEST,
+            _TierConfig([("pool", 4096)], None),
+            "0.0.0.0",
+            55001,
+            1,
+            "t",
+            "l",
+            incarnation,
+            total_bytes=4 * PAGE,
+            minimum_bytes=2 * PAGE,
+        )
+        liveness = PidfdLiveness(os.pidfd_open(os.getpid()))
+        try:
+            granted, _ = _ThreadingUnixServer.dispatch(server, request, liveness, ME)
+        finally:
+            liveness.close()
+        return granted.guard_endpoint
+
+    assert endpoint(None, "a") == "0.0.0.0:55001"
+    table.vacate("t/l/0", ME, 1)
+    assert endpoint("10.1.2.3", "a") == "10.1.2.3:55001"
+
+
 def test_claim_returns_its_own_generation(tmp_path, pools):
     table, _ = _table(tmp_path)
     alive = {"a": True, "b": True}
