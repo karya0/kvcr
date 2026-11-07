@@ -16,9 +16,11 @@ Run as ``python -m kvcr.service.claimant --socket <path> --tenant T --lineage L`
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import mmap
 import os
+import signal
 import struct
 import sys
 import uuid
@@ -31,6 +33,7 @@ from kvcr.service.protocol import (
     _RESIZE_RESPONSE_DECODER,
     _ClaimV2,
     _Grow,
+    _Release,
     _response_fd_counts,
     _send_release,
     _Shrink,
@@ -130,7 +133,7 @@ def run(args: argparse.Namespace) -> None:
     )
     connection = FramedConnection.connect(args.socket)
     # connect() leaves its 60 s timeout; a queued claim waits up to the
-    # service's 180 s ensure, so the grant is awaited with the longer one.
+    # service's 180 s ensure, so the grant is awaited with a longer one (200 s).
     connection._connection.settimeout(args.receive_timeout_s)
     try:
         # The worker pidfd lets the service watch this process, as the v1 client does.
@@ -159,6 +162,12 @@ def run(args: argparse.Namespace) -> None:
         if args.release:
             _send_release(connection)
             _step("released")
+    except BaseException:
+        # Bare EOF frees nothing: the lease and slot would stay held until this
+        # process dies. Say the claim was never served; best effort, no reply awaited.
+        with contextlib.suppress(BaseException):
+            connection.send(_Release(_PROTOCOL_VERSION, False))
+        raise
     finally:
         connection.close()
 
@@ -226,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tier-config", default="pool0:1024", help="NAME:BLOCK,...")
     parser.add_argument("--control-host", default="127.0.0.1")
     parser.add_argument("--control-port", type=int, default=5555)
-    parser.add_argument("--receive-timeout-s", type=float, default=180)
+    parser.add_argument("--receive-timeout-s", type=float, default=200)
     parser.add_argument(
         "--mode", choices=("write", "verify", "grow-shrink"), default="write"
     )
@@ -234,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.socket:
         parser.error("--socket or KVCR_SERVICE_SOCKET is required")
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # release before dying
     try:
         run(args)
     except _Failure as failure:
