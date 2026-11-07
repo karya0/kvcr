@@ -833,6 +833,13 @@ class NodeBroker:
         return errors
 
 
+def same_peer(a: Any, b: Any) -> bool:
+    """Same pod when both know their pod UID, else the same (pid, uid)."""
+    if len(a) > 2 and len(b) > 2 and a[2] and b[2]:
+        return a[2] == b[2]
+    return tuple(a[:2]) == tuple(b[:2])
+
+
 class SlotError(Exception):
     """A v2 claim or resize refused with a protocol reason code."""
 
@@ -991,7 +998,7 @@ class SlotTable:
         """The claimant released its lease: free the slot, keep pool and holder."""
         with self._lock:
             slot = self._slots.get(name)
-            if slot is not None and slot.peer == peer:
+            if slot is not None and same_peer(slot.peer, peer):
                 slot.owner_alive = None
 
     def _send_layout(self, slot: _Slot) -> None:
@@ -1080,7 +1087,7 @@ class SlotTable:
         slot = self._slots.get(name)
         if slot is None:
             raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
-        if slot.peer != peer:
+        if not same_peer(slot.peer, peer):
             raise SlotError(IDENTITY_MISMATCH, f"slot {name} belongs to another peer")
         return slot
 

@@ -406,15 +406,39 @@ def _open_pool_fd(spec: KVCRPoolSpec) -> int:
     return pool_fd
 
 
-def _peer_identity(connection: socket.socket) -> tuple[int, int]:
-    """(pid, uid) of the connected peer, as the kernel saw it at connect."""
+_POD_UID = re.compile(
+    r"(?:^|[/-])pod([0-9a-f]{8}(?:[-_][0-9a-f]{4}){3}[-_][0-9a-f]{12})(?:\.slice|/|$)"
+)
+
+
+def pod_uid_from_cgroup(text: str) -> str | None:
+    """The pod UID in a /proc/<pid>/cgroup body, or None for a non-pod cgroup.
+
+    Handles the systemd form ``kubepods-<qos>-pod<uid_with_underscores>.slice``
+    and the cgroupfs form ``/kubepods/<qos>/pod<uid>``.
+    """
+    for line in text.splitlines():
+        path = line.rsplit(":", 1)[-1]
+        if "kubepods" in path and (match := _POD_UID.search(path)):
+            return match.group(1).replace("_", "-")
+    return None
+
+
+def _peer_identity(connection: socket.socket) -> tuple[int, int, str | None]:
+    """(pid, uid, pod_uid) of the peer: SO_PEERCRED at connect, then the pod UID
+    from the pid's cgroup (needs hostPID; None when unreadable or not a pod)."""
     pid, uid, _gid = struct.unpack(
         "3i",
         connection.getsockopt(
             socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
         ),
     )
-    return pid, uid
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as cgroup:
+            pod_uid = pod_uid_from_cgroup(cgroup.read())
+    except OSError:
+        pod_uid = None
+    return pid, uid, pod_uid
 
 
 def _pidfd_alive(liveness: PidfdLiveness) -> bool:
@@ -431,7 +455,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
     def setup(self) -> None:
         self.channel = FramedConnection(self.request)
         self._slot_name: str | None = None
-        self._peer: tuple[int, int] | None = None
+        self._peer: tuple[int, int, str | None] | None = None
 
     def _resize(self, request: "_Grow | _Shrink") -> "_Grown | _Shrunk | _Error":
         slots = self.server.slots
@@ -632,7 +656,7 @@ class _ThreadingUnixServer(
         self,
         request: _Claim,
         liveness: PidfdLiveness,
-        peer: tuple[int, int] | None = None,
+        peer: tuple[int, int, str | None] | None = None,
     ) -> "tuple[_Granted, tuple[int, int, _Lease]]":
         if request.compatibility_digest != self.compatibility_digest:
             raise KVCRServiceError(

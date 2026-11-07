@@ -22,8 +22,15 @@ from test_node_service import FakeAPI, make_broker
 from test_node_service_v2 import DIGEST, HEADROOM, PAGE, _claim
 
 from kvcr.service import holder
-from kvcr.service.node_service import PoolClaim, SlotTable
-from kvcr.service.protocol import PoolRegion, _Error, _response_fd_counts
+from kvcr.service.node_service import PoolClaim, SlotError, SlotTable
+from kvcr.service.protocol import (
+    IDENTITY_MISMATCH,
+    SLOT_HELD,
+    PoolRegion,
+    _Error,
+    _response_fd_counts,
+)
+from kvcr.service.server import pod_uid_from_cgroup
 
 
 @pytest.fixture
@@ -140,4 +147,78 @@ def test_slot_claim_feeds_toucher(tmp_path):
         assert slot.layout_generation == slot.pool.layout_generation
     finally:
         thread.join(10)
+        table.release("t/l")
+
+
+UID = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
+UNDERSCORED = UID.replace("-", "_")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            f"0::/kubepods.slice/kubepods-burstable.slice/"
+            f"kubepods-burstable-pod{UNDERSCORED}.slice/cri-containerd-ab12.scope\n",
+            UID,
+        ),
+        (f"0::/kubepods.slice/kubepods-pod{UNDERSCORED}.slice/cri-o-ab.scope\n", UID),
+        (f"12:memory:/kubepods/burstable/pod{UID}/ab12cd\n1:name=systemd:/x\n", UID),
+        (f"1:cpu:/kubepods/pod{UID}\n", UID),
+        ("0::/user.slice/user-1000.slice/session-3.scope\n", None),
+        ("0::/system.slice/containerd.service\n", None),
+        ("", None),
+    ],
+)
+def test_pod_uid_from_cgroup(text, expected):
+    assert pod_uid_from_cgroup(text) == expected
+
+
+def _claim_as(table, peer, claim_id="a", alive=lambda: True):
+    return table.claim(
+        "t",
+        "l",
+        total=4 * PAGE,
+        minimum=2 * PAGE,
+        maximum=None,
+        digest=DIGEST,
+        claim_id=claim_id,
+        peer=peer,
+        owner_alive=alive,
+    )
+
+
+def test_resize_identity_by_pod_uid(tmp_path):
+    table = SlotTable(make_broker(tmp_path), HEADROOM + 64 * PAGE)
+    owner = (100, 1000, "pod-a")
+    try:
+        _claim_as(table, owner)
+        # Same pod from another process: allowed.
+        table.grow("t/l", (101, 1000, "pod-a"), PAGE, None)
+        # Different pod: refused, even with the same pid and uid.
+        with pytest.raises(SlotError) as raised:
+            table.grow("t/l", (100, 1000, "pod-b"), PAGE, None)
+        assert raised.value.reason == IDENTITY_MISMATCH
+        # No pod UID on one side: fall back to (pid, uid).
+        table.grow("t/l", (100, 1000, None), PAGE, None)
+        with pytest.raises(SlotError):
+            table.grow("t/l", (101, 1000, None), PAGE, None)
+    finally:
+        table.release("t/l")
+
+
+def test_successor_pod_claims_free_slot_not_held_slot(tmp_path):
+    table = SlotTable(make_broker(tmp_path), HEADROOM + 64 * PAGE)
+    alive = [True]
+    try:
+        _claim_as(table, (100, 1000, "pod-a"), alive=lambda: alive[0])
+        with pytest.raises(SlotError) as raised:
+            _claim_as(table, (200, 1000, "pod-b"), claim_id="b")
+        assert raised.value.reason == SLOT_HELD
+        alive[0] = False
+        slot = _claim_as(table, (200, 1000, "pod-b"), claim_id="b")
+        assert slot.peer[2] == "pod-b"
+        with pytest.raises(SlotError):
+            table.grow("t/l", (100, 1000, "pod-a"), PAGE, None)
+    finally:
         table.release("t/l")
