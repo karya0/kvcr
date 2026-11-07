@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
@@ -42,6 +42,8 @@ _LABEL = "kvcr.nvidia.com/manager"
 _ANNOTATION = "kvcr.nvidia.com/"
 _MAX_MESSAGE = 65536
 _TOUCHER_OVERHEAD_BYTES = 128 << 20
+_LINEAGE_LABEL = "nvidia.com/dynamo-graph-deployment-name"
+_DYNAMO_NAMESPACE_LABEL = "nvidia.com/dynamo-namespace"
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 logger = logging.getLogger(__name__)
 
@@ -154,6 +156,7 @@ def _matching_tolerations(actual: Any, intended: list[dict[str, Any]]) -> bool:
 
 class PodAPI(Protocol):
     def get(self, name: str) -> dict[str, Any] | None: ...
+    def get_by_uid(self, uid: str) -> dict[str, Any] | None: ...
     def list(self, manager: str) -> list[dict[str, Any]]: ...
     def create(self, pod: dict[str, Any]) -> dict[str, Any]: ...
     def delete(self, name: str, uid: str) -> None: ...
@@ -210,6 +213,13 @@ class InClusterPodAPI:
             if error.status == 404:
                 return None
             raise
+
+    def get_by_uid(self, uid: str) -> dict[str, Any] | None:
+        # The API cannot select pods by UID; read the namespace and filter.
+        for pod in self._request("GET")["items"]:
+            if pod.get("metadata", {}).get("uid") == uid:
+                return pod
+        return None
 
     def list(self, manager: str) -> list[dict[str, Any]]:
         selector = urllib.parse.urlencode({"labelSelector": f"{_LABEL}={manager}"})
@@ -597,17 +607,29 @@ class NodeBroker:
 
     def _check_budget(self, claim: PoolClaim) -> None:
         states = [_read_json(path) for path in self.state_dir.glob("*.json")]
-        active = [state for state in states if state["phase"] != "deleted"]
-        pods = self.api.list(self.manager)
-        # An abandoned (deleted-phase) holder still being terminated is reconciled.
+        pods = {pod["metadata"]["name"]: pod for pod in self.api.list(self.manager)}
         known = {state["pod_name"] for state in states}
-        if any(pod["metadata"]["name"] not in known for pod in pods):
+        if any(name not in known for name in pods):
             raise RuntimeError(
                 "unreconciled holder exists; retain it and refuse allocation"
             )
+        counted = []
+        for state in states:
+            pod = pods.get(state["pod_name"])
+            if pod is not None and state.get("holder_uid") not in (
+                None,
+                pod["metadata"].get("uid"),
+            ):
+                raise RuntimeError(
+                    "a holder was replaced under the same name; refusing allocation"
+                )
+            # A deleted-phase holder still in the API is terminating and keeps
+            # its memory: it counts until the pod is gone.
+            if state["phase"] != "deleted" or pod is not None:
+                counted.append(state)
         if (
-            len(active) >= 2
-            or sum(PoolClaim.parse(s["claim"]).data_bytes for s in active)
+            len(counted) >= 2
+            or sum(PoolClaim.parse(s["claim"]).data_bytes for s in counted)
             + claim.data_bytes
             > 256 * _GIB
         ):
@@ -850,6 +872,13 @@ class SlotError(Exception):
 
 
 @dataclass
+class _Waiter:
+    claim_id: str
+    seen: float
+    alive: Callable[[], bool]
+
+
+@dataclass
 class _Slot:
     name: str
     digest: str
@@ -863,6 +892,11 @@ class _Slot:
     holder_conn: socket.socket | None = None
     touched_bytes: int = 0
     layout_generation: int = -1
+    # Incremented on every successful claim; a release from an older claim is stale.
+    claim_generation: int = 0
+    # Guards the pool layout and the holder socket; never taken while waiting
+    # on the table lock.
+    lock: Any = field(default_factory=threading.RLock, repr=False)
 
     @property
     def held(self) -> bool:
@@ -870,12 +904,18 @@ class _Slot:
 
 
 class SlotTable:
-    """v2 slots keyed ``tenant/lineage``: capacity, queueing and holder upkeep.
+    """v2 slots keyed ``tenant/lineage/guard_index``: capacity, queueing, holder upkeep.
 
     A slot outlives its worker: death frees the claim (``owner_alive`` turns
     false) but keeps the region pool and holder so a successor reuses them.
     ``release`` is the teardown. ``_waiters`` is the per-slot queue of pending
-    claim ids; the head is next to be granted, others get SLOT_HELD.
+    claims; the head is next to be granted, others get SLOT_HELD, and a head
+    that is dead or silent for ``2 * ensure_timeout_s`` is dropped.
+
+    ``_lock`` covers table mutations only. Holder creation and the holder
+    socket are under the slot's own lock, so one slow holder never stalls the
+    others. Minimal slot state is persisted so a restarted supervisor keeps its
+    epochs and claim generations and re-feeds a live holder instead of deleting it.
     """
 
     def __init__(
@@ -885,24 +925,151 @@ class SlotTable:
         local_requests: Callable[[str], int] = lambda tenant: 0,
         headroom_bytes: int = _HEADROOM_BYTES,
         ensure_timeout_s: float = 180,
+        *,
+        require_pod_identity: bool = True,
+        clock: Callable[[], float] = time.monotonic,
+        state_path: Path | None = None,
     ):
         self.broker, self.cap_bytes = broker, cap_bytes
         self.local_requests, self.headroom_bytes = local_requests, headroom_bytes
         self.ensure_timeout_s = ensure_timeout_s
+        self.require_pod_identity = require_pod_identity
+        self._clock = clock
         self._slots: dict[str, _Slot] = {}
-        self._waiters: dict[str, list[str]] = {}
+        self._waiters: dict[str, list[_Waiter]] = {}
         self._epochs: dict[str, int] = {}
+        self._generations: dict[str, int] = {}
         self._lock = threading.RLock()
+        root = getattr(broker, "root", None)
+        self._state_path = state_path or (root and Path(root) / "slot-table.json")
+        self._restore()
 
     @staticmethod
-    def slot_name(tenant: str, lineage: str) -> str:
-        return f"{tenant}/{lineage}"
+    def slot_name(tenant: str, lineage: str, guard_index: int) -> str:
+        return f"{tenant}/{lineage}/{guard_index}"
 
     def waiters(self, name: str) -> list[str]:
-        return list(self._waiters.get(name, ()))
+        return [waiter.claim_id for waiter in self._waiters.get(name, ())]
 
     def get(self, name: str) -> _Slot | None:
         return self._slots.get(name)
+
+    def pool_fds(self, name: str) -> list[int]:
+        return self._slots[name].pool.pass_fd_list()
+
+    # -- persistence -------------------------------------------------------
+
+    def _persist(self) -> None:
+        """Caller holds ``_lock``."""
+        if not self._state_path:
+            return
+        _atomic_json(
+            Path(self._state_path),
+            {
+                "epochs": self._epochs,
+                "generations": self._generations,
+                "slots": {
+                    name: {
+                        "digest": slot.digest,
+                        "effective_maximum_bytes": slot.effective_maximum_bytes,
+                        "holder": slot.holder,
+                        "incarnation": slot.incarnation,
+                        "claim_generation": slot.claim_generation,
+                        "next_index": slot.pool.next_index,
+                        "layout_generation": slot.pool.layout_generation,
+                        "regions": [
+                            {"index": r.index, "offset": r.offset, "size": r.size}
+                            for r in slot.pool.regions
+                        ],
+                    }
+                    for name, slot in self._slots.items()
+                },
+            },
+        )
+
+    def _restore(self) -> None:
+        from .protocol import PoolRegion
+        from .regions import RegionPool
+
+        if not self._state_path or not Path(self._state_path).exists():
+            return
+        data = _read_json(Path(self._state_path))
+        self._epochs = {k: int(v) for k, v in data.get("epochs", {}).items()}
+        self._generations = {k: int(v) for k, v in data.get("generations", {}).items()}
+        for name, rec in data.get("slots", {}).items():
+            pool = RegionPool.create(rec["effective_maximum_bytes"])
+            try:
+                pool.restore(
+                    [
+                        PoolRegion(r["index"], r["offset"], r["size"], 0)
+                        for r in rec["regions"]
+                    ],
+                    rec["next_index"],
+                    rec["layout_generation"],
+                )
+            except BaseException:
+                pool.close()
+                raise
+            self._slots[name] = _Slot(
+                name,
+                rec["digest"],
+                pool,
+                rec["effective_maximum_bytes"],
+                rec["holder"],
+                incarnation=rec["incarnation"],
+                claim_generation=rec["claim_generation"],
+            )
+
+    # -- admission ---------------------------------------------------------
+
+    def _check_identity(self, peer: Any) -> None:
+        from .protocol import IDENTITY_MISMATCH
+
+        if self.require_pod_identity and (
+            peer is None or len(peer) < 3 or not peer[0] or peer[2] is None
+        ):
+            raise SlotError(
+                IDENTITY_MISMATCH, "peer pod identity is unavailable; refusing"
+            )
+
+    def _check_lineage(self, lineage: str, namespace: str | None, peer: Any) -> None:
+        """Require the claimant's pod to carry this lineage (and namespace) label."""
+        from .protocol import INCOMPATIBLE_LINEAGE, INTERNAL
+
+        if not self.require_pod_identity:
+            return
+        try:
+            pod = self.broker.api.get_by_uid(peer[2])
+        except PodAPIError as error:
+            raise SlotError(INTERNAL, f"pod lookup failed: {error}") from error
+        if pod is None:
+            raise SlotError(INCOMPATIBLE_LINEAGE, "claimant pod is not visible")
+        labels = pod.get("metadata", {}).get("labels") or {}
+        if labels.get(_LINEAGE_LABEL) != lineage:
+            raise SlotError(
+                INCOMPATIBLE_LINEAGE, f"claimant pod is not in lineage {lineage}"
+            )
+        if namespace is not None and labels.get(_DYNAMO_NAMESPACE_LABEL) != namespace:
+            raise SlotError(
+                INCOMPATIBLE_LINEAGE, f"claimant pod is not in namespace {namespace}"
+            )
+
+    def _expire_waiters(self, name: str) -> None:
+        """Caller holds ``_lock``. Drop waiters that died or stopped re-claiming."""
+        queue = self._waiters.get(name)
+        if not queue:
+            return
+        now = self._clock()
+        limit = 2 * self.ensure_timeout_s
+        keep = []
+        for waiter in queue:
+            if now - waiter.seen > limit or not waiter.alive():
+                logger.warning(
+                    "dropping stale waiter %s for slot %s", waiter.claim_id, name
+                )
+            else:
+                keep.append(waiter)
+        queue[:] = keep
 
     def _available(self, tenant: str, name: str) -> int:
         others = sum(
@@ -914,7 +1081,9 @@ class SlotTable:
 
     def _new_holder(self, name: str, effective: int, digest: str) -> dict[str, Any]:
         # A fresh pool_id per holder: the broker keeps a deleted claim terminal.
-        epoch = self._epochs[name] = self._epochs.get(name, -1) + 1
+        with self._lock:
+            epoch = self._epochs[name] = self._epochs.get(name, -1) + 1
+            self._persist()  # the epoch reaches disk before its holder pod exists
         stem = "s" + hashlib.sha256(name.encode()).hexdigest()[:12]
         mib = max(512, -(-effective // (1 << 20)))
         return PoolClaim(f"{stem}-{epoch}", Decimal(mib) / 1024, digest).as_dict()
@@ -923,6 +1092,7 @@ class SlotTable:
         self,
         tenant: str,
         lineage: str,
+        guard_index: int,
         *,
         total: int | None,
         minimum: int | None,
@@ -931,6 +1101,7 @@ class SlotTable:
         claim_id: str,
         peer: Any,
         owner_alive: Callable[[], bool],
+        namespace: str | None = None,
     ) -> _Slot:
         from .protocol import (
             CAPACITY_BELOW_MINIMUM,
@@ -940,13 +1111,24 @@ class SlotTable:
         )
         from .regions import CapacityError, RegionPool
 
-        name = self.slot_name(tenant, lineage)
+        name = self.slot_name(tenant, lineage, guard_index)
+        self._check_identity(peer)
+        self._check_lineage(lineage, namespace, peer)
+        created = False
         with self._lock:
+            self._expire_waiters(name)
             slot = self._slots.get(name)
             queue = self._waiters.setdefault(name, [])
-            if (slot is not None and slot.held) or (queue and queue[0] != claim_id):
-                if claim_id not in queue:
-                    queue.append(claim_id)
+            if (slot is not None and slot.held) or (
+                queue and queue[0].claim_id != claim_id
+            ):
+                now = self._clock()
+                for waiter in queue:
+                    if waiter.claim_id == claim_id:
+                        waiter.seen, waiter.alive = now, owner_alive
+                        break
+                else:
+                    queue.append(_Waiter(claim_id, now, owner_alive))
                 raise SlotError(SLOT_HELD, f"slot {name} is held")
             if queue:
                 queue.pop(0)
@@ -955,7 +1137,6 @@ class SlotTable:
                     raise SlotError(
                         INCOMPATIBLE_LINEAGE, f"slot {name} lineage differs"
                     )
-                self.check_holder(name)
             else:
                 size = total or maximum or minimum
                 if not size:
@@ -968,39 +1149,88 @@ class SlotTable:
                         CAPACITY_BELOW_MINIMUM, f"capacity below minimum for {name}"
                     )
                 pool = RegionPool.create(effective)
-                holder = self._new_holder(name, effective, digest)
-                slot = None
                 try:
                     pool.grow(min(size, effective))
-                    self.broker.ensure(holder, self.ensure_timeout_s)
-                    slot = _Slot(name, digest, pool, effective, holder)
-                    if self.broker.toucher:
-                        self._feed_holder(slot)
                 except BaseException as error:
-                    if slot is not None and slot.holder_conn is not None:
-                        slot.holder_conn.close()
                     pool.close()
-                    with contextlib.suppress(Exception):
-                        self.broker.release(holder)
                     if isinstance(error, CapacityError):
                         raise SlotError(CAPACITY_BELOW_MINIMUM, str(error)) from error
-                    if isinstance(
-                        error, (OSError, RuntimeError, ValueError, TimeoutError)
-                    ):
-                        raise SlotError(
-                            INTERNAL, f"holder for {name}: {error}"
-                        ) from error
                     raise
+                slot = _Slot(
+                    name,
+                    digest,
+                    pool,
+                    effective,
+                    self._new_holder(name, effective, digest),
+                )
+                # Reserved now: capacity is counted and the slot reads as held
+                # while the holder comes up outside this lock.
                 self._slots[name] = slot
+                created = True
+            generation = self._generations[name] = self._generations.get(name, 0) + 1
+            slot.claim_generation = generation
             slot.peer, slot.owner_alive, slot.claim_id = peer, owner_alive, claim_id
-            return slot
+            self._persist()
+        try:
+            with slot.lock:
+                if created:
+                    self.broker.ensure(slot.holder, self.ensure_timeout_s)
+                    if self.broker.toucher:
+                        self._feed_holder(slot)
+                else:
+                    self._check_holder(slot)
+        except BaseException as error:
+            self._abort_claim(slot, created, generation)
+            if isinstance(error, SlotError):
+                raise
+            if isinstance(error, CapacityError):
+                raise SlotError(CAPACITY_BELOW_MINIMUM, str(error)) from error
+            if isinstance(error, (OSError, RuntimeError, ValueError, TimeoutError)):
+                raise SlotError(INTERNAL, f"holder for {name}: {error}") from error
+            raise
+        return slot
 
-    def vacate(self, name: str, peer: Any) -> None:
-        """The claimant released its lease: free the slot, keep pool and holder."""
+    def _abort_claim(self, slot: _Slot, created: bool, generation: int) -> None:
+        """A claim whose holder never came up: forget a new slot, free an old one."""
+        with self._lock:
+            if not created:
+                if slot.claim_generation == generation:
+                    slot.owner_alive = None
+                return
+            if self._slots.get(slot.name) is slot:
+                del self._slots[slot.name]
+            self._persist()
+        with slot.lock:
+            if slot.holder_conn is not None:
+                slot.holder_conn.close()
+                slot.holder_conn = None
+            slot.pool.close()
+            with contextlib.suppress(Exception):
+                self.broker.release(slot.holder)
+
+    def vacate(self, name: str, peer: Any, generation: int) -> None:
+        """The claimant released its lease: free the slot, keep pool and holder.
+
+        ``generation`` is the claim generation captured at grant; a vacate from
+        an earlier claim than the current one must not free the new owner.
+        """
+        self._check_identity(peer)
         with self._lock:
             slot = self._slots.get(name)
-            if slot is not None and same_peer(slot.peer, peer):
+            if slot is None:
+                return
+            if generation != slot.claim_generation:
+                logger.warning(
+                    "ignoring stale vacate of slot %s: claim generation %s, current %s",
+                    name,
+                    generation,
+                    slot.claim_generation,
+                )
+                return
+            if same_peer(slot.peer, peer):
                 slot.owner_alive = None
+
+    # -- holder upkeep (caller holds slot.lock) -----------------------------
 
     def _send_layout(self, slot: _Slot) -> None:
         """Send the whole layout plus the pool fds; store the holder's report."""
@@ -1031,9 +1261,7 @@ class SlotTable:
         path = self.broker.holder_socket_path(
             self.broker._load(PoolClaim.parse(slot.holder))
         )
-        if slot.holder_conn is not None:
-            slot.holder_conn.close()
-            slot.holder_conn = None
+        self._drop_holder_conn(slot)
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
@@ -1047,6 +1275,13 @@ class SlotTable:
                     os.unlink(path)
         self._send_layout(slot)
 
+    @staticmethod
+    def _drop_holder_conn(slot: _Slot) -> None:
+        if slot.holder_conn is not None:
+            with contextlib.suppress(OSError):
+                slot.holder_conn.close()
+            slot.holder_conn = None
+
     def _holder_dead(self, slot: _Slot) -> bool:
         pod = self.broker.api.get(
             "gaas-pool-" + self.broker._key(PoolClaim.parse(slot.holder))
@@ -1057,35 +1292,52 @@ class SlotTable:
             or pod.get("status", {}).get("phase") in ("Failed", "Succeeded")
         )
 
+    def _check_holder(self, slot: _Slot) -> bool:
+        """Recreate a dead holder once, or re-feed a live one that lost its
+        connection (a restarted supervisor); True if it was recreated."""
+        from .protocol import INTERNAL
+
+        if not self._holder_dead(slot):
+            if self.broker.toucher and slot.holder_conn is None:
+                self._feed_holder(slot)
+            return False
+        self.broker.abandon(slot.holder)
+        self._drop_holder_conn(slot)
+        slot.incarnation += 1
+        slot.holder = self._new_holder(
+            slot.name, slot.effective_maximum_bytes, slot.digest
+        )
+        with self._lock:
+            self._persist()
+        try:
+            self.broker.ensure(slot.holder, self.ensure_timeout_s)
+            if self.broker.toucher:
+                self._feed_holder(slot)
+        except (OSError, RuntimeError, ValueError, TimeoutError) as error:
+            raise SlotError(
+                INTERNAL, f"holder recreate for {slot.name}: {error}"
+            ) from error
+        return True
+
     def check_holder(self, name: str) -> bool:
         """Recreate the holder once if it is gone or terminating; True if it was."""
-        from .protocol import INTERNAL, UNKNOWN_SLOT
+        from .protocol import UNKNOWN_SLOT
 
         with self._lock:
             slot = self._slots.get(name)
-            if slot is None:
-                raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
-            if not self._holder_dead(slot):
-                return False
-            self.broker.abandon(slot.holder)
-            slot.incarnation += 1
-            slot.holder = self._new_holder(
-                name, slot.effective_maximum_bytes, slot.digest
-            )
-            try:
-                self.broker.ensure(slot.holder, self.ensure_timeout_s)
-                if self.broker.toucher:
-                    self._feed_holder(slot)
-            except (OSError, RuntimeError, ValueError, TimeoutError) as error:
-                raise SlotError(
-                    INTERNAL, f"holder recreate for {name}: {error}"
-                ) from error
-            return True
+        if slot is None:
+            raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
+        with slot.lock:
+            return self._check_holder(slot)
+
+    # -- resize -------------------------------------------------------------
 
     def _owned(self, name: str, peer: Any) -> _Slot:
         from .protocol import IDENTITY_MISMATCH, UNKNOWN_SLOT
 
-        slot = self._slots.get(name)
+        self._check_identity(peer)
+        with self._lock:
+            slot = self._slots.get(name)
         if slot is None:
             raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
         if not same_peer(slot.peer, peer):
@@ -1096,25 +1348,36 @@ class SlotTable:
         from .protocol import CAPACITY_BELOW_MINIMUM, INTERNAL
         from .regions import CapacityError
 
-        with self._lock:
-            slot = self._owned(name, peer)
+        slot = self._owned(name, peer)
+        with slot.lock:
+            before = (slot.pool.layout_generation, slot.pool.next_index)
             try:
                 regions = slot.pool.grow(additional_bytes, split)
             except CapacityError as error:
                 raise SlotError(CAPACITY_BELOW_MINIMUM, str(error)) from error
-            if slot.holder_conn is not None:
+            if slot.holder_conn is not None or self.broker.toucher:
                 try:
-                    self._send_layout(slot)
-                except (OSError, RuntimeError, ValueError) as error:
+                    if slot.holder_conn is None:
+                        self._feed_holder(slot)
+                    else:
+                        self._send_layout(slot)
+                except (OSError, RuntimeError, ValueError, KeyError) as error:
+                    # The holder never acknowledged: take the regions back so a
+                    # retry grows once, and make the holder reconnect for a re-feed.
+                    self._drop_holder_conn(slot)
+                    slot.pool.rollback_grow(regions, *before)
                     raise SlotError(INTERNAL, f"holder layout: {error}") from error
-            return regions, slot.pool.layout_generation
+            generation = slot.pool.layout_generation
+        with self._lock:
+            self._persist()
+        return regions, generation
 
     def shrink(self, name: str, peer: Any, indices: tuple[int, ...]):
         from .protocol import REGION_BUSY, UNKNOWN_SLOT
         from .regions import RegionBusy, UnknownRegion
 
-        with self._lock:
-            slot = self._owned(name, peer)
+        slot = self._owned(name, peer)
+        with slot.lock:
             try:
                 for index in indices:
                     slot.pool.mark_quiescent(index)
@@ -1123,25 +1386,37 @@ class SlotTable:
                 raise SlotError(REGION_BUSY, str(error)) from error
             except UnknownRegion as error:
                 raise SlotError(UNKNOWN_SLOT, f"unknown region {error}") from error
-            return removed, slot.pool.layout_generation
+            if slot.holder_conn is not None:
+                try:
+                    self._send_layout(slot)
+                except (OSError, RuntimeError, ValueError, KeyError):
+                    # The regions are gone either way; the holder is re-fed in
+                    # full after it reconnects.
+                    logger.warning("holder did not take the reduced layout of %s", name)
+                    self._drop_holder_conn(slot)
+            generation = slot.pool.layout_generation
+        with self._lock:
+            self._persist()
+        return removed, generation
 
     def release(self, name: str) -> list[str]:
         """PoC teardown: close pool, drain and delete holder; returns waiters."""
         from .protocol import UNKNOWN_SLOT
 
         with self._lock:
-            slot = self._slots.get(name)
+            slot = self._slots.pop(name, None)
             if slot is None:
                 raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
-            if slot.holder_conn is not None:
-                slot.holder_conn.close()
+            self._persist()
+            waiters = self.waiters(name)
+        with slot.lock:
+            self._drop_holder_conn(slot)
             slot.pool.close()
             if self._holder_dead(slot):
                 self.broker.abandon(slot.holder)
             else:
                 self.broker.release(slot.holder)
-            del self._slots[name]
-            return self.waiters(name)
+        return waiters
 
 
 def _rpc(

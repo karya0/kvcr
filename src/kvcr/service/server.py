@@ -54,9 +54,11 @@ from .protocol import (
     PidfdLiveness,
     _Claim,
     _claim_fd_counts,
+    _ClaimV2,
     _Drain,
     _Error,
     _Granted,
+    _GrantedV2,
     _Grow,
     _Grown,
     _Heartbeat,
@@ -454,6 +456,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
 
     _slot_name: str | None = None
     _peer: tuple[int, int, str | None] | None = None
+    _claim_generation: int = 0
 
     def setup(self) -> None:
         self.channel = FramedConnection(self.request)
@@ -510,10 +513,9 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         grant: "tuple[int, int, _Lease] | None" = None
         try:
             liveness = PidfdLiveness.from_peer_socket(self.request, worker_pidfd)
-            if request.tenant and request.lineage:  # v2 claim: slot + peer identity
-                response, grant = self.server.dispatch(
-                    request, liveness, _peer_identity(self.request)
-                )
+            if isinstance(request, _ClaimV2):  # v2 claim: slot + peer identity
+                self._peer = _peer_identity(self.request)
+                response, grant = self.server.dispatch(request, liveness, self._peer)
             else:  # v1 claim: untouched path
                 response, grant = self.server.dispatch(request, liveness)
         except SlotError as error:
@@ -532,15 +534,16 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             return
 
         guard_index, listener_fd, lease = grant
-        self._slot_name = getattr(response, "slot_name", None)
-        if self._slot_name is not None:
-            self._peer = _peer_identity(self.request)
+        if isinstance(response, _GrantedV2):
+            self._slot_name = response.slot_name
+            self._claim_generation = response.claim_generation
         try:
             pool_fd = _open_pool_fd(response.spec)
         except Exception:  # noqa: BLE001 - nothing sent yet: take the grant back
             logger.exception("KVCR could not open the pool for a claimant")
             os.close(listener_fd)
             self._release_or_fail(guard_index, lease, activated=False)
+            self._vacate()
             self._send_error(KVCRServiceError("KVCR could not open the pool"))
             return
         try:
@@ -550,7 +553,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             region_fds = (
                 []
                 if self._slot_name is None or self.server.slots is None
-                else self.server.slots.get(self._slot_name).pool.pass_fd_list()
+                else self.server.slots.pool_fds(self._slot_name)
             )
             self.channel.send_with_fd(response, pool_fd, listener_fd, *region_fds)
         # The lease is already granted and the send may have partially
@@ -566,6 +569,18 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 with contextlib.suppress(OSError):
                     os.close(file_descriptor)
         self._await_release(guard_index, lease)
+
+    def _vacate(self) -> None:
+        """Free this connection's slot claim; a stale or foreign release is a no-op."""
+        slots = getattr(self.server, "slots", None)
+        if self._slot_name is None or slots is None:
+            return
+        try:
+            slots.vacate(self._slot_name, self._peer, self._claim_generation)
+        except SlotError:
+            logger.warning(
+                "KVCR slot %s vacate refused", self._slot_name, exc_info=True
+            )
 
     def _await_release(self, guard_index: int, lease: "_Lease") -> None:
         """Keep the lease alive with heartbeats until its release.
@@ -585,8 +600,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 self.server.registry.heartbeat(guard_index, lease)
                 continue
             if self._release_or_fail(guard_index, lease, message.activated):
-                if self._slot_name and getattr(self.server, "slots", None) is not None:
-                    self.server.slots.vacate(self._slot_name, self._peer)
+                self._vacate()
                 with contextlib.suppress(OSError):
                     self.channel.send(_Released(_PROTOCOL_VERSION))
             return
@@ -659,22 +673,25 @@ class _ThreadingUnixServer(
 
     def dispatch(
         self,
-        request: _Claim,
+        request: "_Claim | _ClaimV2",
         liveness: PidfdLiveness,
         peer: tuple[int, int, str | None] | None = None,
-    ) -> "tuple[_Granted, tuple[int, int, _Lease]]":
+    ) -> "tuple[_Granted | _GrantedV2, tuple[int, int, _Lease]]":
         if request.compatibility_digest != self.compatibility_digest:
             raise KVCRServiceError(
                 "KVCR compatibility digest does not match the service"
             )
         liveness.incarnation = request.incarnation
-        # v2 claims (tenant and lineage) take a slot first; v1 claims skip it.
-        slot = None
+        # v2 claims take a slot first; v1 claims skip it.
+        slot = generation = None
         slots = getattr(self, "slots", None)  # absent on v1-only servers
-        if slots is not None and request.tenant and request.lineage:
+        if isinstance(request, _ClaimV2):
+            if slots is None:
+                raise SlotError(NOT_IMPLEMENTED, "this service has no slot table")
             slot = slots.claim(
                 request.tenant,
                 request.lineage,
+                request.guard_index,
                 total=request.total_bytes,
                 minimum=request.minimum_bytes,
                 maximum=request.maximum_bytes,
@@ -683,7 +700,11 @@ class _ThreadingUnixServer(
                 or f"{request.control_host}:{request.control_port}",
                 peer=peer,
                 owner_alive=lambda: _pidfd_alive(liveness),
+                namespace=request.state_agent.namespace
+                if request.state_agent
+                else None,
             )
+            generation = slot.claim_generation
         try:
             # Retain the Guard across a concurrent close; claim validates the request.
             guard = self.registry._guards.get(request.guard_index)
@@ -697,33 +718,35 @@ class _ThreadingUnixServer(
                 raise KVCRServiceError("KVCR claim succeeded without a Guard")
         except BaseException:
             if slot is not None:
-                slots.vacate(slot.name, peer)
+                slots.vacate(slot.name, peer, generation)
             raise
-        slot_fields = (
-            {}
-            if slot is None
-            else {
-                "slot_name": slot.name,
-                "effective_maximum_bytes": slot.effective_maximum_bytes,
-                "regions": slot.pool.regions,
-                "layout_generation": slot.pool.layout_generation,
-                # The Guard binds the claimant-requested control address.
-                "guard_endpoint": f"{request.control_host}:{request.control_port}",
-            }
+        common = (
+            request.guard_index,
+            spec,
+            request.tier_config,
+            pools,
+            _PROTOCOL_VERSION,
         )
-        return (
-            _Granted(
-                request.guard_index,
-                spec,
-                request.tier_config,
-                pools,
-                _PROTOCOL_VERSION,
+        if slot is None:
+            granted: "_Granted | _GrantedV2" = _Granted(
+                *common,
                 dead_incarnations=guard.dead_incarnations,
                 heartbeat_enabled=guard.heartbeat_enabled,
-                **slot_fields,
-            ),
-            (request.guard_index, listener_fd, lease),
-        )
+            )
+        else:
+            granted = _GrantedV2(
+                *common,
+                slot_name=slot.name,
+                effective_maximum_bytes=slot.effective_maximum_bytes,
+                regions=slot.pool.regions,
+                layout_generation=slot.pool.layout_generation,
+                claim_generation=generation,
+                # The Guard binds the claimant-requested control address.
+                guard_endpoint=f"{request.control_host}:{request.control_port}",
+                dead_incarnations=guard.dead_incarnations,
+                heartbeat_enabled=guard.heartbeat_enabled,
+            )
+        return granted, (request.guard_index, listener_fd, lease)
 
     def fail(self, error: BaseException) -> None:
         """Stop the service, keeping only the first failure.

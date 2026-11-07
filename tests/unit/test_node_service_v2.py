@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """v2 claim path: slots, capacity, SLOT_HELD, holder recreate, resize (Linux only)."""
 
+import copy
+import json
 import mmap
 import os
 import socket
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -15,20 +18,21 @@ if sys.platform != "linux":
     pytest.skip("memfd and MAP_FIXED regions are Linux-only", allow_module_level=True)
 
 from test_kvcr_service import _running_server
-from test_node_service import _SPECS, FakeAPI, make_broker
+from test_node_service import _CLAIM, _SPECS, FakeAPI, make_broker
 
 from kvcr.runtime.control_channels import FramedConnection
-from kvcr.service import node_service
+from kvcr.service import holder, node_service
 from kvcr.service.node_service import SlotError, SlotTable, effective_grant
 from kvcr.service.protocol import (
     _RESIZE_RESPONSE_DECODER,
     CAPACITY_BELOW_MINIMUM,
     IDENTITY_MISMATCH,
+    INCOMPATIBLE_LINEAGE,
     INTERNAL,
     REGION_BUSY,
     SLOT_HELD,
     UNKNOWN_SLOT,
-    _Error,
+    _ErrorV2,
     _Grow,
     _Grown,
     _Shrink,
@@ -81,13 +85,17 @@ def pools(monkeypatch):
 def _table(tmp_path, api=None, pages=64, **kwargs):
     api = api or FakeAPI()
     broker = make_broker(tmp_path, api, **kwargs)
-    return SlotTable(broker, HEADROOM + pages * PAGE), api
+    return (
+        SlotTable(broker, HEADROOM + pages * PAGE, require_pod_identity=False),
+        api,
+    )
 
 
 def _claim(table, claim_id="a", total=4, minimum=2, maximum=None, alive=lambda: True):
     return table.claim(
         "t",
         "l",
+        0,
         total=total * PAGE,
         minimum=minimum * PAGE,
         maximum=maximum and maximum * PAGE,
@@ -101,7 +109,7 @@ def _claim(table, claim_id="a", total=4, minimum=2, maximum=None, alive=lambda: 
 def test_full_grant(tmp_path, pools):
     table, api = _table(tmp_path)
     slot = _claim(table)
-    assert slot.name == "t/l" and slot.effective_maximum_bytes == 4 * PAGE
+    assert slot.name == "t/l/0" and slot.effective_maximum_bytes == 4 * PAGE
     assert [r.size for r in slot.pool.regions] == [4 * PAGE]
     assert len(api.creates) == 1
 
@@ -126,6 +134,7 @@ def test_other_slots_reduce_capacity(tmp_path, pools):
         table.claim(
             "u",
             "l",
+            0,
             total=4 * PAGE,
             minimum=2 * PAGE,
             maximum=None,
@@ -142,7 +151,7 @@ def test_below_minimum_leaves_nothing(tmp_path, pools):
     with pytest.raises(SlotError) as raised:
         _claim(table)
     assert raised.value.reason == CAPACITY_BELOW_MINIMUM
-    assert not api.creates and not api.deletes and table.get("t/l") is None
+    assert not api.creates and not api.deletes and table.get("t/l/0") is None
     assert all(pool.fd == -1 for pool in pools)
 
 
@@ -160,7 +169,7 @@ def test_failed_holder_closes_pool_and_deletes_holder(tmp_path, pools):
     assert raised.value.reason == INTERNAL
     assert len(pools) == 1 and pools[0].fd == -1
     assert api.deletes == [(api.creates[0]["metadata"]["name"], "holder-uid-1")]
-    assert table.get("t/l") is None
+    assert table.get("t/l/0") is None
 
 
 def test_slot_held_queue_and_release(tmp_path, pools):
@@ -171,14 +180,14 @@ def test_slot_held_queue_and_release(tmp_path, pools):
         with pytest.raises(SlotError) as raised:
             _claim(table, waiter)
         assert raised.value.reason == SLOT_HELD
-    assert table.waiters("t/l") == ["b", "c"]
+    assert table.waiters("t/l/0") == ["b", "c"]
     alive[0] = False  # the worker died: the slot is free, b is next
     with pytest.raises(SlotError):
         _claim(table, "c")
     slot = _claim(table, "b")
-    assert table.waiters("t/l") == ["c"]
+    assert table.waiters("t/l/0") == ["c"]
     assert slot.pool.fd >= 0 and len(api.creates) == 1  # pool and holder reused
-    assert table.release("t/l") == ["c"]
+    assert table.release("t/l/0") == ["c"]
     assert api.deletes and slot.pool.fd == -1
     assert _claim(table, "c").claim_id == "c"
     assert len(api.creates) == 2
@@ -187,19 +196,19 @@ def test_slot_held_queue_and_release(tmp_path, pools):
 def test_holder_death_recreates_once(tmp_path, pools):
     table, api = _table(tmp_path)
     slot = _claim(table)
-    assert table.check_holder("t/l") is False
+    assert table.check_holder("t/l/0") is False
     del api.pods[api.creates[0]["metadata"]["name"]]
-    assert table.check_holder("t/l") is True
+    assert table.check_holder("t/l/0") is True
     assert slot.incarnation == 1 and len(api.creates) == 2
     assert api.creates[1]["metadata"]["name"] != api.creates[0]["metadata"]["name"]
-    assert table.check_holder("t/l") is False and len(api.creates) == 2
+    assert table.check_holder("t/l/0") is False and len(api.creates) == 2
 
 
 def test_terminating_holder_recreates(tmp_path, pools):
     table, api = _table(tmp_path)
     slot = _claim(table)
     api.pods[api.creates[0]["metadata"]["name"]]["metadata"]["deletionTimestamp"] = "t"
-    assert table.check_holder("t/l") is True and slot.incarnation == 1
+    assert table.check_holder("t/l/0") is True and slot.incarnation == 1
 
 
 def test_resize_round_trip_and_identity(tmp_path, pools):
@@ -215,17 +224,253 @@ def test_resize_round_trip_and_identity(tmp_path, pools):
                 channel.send(request)
                 return channel.receive(_RESIZE_RESPONSE_DECODER)
 
-        grown = send(_Grow(1, "t/l", 2 * PAGE))
+        grown = send(_Grow(1, "t/l/0", 2 * PAGE))
         assert isinstance(grown, _Grown) and grown.layout_generation == 2
         assert [r.index for r in grown.regions] == [1]
-        assert send(_Grow(1, "t/l", 64 * PAGE)).reason == CAPACITY_BELOW_MINIMUM
-        assert send(_Grow(1, "x/y", PAGE)).reason == UNKNOWN_SLOT
-        assert send(_Shrink(1, "t/l", (0,))).reason == REGION_BUSY  # not a suffix
-        assert send(_Shrink(1, "t/l", (7,))).reason == UNKNOWN_SLOT
-        shrunk = send(_Shrink(1, "t/l", (1,)))
+        assert send(_Grow(1, "t/l/0", 64 * PAGE)).reason == CAPACITY_BELOW_MINIMUM
+        assert send(_Grow(1, "x/y/0", PAGE)).reason == UNKNOWN_SLOT
+        assert send(_Shrink(1, "t/l/0", (0,))).reason == REGION_BUSY  # not a suffix
+        assert send(_Shrink(1, "t/l/0", (7,))).reason == UNKNOWN_SLOT
+        shrunk = send(_Shrink(1, "t/l/0", (1,)))
         assert isinstance(shrunk, _Shrunk) and shrunk.region_indices == (1,)
         assert shrunk.layout_generation == 3
-        table.get("t/l").peer = (ME[0] + 1, ME[1])  # another peer owns the slot
-        for request in (_Grow(1, "t/l", PAGE), _Shrink(1, "t/l", (0,))):
+        table.get("t/l/0").peer = (ME[0] + 1, ME[1])  # another peer owns the slot
+        for request in (_Grow(1, "t/l/0", PAGE), _Shrink(1, "t/l/0", (0,))):
             error = send(request)
-            assert isinstance(error, _Error) and error.reason == IDENTITY_MISMATCH
+            assert isinstance(error, _ErrorV2) and error.reason == IDENTITY_MISMATCH
+
+
+def _claim_raw(table, *, peer=ME, claim_id="a", alive=lambda: True, **kwargs):
+    return table.claim(
+        "t",
+        "l",
+        0,
+        total=4 * PAGE,
+        minimum=2 * PAGE,
+        maximum=8 * PAGE,
+        digest=DIGEST,
+        claim_id=claim_id,
+        peer=peer,
+        owner_alive=alive,
+        **kwargs,
+    )
+
+
+def test_slot_key_includes_the_worker_position(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    first = _claim_raw(table)
+    second = table.claim(
+        "t",
+        "l",
+        1,
+        total=2 * PAGE,
+        minimum=2 * PAGE,
+        maximum=None,
+        digest=DIGEST,
+        claim_id="a",
+        peer=ME,
+        owner_alive=lambda: True,
+    )
+    assert (first.name, second.name) == ("t/l/0", "t/l/1")
+
+
+def test_v2_fails_closed_without_pod_identity(tmp_path, pools):
+    broker = make_broker(tmp_path, FakeAPI())
+    table = SlotTable(broker, HEADROOM + 64 * PAGE)  # require_pod_identity=True
+    for peer in (None, (ME[0], ME[1], None), (0, ME[1], "pod-a"), ME):
+        with pytest.raises(SlotError) as raised:
+            _claim_raw(table, peer=peer)
+        assert raised.value.reason == IDENTITY_MISMATCH
+    assert table.get("t/l/0") is None
+    for call in (
+        lambda: table.grow("t/l/0", (0, 1, "p"), PAGE, None),
+        lambda: table.shrink("t/l/0", (1, 1, None), (0,)),
+        lambda: table.vacate("t/l/0", (0, 1, "p"), 1),
+    ):
+        with pytest.raises(SlotError) as raised:
+            call()
+        assert raised.value.reason == IDENTITY_MISMATCH
+
+
+class _LineageAPI(FakeAPI):
+    def __init__(self, workers):
+        super().__init__()
+        self.workers = workers
+
+    def get_by_uid(self, uid):
+        return copy.deepcopy(self.workers.get(uid))
+
+
+def _worker(lineage, namespace="ns"):
+    labels = {
+        node_service._LINEAGE_LABEL: lineage,
+        node_service._DYNAMO_NAMESPACE_LABEL: namespace,
+    }
+    return {"metadata": {"uid": "u1", "labels": labels}}
+
+
+@pytest.mark.parametrize(
+    ("workers", "namespace", "expected"),
+    [
+        ({"u1": _worker("l")}, "ns", None),
+        ({"u1": _worker("l")}, None, None),
+        ({"u1": _worker("other")}, "ns", INCOMPATIBLE_LINEAGE),
+        ({"u1": _worker("l", "elsewhere")}, "ns", INCOMPATIBLE_LINEAGE),
+        ({"u1": {"metadata": {"uid": "u1"}}}, None, INCOMPATIBLE_LINEAGE),
+        ({}, "ns", INCOMPATIBLE_LINEAGE),
+    ],
+)
+def test_claim_proves_lineage_membership(tmp_path, pools, workers, namespace, expected):
+    table = SlotTable(make_broker(tmp_path, _LineageAPI(workers)), HEADROOM + 64 * PAGE)
+    peer = (ME[0], ME[1], "u1")
+    if expected is None:
+        assert _claim_raw(table, peer=peer, namespace=namespace).peer == peer
+        return
+    with pytest.raises(SlotError) as raised:
+        _claim_raw(table, peer=peer, namespace=namespace)
+    assert raised.value.reason == expected
+    assert table.get("t/l/0") is None
+
+
+def test_stale_release_does_not_free_the_new_owner(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    alive = {"a": True, "b": True}
+    first = _claim_raw(table, claim_id="a", alive=lambda: alive["a"])
+    generation_a = first.claim_generation
+    alive["a"] = False  # A died; its release is still in flight
+    second = _claim_raw(table, claim_id="b", alive=lambda: alive["b"])
+    assert second.claim_generation == generation_a + 1
+    table.vacate("t/l/0", ME, generation_a)  # same peer, older claim: no-op
+    assert second.held and second.claim_id == "b"
+    table.vacate("t/l/0", ME, second.claim_generation)
+    assert not second.held
+
+
+def test_failed_holder_ack_rolls_the_grow_back(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    slot = _claim(table, total=2, minimum=2, maximum=8)
+    before = (slot.pool.regions, slot.pool.layout_generation)
+    supervisor_end, holder_end = socket.socketpair()
+    holder_end.close()  # the holder is gone: EOF/EPIPE on the layout
+    slot.holder_conn = supervisor_end
+    with pytest.raises(SlotError) as raised:
+        table.grow("t/l/0", ME, 2 * PAGE, None)
+    assert raised.value.reason == INTERNAL
+    assert (slot.pool.regions, slot.pool.layout_generation) == before
+    assert slot.holder_conn is None
+    regions, generation = table.grow("t/l/0", ME, 2 * PAGE, None)  # retry grows once
+    assert [r.index for r in regions] == [1] and generation == before[1] + 1
+    assert len(slot.pool.regions) == 2
+
+
+def test_shrink_fallocate_failure_is_region_busy(tmp_path, pools, monkeypatch):
+    table, _ = _table(tmp_path)
+    slot = _claim(table, total=2, minimum=2, maximum=8)
+    table.grow("t/l/0", ME, 2 * PAGE, None)
+    layout = (slot.pool.regions, slot.pool.layout_generation)
+    monkeypatch.setattr(slot.pool._libc, "fallocate", lambda *args: -1)
+    with pytest.raises(SlotError) as raised:
+        table.shrink("t/l/0", ME, (1,))
+    assert raised.value.reason == REGION_BUSY
+    assert (slot.pool.regions, slot.pool.layout_generation) == layout
+
+
+def test_shrink_resends_the_reduced_layout(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    slot = _claim(table, total=2, minimum=2, maximum=8)
+    table.grow("t/l/0", ME, 2 * PAGE, None)
+    supervisor_end, holder_end = socket.socketpair()
+    slot.holder_conn = supervisor_end
+    mappings = {}
+    thread = threading.Thread(target=holder.handle_layout, args=(holder_end, mappings))
+    thread.start()
+    try:
+        _, generation = table.shrink("t/l/0", ME, (1,))
+        thread.join(10)
+        assert slot.touched_bytes == 2 * PAGE
+        assert slot.layout_generation == generation
+        assert list(mappings) == [0]
+    finally:
+        for view, _size in mappings.values():
+            view.close()
+        supervisor_end.close()
+        holder_end.close()
+
+
+def test_dead_queue_head_is_dropped(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    owner, head = [True], [True]
+    _claim(table, "a", alive=lambda: owner[0])
+    with pytest.raises(SlotError):
+        _claim(table, "b", alive=lambda: head[0])
+    with pytest.raises(SlotError):
+        _claim(table, "c")
+    owner[0] = head[0] = False  # the owner and the head both died
+    assert _claim(table, "c").claim_id == "c"
+    assert table.waiters("t/l/0") == []
+
+
+def test_silent_queue_head_is_dropped_after_twice_the_ensure_timeout(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    table.ensure_timeout_s = 10
+    now = [0.0]
+    table._clock = lambda: now[0]
+    owner = [True]
+    _claim(table, "a", alive=lambda: owner[0])
+    for waiter in ("d", "e"):  # d heads the queue and never comes back
+        with pytest.raises(SlotError):
+            _claim(table, waiter)
+    owner[0] = False
+    now[0] = 5.0
+    with pytest.raises(SlotError):  # d is within its window and is next
+        _claim(table, "e")
+    now[0] = 21.0  # d silent for 21 s > 2 x 10 s; e re-claimed at 5 s
+    assert _claim(table, "e").claim_id == "e"
+
+
+def test_slot_state_persists_across_supervisor_restart(tmp_path, pools):
+    table, api = _table(tmp_path)
+    slot = _claim(table, total=2, minimum=2, maximum=8)
+    table.grow("t/l/0", ME, 2 * PAGE, None)
+    restarted = SlotTable(
+        table.broker, HEADROOM + 64 * PAGE, require_pod_identity=False
+    )
+    again = restarted.get("t/l/0")
+    pools.append(again.pool)  # closed by the fixture
+    assert again.pool.regions == slot.pool.regions
+    assert again.pool.layout_generation == slot.pool.layout_generation
+    assert (again.holder, again.digest) == (slot.holder, slot.digest)
+    assert again.claim_generation == slot.claim_generation and not again.held
+    assert restarted._epochs == table._epochs == {"t/l/0": 0}
+    # The live holder is kept and re-claimed, not deleted and recreated.
+    creates = len(api.creates)
+    reclaimed = _claim(restarted, "b", total=2, minimum=2, maximum=8)
+    assert (
+        reclaimed is again and reclaimed.claim_generation == slot.claim_generation + 1
+    )
+    assert len(api.creates) == creates and not api.deletes
+    # Epochs continue instead of restarting at 0.
+    del api.pods[api.creates[0]["metadata"]["name"]]
+    assert restarted.check_holder("t/l/0") is True
+    assert restarted._epochs == {"t/l/0": 1}
+    persisted = json.loads((tmp_path / "slot-table.json").read_text())
+    assert persisted["epochs"] == {"t/l/0": 1}
+
+
+def test_terminating_holders_still_count_toward_the_budget(tmp_path):
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    claims = [{**_CLAIM, "pool_id": f"pool-{name}"} for name in "abc"]
+    held = broker.ensure(claims[0])["holder_name"]
+    terminating = copy.deepcopy(api.pods[held])
+    assert broker.release(claims[0])["state"] == "deleted" and not api.pods
+    terminating["metadata"]["deletionTimestamp"] = "now"
+    api.pods[held] = terminating  # gone from the claim's view, not from the API
+    broker.ensure(claims[1])
+    with pytest.raises(ValueError, match="budget"):
+        broker.ensure(claims[2])
+    api.pods[held]["metadata"]["uid"] = "replacement"  # same name, other UID
+    with pytest.raises(RuntimeError, match="replaced"):
+        broker.ensure(claims[2])
+    del api.pods[held]
+    broker.ensure(claims[2])
