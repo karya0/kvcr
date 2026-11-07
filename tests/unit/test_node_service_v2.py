@@ -3,6 +3,7 @@
 """v2 claim path: slots, capacity, SLOT_HELD, holder recreate, resize (Linux only)."""
 
 import copy
+import errno
 import json
 import mmap
 import os
@@ -202,15 +203,47 @@ def test_slot_held_queue_and_release(tmp_path, pools):
     assert len(api.creates) == 2
 
 
+def _queue_waiter(table, claim_id, fds):
+    def open_fd():
+        fds.append(os.dup(0))
+        return fds[-1]
+
+    with pytest.raises(SlotError) as raised:
+        _claim_raw(table, claim_id=claim_id, waiter_fd=open_fd)
+    assert raised.value.reason == SLOT_HELD
+
+
+def _assert_closed(fds):
+    assert fds
+    for fd in fds:
+        with pytest.raises(OSError) as raised:
+            os.fstat(fd)
+        assert raised.value.errno == errno.EBADF
+
+
 def test_release_drops_queued_waiters(tmp_path, pools):
     table, _ = _table(tmp_path)
-    _claim(table, "a")
-    with pytest.raises(SlotError) as raised:
-        _claim(table, "b")
-    assert raised.value.reason == SLOT_HELD
+    _claim_raw(table)
+    fds: list[int] = []
+    _queue_waiter(table, "b", fds)
     assert table.release("t/l/0") == ["b"]
+    _assert_closed(fds)
     assert table.waiters("t/l/0") == []
-    assert _claim(table, "d").claim_id == "d"  # granted at once, no SLOT_HELD
+    assert _claim_raw(table, claim_id="d").claim_id == "d"  # no SLOT_HELD
+
+
+def test_abort_claim_drops_queued_waiters(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    slot, generation = table.claim_with_generation(
+        "t", "l", 0, total=4 * PAGE, minimum=2 * PAGE, maximum=None,
+        digest=DIGEST, claim_id="a", peer=ME, owner_alive=lambda: True,
+    )
+    fds: list[int] = []
+    _queue_waiter(table, "b", fds)
+    table._abort_claim(slot, True, generation)
+    _assert_closed(fds)
+    assert table.waiters("t/l/0") == []
+    assert _claim_raw(table, claim_id="d").claim_id == "d"
 
 
 def test_holder_death_recreates_once(tmp_path, pools):
