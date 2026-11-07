@@ -3,12 +3,15 @@
 """Region pool: one memfd and a PROT_NONE reservation with MAP_FIXED regions."""
 
 import ctypes
+import logging
 import mmap
 import os
 import types
 
 from kvcr.service.memmap import round_up
 from kvcr.service.protocol import PoolRegion
+
+logger = logging.getLogger(__name__)
 
 _PROT_NONE = 0  # the mmap module does not export it
 _MAP_FIXED = 0x10
@@ -205,14 +208,14 @@ class RegionPool:
             raise RegionBusy("only the highest regions can be removed")
         # Punch the whole suffix in one call, before any metadata change: a
         # failure (an I/O error, not busyness) leaves layout and generation as is.
+        length = sum(region.size for region in removed)
         if removed and self._libc.fallocate(
-            self._fd,
-            _FALLOC_PUNCH,
-            removed[0].offset,
-            sum(region.size for region in removed),
+            self._fd, _FALLOC_PUNCH, removed[0].offset, length
         ):
             error = ctypes.get_errno()
             raise OSError(error, f"cannot release regions: {os.strerror(error)}")
+        if removed:
+            logger.info("punched regions offset=%d length=%d", removed[0].offset, length)
         self._unmap(removed)
         if removed:
             self._generation += 1

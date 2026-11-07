@@ -32,6 +32,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
@@ -366,6 +367,7 @@ class NodeBroker:
         logger.info(
             json.dumps(
                 {
+                    "ts": datetime.now(timezone.utc).isoformat(),
                     "event": "holder_state",
                     "namespace": self.namespace,
                     "node_name": self.node_name,
