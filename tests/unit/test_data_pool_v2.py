@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -174,28 +174,33 @@ def test_guard_registers_the_regions_not_pool_rank(short_dir):
             hold.release()
 
 
-def test_guard_logs_the_registered_data_pool_at_info(short_dir, caplog):
+def test_guard_logs_the_data_pool_at_promotion_not_at_claim(short_dir, caplog):
     server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         guard = harness.server._server.registry._guards[0]
-        hold = _claim(harness)
-        try:
-            slot_pool = table.get("t/l/0").pool
-            base = slot_pool.address(slot_pool.regions[0])
-            del guard._prepare_core
-            with caplog.at_level(logging.INFO, logger=guard_module.logger.name):
-                with patch.object(guard_module, "_KVCRCore"):
-                    guard._prepare_core()
-            lines = [m for m in caplog.messages if "guard_data_pool_registered" in m]
-            assert lines == [
-                f"KVCR_EVENT guard_data_pool_registered guard=0 slot=t/l/0 "
-                f"base=0x{base:x} bytes={4 * PAGE} "
-                f"regions={len(slot_pool.regions)}"
-            ]
-            print(lines[0])
-        finally:
-            hold.release()
+        with caplog.at_level(logging.INFO, logger=guard_module.logger.name):
+            hold = _claim(harness)
+            try:
+                # A claim released without promotion logs nothing.
+                assert not [m for m in caplog.messages if "guard_data_pool" in m]
+                slot_pool = table.get("t/l/0").pool
+                base = slot_pool.address(slot_pool.regions[0])
+                guard._core = MagicMock()
+                with patch.object(guard._recovery, "prepare_to_serve", lambda r: r):
+                    with patch.object(guard._recovery, "release_snapshot_region"):
+                        guard._serve({}, time.monotonic(), time.monotonic())
+                assert any("guard_promoted" in m for m in caplog.messages)
+                lines = [m for m in caplog.messages if "guard_data_pool_" in m]
+                assert lines == [
+                    f"KVCR_EVENT guard_data_pool_serving guard=0 slot=t/l/0 "
+                    f"base=0x{base:x} bytes={4 * PAGE} "
+                    f"regions={len(slot_pool.regions)}"
+                ]
+            finally:
+                guard._serving = False  # the mocked core has no state to hand back
+                guard._core = None
+                hold.release()
 
 
 @pytest.mark.parametrize("skew", [False, True])

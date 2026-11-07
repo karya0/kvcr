@@ -1158,12 +1158,23 @@ class _Guard:
             (serving - start_started) * 1000,
             (serving - started) * 1000,
         )
+        if self._data_pool is not None:
+            address, size, _digest, slot_name, regions = self._data_pool
+            logger.info(
+                "KVCR_EVENT guard_data_pool_serving guard=%d slot=%s "
+                "base=0x%x bytes=%d regions=%d",
+                self._guard_index,
+                slot_name,
+                address,
+                size,
+                regions,
+            )
 
     def _prepare_core(self) -> None:
         """Register the Guard's pool without accepting control traffic."""
 
         if self._data_pool is not None:
-            address, size, _digest, slot_name, regions = self._data_pool
+            address, size = self._data_pool[:2]
             pools = [(self._recovery.pools[0].name, address, size)]
         else:
             pools = [
@@ -1194,16 +1205,6 @@ class _Guard:
         )
         self._core = core
         self._log_promotion_stage("core_init_done")
-        if self._data_pool is not None:
-            logger.info(
-                "KVCR_EVENT guard_data_pool_registered guard=%d slot=%s "
-                "base=0x%x bytes=%d regions=%d",
-                self._guard_index,
-                slot_name,
-                address,
-                size,
-                regions,
-            )
         # Registration can take long; promotion's start() waits for it.
         core._progress.prepare(wait=False)
 
