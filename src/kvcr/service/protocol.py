@@ -691,7 +691,12 @@ class KVCRClient:
                 # this claimant never learned it won; only this message or death
                 # -- never bare EOF -- rolls it back. Must not mask the claim error.
                 with contextlib.suppress(BaseException):
-                    _send_release(connection, activated=False)
+                    if v2:
+                        # Do not await a reply: after a receive timeout the peer
+                        # is silent and a second wait would double the delay.
+                        connection.send(_Release(_PROTOCOL_VERSION, False))
+                    else:
+                        _send_release(connection, activated=False)
             _close_quietly(connection)
             if not grant_received and isinstance(error, (OSError, EOFError)):
                 raise KVCRSocketError(f"KVCR-Service claim failed: {error}") from error

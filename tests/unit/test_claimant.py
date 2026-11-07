@@ -5,6 +5,7 @@
 import json
 import logging
 import mmap
+import socket
 import sys
 import tempfile
 import time
@@ -348,3 +349,34 @@ def test_claim_guarded_pool_logs_the_v2_grant(tmp_path, pools, caplog):  # noqa:
         "gaas claim granted slot=t/l/0 claim_gen=1 layout_gen=1 effective_max="
     )
     assert messages[0].endswith(f"regions=1 guard={host}:{port}")
+
+
+def test_invalid_claim_flags_emit_the_error_line_and_exit_2(
+    tmp_path, pools, capsys  # noqa: F811
+):
+    server, table = _serve(tmp_path)
+    with server as harness:
+        _attach(harness, table)
+        code, steps = _run(harness, capsys, "--total-bytes", "0")
+    assert code == 2
+    assert steps["error"]["reason"] == "error"
+    assert "total_bytes" in steps["error"]["message"]
+
+
+def test_silent_peer_costs_one_receive_timeout_not_two(tmp_path, capsys):
+    path = tmp_path / "s.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(1)  # accepts at the kernel and never answers
+    started = time.monotonic()
+    code = claimant.main(
+        [
+            "--socket", str(path), "--tenant", "t", "--lineage", "l",
+            "--receive-timeout-s", "1",
+        ]
+    )  # fmt: skip
+    elapsed = time.monotonic() - started
+    listener.close()
+    steps = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert code == 2 and steps[-1]["reason"] == "timeout"
+    assert 1 <= elapsed < 1.8

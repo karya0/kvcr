@@ -26,6 +26,8 @@ import struct
 import sys
 from typing import Any
 
+import msgspec
+
 from kvcr.config import GaaSSettings
 from kvcr.runtime.control_channels import (
     KVCRMsgFramingError,
@@ -230,6 +232,9 @@ def main(argv: list[str] | None = None) -> int:
     except _Failure as failure:
         _step("error", reason=failure.reason, message=str(failure))
         return failure.code
+    except msgspec.ValidationError as error:  # a bad flag, caught before connecting
+        _step("error", reason="error", message=str(error))
+        return 2
     except KVCRServiceReasonError as error:
         _step("error", reason=error.reason, message=error.message)
         return 2
