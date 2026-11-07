@@ -236,7 +236,8 @@ def test_client_without_tenant_and_lineage_sends_the_v1_claim(tmp_path):
     real = FramedConnection.send_with_fd
 
     def spy(self, message, *fds):
-        sent.append(type(message))
+        if isinstance(message, (_Claim, _ClaimV2)):  # the service sends grants too
+            sent.append(type(message))
         return real(self, message, *fds)
 
     with (
@@ -259,7 +260,8 @@ def test_client_v2_claim_is_a_claim_v2_and_v1_server_refuses_it(tmp_path):
     real = FramedConnection.send_with_fd
 
     def spy(self, message, *fds):
-        sent.append(type(message))
+        if isinstance(message, (_Claim, _ClaimV2)):  # the service sends grants too
+            sent.append(type(message))
         return real(self, message, *fds)
 
     with (
