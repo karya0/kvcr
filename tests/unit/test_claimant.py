@@ -7,13 +7,19 @@ import mmap
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 if sys.platform != "linux":
     pytest.skip("memfd and MAP_FIXED regions are Linux-only", allow_module_level=True)
 
-from test_kvcr_service import _TEST_DIGEST, _control_bind, _running_server
+from test_kvcr_service import (  # noqa: F401 - _channels_are_taken is an autouse fixture
+    _TEST_DIGEST,
+    _channels_are_taken,
+    _control_bind,
+    _running_server,
+)
 from test_node_service import _SPECS, make_broker
 from test_node_service_v2 import HEADROOM, pools  # noqa: F401 - fixture
 
@@ -62,10 +68,17 @@ def _serve(tmp_path, pages=64):
     return _running_server(tmp_path), table
 
 
+def _attach(harness, table):
+    harness.server._server.slots = table
+    for guard in harness.server._server.registry._guards.values():
+        # A real Guard would register the pool with NIXL, which the host cannot.
+        guard._prepare_core = Mock()
+
+
 def test_write_then_verify_across_runs(tmp_path, pools, capsys):  # noqa: F811
     server, table = _serve(tmp_path)
     with server as harness:
-        harness.server._server.slots = table
+        _attach(harness, table)
         code, steps = _run(harness, capsys, "--mode", "write", "--release")
         assert code == 0 and steps["written"]["bytes"] == 4 * PAGE
         code, steps = _run(harness, capsys, "--mode", "verify", "--release")
@@ -75,7 +88,7 @@ def test_write_then_verify_across_runs(tmp_path, pools, capsys):  # noqa: F811
 def test_grow_shrink_increments_generation_twice(tmp_path, pools, capsys):  # noqa: F811
     server, table = _serve(tmp_path)
     with server as harness:
-        harness.server._server.slots = table
+        _attach(harness, table)
         code, steps = _run(harness, capsys, "--mode", "grow-shrink", "--release")
         assert code == 0
         assert steps["granted"]["layout_generation"] == 1
@@ -88,6 +101,6 @@ def test_grow_shrink_increments_generation_twice(tmp_path, pools, capsys):  # no
 def test_minimum_above_capacity_exits_2(tmp_path, pools, capsys):  # noqa: F811
     server, table = _serve(tmp_path, pages=3)
     with server as harness:
-        harness.server._server.slots = table
+        _attach(harness, table)
         code, steps = _run(harness, capsys, pages=(8, 4, 8))
         assert code == 2 and steps["error"]["reason"] == "capacity_below_minimum"
