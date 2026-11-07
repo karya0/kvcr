@@ -65,18 +65,26 @@ def _receive(connection: socket.socket) -> tuple[dict[str, Any], list[int]] | No
 
 
 def handle_layout(
-    connection: socket.socket, mappings: dict[int, tuple[mmap.mmap, int]]
+    connection: socket.socket,
+    mappings: dict[int, tuple[mmap.mmap, int]],
+    reset: bool = False,
 ) -> bool:
     """Receive one layout, map and touch new regions, report. False on EOF.
 
     ``mappings`` maps region index to (mmap, size) and is kept by the caller so
-    the pages stay resident; regions absent from the layout are unmapped.
+    the pages stay resident; regions absent from the layout are unmapped. With
+    ``reset`` (the first layout after a reconnect) every old mapping is dropped
+    first: a restarted supervisor feeds a new memfd, so old mappings are stale.
     """
     received = _receive(connection)
     if received is None:
         return False
     layout, fds = received
     try:
+        if reset:
+            for view, _size in mappings.values():
+                view.close()
+            mappings.clear()
         wanted = {region["index"]: region for region in layout["regions"]}
         for index in set(mappings) - set(wanted):
             mappings.pop(index)[0].close()
@@ -103,9 +111,16 @@ def handle_layout(
     return True
 
 
-def connect(path: str, timeout_s: float) -> socket.socket:
-    """Connect, retrying until the supervisor has bound its socket."""
+def connect(
+    path: str, timeout_s: float, stop: threading.Event | None = None
+) -> socket.socket:
+    """Connect, retrying until the supervisor has bound its socket.
+
+    With ``stop`` the retry has no deadline and backs off up to 5 s, returning
+    only when connected or raising ``InterruptedError`` once ``stop`` is set.
+    """
     deadline = time.monotonic() + timeout_s
+    delay = 0.2
     while True:
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -113,11 +128,44 @@ def connect(path: str, timeout_s: float) -> socket.socket:
             return connection
         except OSError as error:
             connection.close()
-            if error.errno not in (errno.ENOENT, errno.ECONNREFUSED) or (
-                time.monotonic() >= deadline
-            ):
+            if error.errno not in (errno.ENOENT, errno.ECONNREFUSED):
                 raise
+            if stop is None:
+                if time.monotonic() >= deadline:
+                    raise
+            elif stop.is_set():
+                raise InterruptedError from error
+        if stop is None:
             time.sleep(0.2)
+        else:
+            stop.wait(delay)
+            delay = min(delay * 2, 5.0)
+
+
+def serve(
+    path: str,
+    connect_timeout_s: float,
+    stop: threading.Event,
+    mappings: dict[int, tuple[mmap.mmap, int]],
+) -> None:
+    """Hold the mappings; on EOF reconnect with backoff rather than sleeping forever."""
+    connection = connect(path, connect_timeout_s)
+    reset = False
+    while not stop.is_set():
+        if select.select([connection], [], [], 1.0)[0]:
+            try:
+                alive = handle_layout(connection, mappings, reset)
+            except OSError:
+                alive = False
+            if alive:
+                reset = False
+                continue
+            connection.close()
+            try:
+                connection = connect(path, 0, stop)
+            except InterruptedError:
+                return
+            reset = True
 
 
 def main() -> None:
@@ -130,14 +178,7 @@ def main() -> None:
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
-    mappings: dict[int, tuple[mmap.mmap, int]] = {}
-    connection = connect(args.socket, args.connect_timeout_s)
-    listening = True
-    while not stop.is_set():
-        if listening and select.select([connection], [], [], 1.0)[0]:
-            listening = handle_layout(connection, mappings)
-        elif not listening:
-            stop.wait(1.0)
+    serve(args.socket, args.connect_timeout_s, stop, {})
 
 
 if __name__ == "__main__":

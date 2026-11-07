@@ -11,8 +11,8 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
+import msgspec
 import pytest
 
 if sys.platform != "linux":
@@ -22,13 +22,19 @@ from test_node_service import FakeAPI, make_broker
 from test_node_service_v2 import DIGEST, HEADROOM, PAGE, _claim
 
 from kvcr.service import holder
+from kvcr.service.memory import KVCRPoolSpec, _pool_filename
 from kvcr.service.node_service import PoolClaim, SlotError, SlotTable
 from kvcr.service.protocol import (
     IDENTITY_MISMATCH,
     SLOT_HELD,
     PoolRegion,
     _Error,
+    _ErrorV2,
+    _Granted,
+    _GrantedV2,
+    _PoolDescriptor,
     _response_fd_counts,
+    _TierConfig,
 )
 from kvcr.service.server import pod_uid_from_cgroup
 
@@ -80,15 +86,75 @@ def test_holder_touches_and_reports():
 
 
 def test_response_fd_counts():
-    assert _response_fd_counts(SimpleNamespace(slot_name=None, regions=())) == (2,)
-    v2 = SimpleNamespace(slot_name="t/l", regions=(PoolRegion(0, 0, PAGE, 0),))
+    spec = KVCRPoolSpec(
+        "p", "/x/" + _pool_filename("p", "0" * 32), "0" * 32, 1, 2, 16384, 8192
+    )
+    v2 = _GrantedV2(
+        0,
+        spec,
+        _TierConfig([("pool", PAGE)], None),
+        (_PoolDescriptor("pool", PAGE, PAGE, 0),),
+        1,
+        "t/l/0",
+        PAGE,
+        (PoolRegion(0, 0, PAGE, 0),),
+        1,
+        1,
+        "h:1",
+    )
     assert _response_fd_counts(v2) == (3,)
-    two_fds = SimpleNamespace(
-        slot_name="t/l",
-        regions=(PoolRegion(0, 0, PAGE, 0), PoolRegion(1, PAGE, PAGE, 1)),
+    two_fds = msgspec.structs.replace(
+        v2, regions=(PoolRegion(0, 0, PAGE, 0), PoolRegion(1, PAGE, PAGE, 1))
     )
     assert _response_fd_counts(two_fds) == (4,)
+    v1 = _Granted(0, v2.spec, v2.tier_config, v2.pools, 1)
+    assert _response_fd_counts(v1) == (2,)
     assert _response_fd_counts(_Error("x", 2)) == (0,)
+    assert _response_fd_counts(_ErrorV2("x", 2)) == (0,)
+
+
+def test_holder_reconnects_after_eof_and_remaps(tmp_path):
+    path = str(tmp_path / "h.sock")
+    stop = threading.Event()
+    mappings = {}
+    thread = threading.Thread(
+        target=holder.serve, args=(path, 10, stop, mappings), daemon=True
+    )
+
+    def feed(listener, size):
+        conn, _ = listener.accept()
+        fd = os.memfd_create("x")
+        os.ftruncate(fd, size)
+        layout = {
+            "regions": [{"index": 0, "offset": 0, "size": size, "fd_index": 0}],
+            "layout_generation": 1,
+        }
+        socket.send_fds(conn, [json.dumps(layout).encode() + b"\n"], [fd])
+        os.close(fd)
+        return conn, _read_report(conn)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(path)
+        listener.listen(1)
+        listener.settimeout(10)
+        thread.start()
+        conn, report = feed(listener, PAGE)
+        assert report["touched_bytes"] == PAGE
+        conn.close()  # the supervisor goes away
+        listener.close()
+        os.unlink(path)  # holder now retries with backoff, not sleeping forever
+        time.sleep(0.5)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as second:
+            second.bind(path)
+            second.listen(1)
+            second.settimeout(10)
+            conn, report = feed(second, 2 * PAGE)
+            # Remapped from the new memfd, not left on the stale mapping.
+            assert report["touched_bytes"] == 2 * PAGE
+            conn.close()
+    stop.set()
+    thread.join(10)
+    assert not thread.is_alive()
 
 
 class _ToucherAPI(FakeAPI):
@@ -123,7 +189,9 @@ def test_slot_claim_feeds_toucher(tmp_path):
     api = _ToucherAPI()
     broker = make_broker(tmp_path, api)
     broker.toucher = True
-    table = SlotTable(broker, HEADROOM + 64 * PAGE, ensure_timeout_s=10)
+    table = SlotTable(
+        broker, HEADROOM + 64 * PAGE, ensure_timeout_s=10, require_pod_identity=False
+    )
     reports = []
 
     def run_holder():
@@ -147,7 +215,7 @@ def test_slot_claim_feeds_toucher(tmp_path):
         assert slot.layout_generation == slot.pool.layout_generation
     finally:
         thread.join(10)
-        table.release("t/l")
+        table.release("t/l/0")
 
 
 UID = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"
@@ -178,6 +246,7 @@ def _claim_as(table, peer, claim_id="a", alive=lambda: True):
     return table.claim(
         "t",
         "l",
+        0,
         total=4 * PAGE,
         minimum=2 * PAGE,
         maximum=8 * PAGE,  # room above the grant to grow into
@@ -189,26 +258,30 @@ def _claim_as(table, peer, claim_id="a", alive=lambda: True):
 
 
 def test_resize_identity_by_pod_uid(tmp_path):
-    table = SlotTable(make_broker(tmp_path), HEADROOM + 64 * PAGE)
+    table = SlotTable(
+        make_broker(tmp_path), HEADROOM + 64 * PAGE, require_pod_identity=False
+    )
     owner = (100, 1000, "pod-a")
     try:
         _claim_as(table, owner)
         # Same pod from another process: allowed.
-        table.grow("t/l", (101, 1000, "pod-a"), PAGE, None)
+        table.grow("t/l/0", (101, 1000, "pod-a"), PAGE, None)
         # Different pod: refused, even with the same pid and uid.
         with pytest.raises(SlotError) as raised:
-            table.grow("t/l", (100, 1000, "pod-b"), PAGE, None)
+            table.grow("t/l/0", (100, 1000, "pod-b"), PAGE, None)
         assert raised.value.reason == IDENTITY_MISMATCH
         # No pod UID on one side: fall back to (pid, uid).
-        table.grow("t/l", (100, 1000, None), PAGE, None)
+        table.grow("t/l/0", (100, 1000, None), PAGE, None)
         with pytest.raises(SlotError):
-            table.grow("t/l", (101, 1000, None), PAGE, None)
+            table.grow("t/l/0", (101, 1000, None), PAGE, None)
     finally:
-        table.release("t/l")
+        table.release("t/l/0")
 
 
 def test_successor_pod_claims_free_slot_not_held_slot(tmp_path):
-    table = SlotTable(make_broker(tmp_path), HEADROOM + 64 * PAGE)
+    table = SlotTable(
+        make_broker(tmp_path), HEADROOM + 64 * PAGE, require_pod_identity=False
+    )
     alive = [True]
     try:
         _claim_as(table, (100, 1000, "pod-a"), alive=lambda: alive[0])
@@ -219,6 +292,6 @@ def test_successor_pod_claims_free_slot_not_held_slot(tmp_path):
         slot = _claim_as(table, (200, 1000, "pod-b"), claim_id="b")
         assert slot.peer[2] == "pod-b"
         with pytest.raises(SlotError):
-            table.grow("t/l", (100, 1000, "pod-a"), PAGE, None)
+            table.grow("t/l/0", (100, 1000, "pod-a"), PAGE, None)
     finally:
-        table.release("t/l")
+        table.release("t/l/0")
