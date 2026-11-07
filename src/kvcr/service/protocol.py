@@ -219,6 +219,8 @@ class _Grow(msgspec.Struct, frozen=True, tag="grow"):
     version: ProtocolVersion
     slot_name: str
     additional_bytes: Annotated[int, msgspec.Meta(gt=0)]
+    # From the grant: a resize by a stale claim of the same pod is refused.
+    claim_generation: int
     # Number of regions to add the bytes as; None lets the service choose.
     split: Annotated[int, msgspec.Meta(gt=0)] | None = None
 
@@ -227,6 +229,7 @@ class _Shrink(msgspec.Struct, frozen=True, tag="shrink"):
     version: ProtocolVersion
     slot_name: str
     region_indices: tuple[int, ...]
+    claim_generation: int
 
 
 class _Grown(msgspec.Struct, frozen=True, tag="grown"):

@@ -201,10 +201,10 @@ def test_pool_region_roundtrip():
 
 
 def test_grow_shrink_and_responses_roundtrip():
-    grow = _Grow(1, "slot-a", 4096, 2)
+    grow = _Grow(1, "slot-a", 4096, 7, 2)
     assert _roundtrip(grow, _CLAIM_DECODER) == grow
-    assert _roundtrip(_Grow(1, "slot-a", 4096), _CLAIM_DECODER).split is None
-    shrink = _Shrink(1, "slot-a", (1, 2))
+    assert _roundtrip(_Grow(1, "slot-a", 4096, 7), _CLAIM_DECODER).split is None
+    shrink = _Shrink(1, "slot-a", (1, 2), 7)
     assert _roundtrip(shrink, _CLAIM_DECODER) == shrink
     grown = _Grown(1, _REGIONS, 3)
     assert _roundtrip(grown, _RESIZE_RESPONSE_DECODER) == grown
@@ -243,7 +243,7 @@ def test_error_reason_default_and_codes():
 
 @pytest.mark.parametrize(
     "request_",
-    [_Grow(1, "slot-a", 4096), _Shrink(1, "slot-a", (0,))],
+    [_Grow(1, "slot-a", 4096, 7), _Shrink(1, "slot-a", (0,), 7)],
 )
 def test_server_rejects_resize_with_a_reason(tmp_path, request_):
     with _running_server(tmp_path) as harness:

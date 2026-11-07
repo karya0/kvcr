@@ -477,11 +477,18 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             peer = _peer_identity(self.request)
             if isinstance(request, _Grow):
                 regions, generation = slots.grow(
-                    request.slot_name, peer, request.additional_bytes, request.split
+                    request.slot_name,
+                    peer,
+                    request.additional_bytes,
+                    request.split,
+                    request.claim_generation,
                 )
                 return _Grown(_PROTOCOL_VERSION, regions, generation)
             removed, generation = slots.shrink(
-                request.slot_name, peer, request.region_indices
+                request.slot_name,
+                peer,
+                request.region_indices,
+                request.claim_generation,
             )
             return _Shrunk(_PROTOCOL_VERSION, removed, generation)
         except SlotError as error:

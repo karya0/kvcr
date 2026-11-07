@@ -189,7 +189,10 @@ def _mode(args: argparse.Namespace, grant: Any, fds: list[int], views: dict) -> 
     if args.mode == "write":
         return
     grown = _resize(
-        args.socket, _Grow(_PROTOCOL_VERSION, grant.slot_name, args.grow_bytes)
+        args.socket,
+        _Grow(
+            _PROTOCOL_VERSION, grant.slot_name, args.grow_bytes, grant.claim_generation
+        ),
     )
     end = max(r.offset + r.size for _v, r in views.values())
     if grown.layout_generation != grant.layout_generation + 1 or any(
@@ -210,7 +213,10 @@ def _mode(args: argparse.Namespace, grant: Any, fds: list[int], views: dict) -> 
     for view, _region in added.values():
         view.close()  # a region must be unmapped before it is shrunk away
     shrunk = _resize(
-        args.socket, _Shrink(_PROTOCOL_VERSION, grant.slot_name, tuple(added))
+        args.socket,
+        _Shrink(
+            _PROTOCOL_VERSION, grant.slot_name, tuple(added), grant.claim_generation
+        ),
     )
     if shrunk.layout_generation != grant.layout_generation + 2:
         raise _Failure(3, "mismatch", "layout_generation did not increment twice")

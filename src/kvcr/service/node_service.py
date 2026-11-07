@@ -1443,7 +1443,9 @@ class SlotTable:
                 IDENTITY_MISMATCH, f"slot {slot.name} changed owner during the resize"
             )
 
-    def _owned(self, name: str, peer: Any) -> tuple[_Slot, int]:
+    def _owned(
+        self, name: str, peer: Any, claim_generation: int | None = None
+    ) -> tuple[_Slot, int]:
         from .protocol import IDENTITY_MISMATCH, UNKNOWN_SLOT
 
         self._check_identity(peer)
@@ -1455,13 +1457,25 @@ class SlotTable:
                 raise SlotError(
                     IDENTITY_MISMATCH, f"slot {name} belongs to another peer"
                 )
+            # A released slot, or a stale claim of the same pod, may not resize.
+            if not slot.held or claim_generation not in (None, slot.claim_generation):
+                raise SlotError(
+                    IDENTITY_MISMATCH, f"slot {name} is not held by this claim"
+                )
             return slot, slot.claim_generation
 
-    def grow(self, name: str, peer: Any, additional_bytes: int, split: int | None):
+    def grow(
+        self,
+        name: str,
+        peer: Any,
+        additional_bytes: int,
+        split: int | None,
+        claim_generation: int | None = None,
+    ):
         from .protocol import CAPACITY_BELOW_MINIMUM, INTERNAL
         from .regions import CapacityError
 
-        slot, generation_seen = self._owned(name, peer)
+        slot, generation_seen = self._owned(name, peer, claim_generation)
         with slot.lock:
             self._recheck_owner(slot, peer, generation_seen)
             before = (slot.pool.layout_generation, slot.pool.next_index)
@@ -1487,11 +1501,17 @@ class SlotTable:
             self._persist()
         return regions, generation
 
-    def shrink(self, name: str, peer: Any, indices: tuple[int, ...]):
+    def shrink(
+        self,
+        name: str,
+        peer: Any,
+        indices: tuple[int, ...],
+        claim_generation: int | None = None,
+    ):
         from .protocol import INTERNAL, REGION_BUSY, UNKNOWN_SLOT
         from .regions import RegionBusy, UnknownRegion
 
-        slot, generation_seen = self._owned(name, peer)
+        slot, generation_seen = self._owned(name, peer, claim_generation)
         with slot.lock:
             self._recheck_owner(slot, peer, generation_seen)
             try:

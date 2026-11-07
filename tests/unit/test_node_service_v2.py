@@ -274,7 +274,7 @@ def test_terminating_holder_recreates(tmp_path, pools):
 
 def test_resize_round_trip_and_identity(tmp_path, pools):
     table, _ = _table(tmp_path)
-    _claim(table, total=2, minimum=2, maximum=8)
+    gen = _claim(table, total=2, minimum=2, maximum=8).claim_generation
     with _running_server(tmp_path) as harness:
         harness.server._server.slots = table
 
@@ -285,18 +285,25 @@ def test_resize_round_trip_and_identity(tmp_path, pools):
                 channel.send(request)
                 return channel.receive(_RESIZE_RESPONSE_DECODER)
 
-        grown = send(_Grow(1, "t/l/0", 2 * PAGE))
+        grown = send(_Grow(1, "t/l/0", 2 * PAGE, gen))
         assert isinstance(grown, _Grown) and grown.layout_generation == 2
         assert [r.index for r in grown.regions] == [1]
-        assert send(_Grow(1, "t/l/0", 64 * PAGE)).reason == CAPACITY_BELOW_MINIMUM
-        assert send(_Grow(1, "x/y/0", PAGE)).reason == UNKNOWN_SLOT
-        assert send(_Shrink(1, "t/l/0", (0,))).reason == REGION_BUSY  # not a suffix
-        assert send(_Shrink(1, "t/l/0", (7,))).reason == UNKNOWN_SLOT
-        shrunk = send(_Shrink(1, "t/l/0", (1,)))
+        assert send(_Grow(1, "t/l/0", 64 * PAGE, gen)).reason == CAPACITY_BELOW_MINIMUM
+        assert send(_Grow(1, "x/y/0", PAGE, gen)).reason == UNKNOWN_SLOT
+        assert (
+            send(_Shrink(1, "t/l/0", (0,), gen)).reason == REGION_BUSY
+        )  # not a suffix
+        assert send(_Shrink(1, "t/l/0", (7,), gen)).reason == UNKNOWN_SLOT
+        shrunk = send(_Shrink(1, "t/l/0", (1,), gen))
         assert isinstance(shrunk, _Shrunk) and shrunk.region_indices == (1,)
         assert shrunk.layout_generation == 3
+        stale = send(_Grow(1, "t/l/0", PAGE, gen + 1))  # not the granted claim
+        assert isinstance(stale, _ErrorV2) and stale.reason == IDENTITY_MISMATCH
+        table.get("t/l/0").owner_alive = None  # released: no resize either
+        assert send(_Shrink(1, "t/l/0", (0,), gen)).reason == IDENTITY_MISMATCH
+        table.get("t/l/0").owner_alive = lambda: True
         table.get("t/l/0").peer = (ME[0] + 1, ME[1])  # another peer owns the slot
-        for request in (_Grow(1, "t/l/0", PAGE), _Shrink(1, "t/l/0", (0,))):
+        for request in (_Grow(1, "t/l/0", PAGE, gen), _Shrink(1, "t/l/0", (0,), gen)):
             error = send(request)
             assert isinstance(error, _ErrorV2) and error.reason == IDENTITY_MISMATCH
 
@@ -651,8 +658,8 @@ def test_resize_rechecks_ownership_under_the_slot_lock(
     slot = _claim(table, "a", total=2, minimum=2, maximum=8, alive=lambda: alive["a"])
     real = table._owned
 
-    def owned_then_b_claims(name, peer):
-        result = real(name, peer)
+    def owned_then_b_claims(name, peer, *args):
+        result = real(name, peer, *args)
         alive["a"] = False  # A dies; B claims between validation and the lock
         _claim(table, "b", total=2, minimum=2, maximum=8, alive=lambda: alive["b"])
         return result
