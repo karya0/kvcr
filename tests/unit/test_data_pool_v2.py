@@ -7,6 +7,7 @@ import logging
 import mmap
 import os
 import sys
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -104,6 +105,9 @@ def test_partial_grant_fails_closed_and_frees_the_slot(tmp_path, pools):  # noqa
             _claim(harness)
         assert refused.value.reason == DATA_POOL_LAYOUT
         assert "granted" in refused.value.message
+        deadline = time.monotonic() + 5  # the service frees it on the release
+        while table.get("t/l/0").held and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert not table.get("t/l/0").held
 
 
