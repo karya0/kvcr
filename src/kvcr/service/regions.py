@@ -42,6 +42,7 @@ def _libc() -> ctypes.CDLL:
     libc.mmap.restype = ctypes.c_void_p
     libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_long, ctypes.c_long]
+    libc.fallocate.restype = ctypes.c_int
     return libc
 
 
@@ -62,6 +63,9 @@ class RegionPool:
     never has holes; the range is re-mapped PROT_NONE and its pages are punched out.
     Region indices are never reused. Pool data does not travel through the control
     socket: peers get ``pass_fd_list()`` over SCM_RIGHTS and map the regions.
+
+    The pool owns ``fd`` from the moment ``__init__`` is entered: a failed
+    construction closes it, and so does ``close()``, each exactly once.
     """
 
     def __init__(self, fd: int, maximum: int, page_size: int) -> None:
@@ -106,10 +110,10 @@ class RegionPool:
         fd = os.memfd_create("kvcr-region-pool", flags)
         try:
             os.ftruncate(fd, maximum)
-            return cls(fd, maximum, page)
         except BaseException:
             os.close(fd)
             raise
+        return cls(fd, maximum, page)  # owns fd, closing it if construction fails
 
     @property
     def fd(self) -> int:
@@ -192,6 +196,21 @@ class RegionPool:
         removed = [r for r in self._regions if r.index in wanted]
         if removed != self._regions[len(self._regions) - len(removed) :]:
             raise RegionBusy("only the highest regions can be removed")
+        # Punch first: a failure leaves the layout and generation untouched.
+        for region in removed:
+            if self._libc.fallocate(
+                self._fd, _FALLOC_PUNCH, region.offset, region.size
+            ):
+                error = ctypes.get_errno()
+                raise RegionBusy(
+                    f"cannot release region {region.index}: {os.strerror(error)}"
+                )
+        self._unmap(removed)
+        if removed:
+            self._generation += 1
+        return tuple(region.index for region in removed)
+
+    def _unmap(self, removed: list[PoolRegion]) -> None:
         for region in reversed(removed):
             addr = self._libc.mmap(
                 self._base + region.offset,
@@ -202,12 +221,44 @@ class RegionPool:
                 0,
             )
             _check(addr, "region unmap")
-            self._libc.fallocate(self._fd, _FALLOC_PUNCH, region.offset, region.size)
             self._regions.remove(region)
             self._quiescent.discard(region.index)
-        if removed:
-            self._generation += 1
-        return tuple(region.index for region in removed)
+
+    def rollback_grow(
+        self, added: tuple[PoolRegion, ...], generation: int, next_index: int
+    ) -> None:
+        """Undo a grow whose regions no peer acknowledged: drop them, restore ids."""
+        removed = [r for r in self._regions if r in added]
+        self._libc_punch(removed)
+        self._unmap(removed)
+        self._generation, self._next_index = generation, next_index
+
+    def _libc_punch(self, regions: list[PoolRegion]) -> None:
+        for region in regions:
+            self._libc.fallocate(self._fd, _FALLOC_PUNCH, region.offset, region.size)
+
+    def restore(
+        self, regions: list[PoolRegion], next_index: int, generation: int
+    ) -> None:
+        """Re-map a persisted layout into an empty pool (supervisor restart)."""
+        if self._regions:
+            raise ValueError("restore needs an empty pool")
+        for region in regions:
+            addr = self._libc.mmap(
+                self._base + region.offset,
+                region.size,
+                mmap.PROT_READ | mmap.PROT_WRITE,
+                mmap.MAP_SHARED | _MAP_FIXED,
+                self._fd,
+                region.offset,
+            )
+            _check(addr, "region mmap")
+            self._regions.append(region)
+        self._next_index, self._generation = next_index, generation
+
+    @property
+    def next_index(self) -> int:
+        return self._next_index
 
     def close(self) -> None:
         if self._base:
