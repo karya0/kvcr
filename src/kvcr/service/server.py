@@ -1117,6 +1117,7 @@ def _build_slots(args: argparse.Namespace) -> SlotTable | None:
         image=args.holder_image,
         socket_root=args.slot_root or Path(args.socket_path).resolve().parent,
         api=InClusterPodAPI(args.namespace),
+        toucher=True,
     )
     return SlotTable(
         broker, args.slot_cap_bytes, require_pod_identity=args.require_pod_identity

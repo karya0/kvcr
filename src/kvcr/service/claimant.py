@@ -27,7 +27,7 @@ import sys
 import uuid
 from typing import Any
 
-from kvcr.runtime.control_channels import FramedConnection
+from kvcr.runtime.control_channels import FramedConnection, KVCRMsgFramingError
 from kvcr.service.protocol import (
     _CLAIM_RESPONSE_DECODER,
     _PROTOCOL_VERSION,
@@ -150,7 +150,7 @@ def run(args: argparse.Namespace) -> None:
         )
         if hasattr(grant, "message"):
             raise _Failure(2, getattr(grant, "reason", "error"), grant.message)
-        # fds: pool, control listener (kept open until exit), then region memfds.
+        # fds: pool, control listener, then region memfds (all closed in finally).
         region_fds = fds[2:]
         _step(
             "granted",
@@ -267,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
     except (TimeoutError, socket.timeout) as error:
         _step("error", reason="timeout", message=str(error))
         return 2
-    except OSError as error:  # includes ConnectionError
+    except (OSError, EOFError, KVCRMsgFramingError) as error:  # incl. ConnectionError
         _step("error", reason="transport", message=str(error))
         return 2
     return 0

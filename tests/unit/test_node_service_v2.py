@@ -710,6 +710,43 @@ def test_service_main_builds_the_slot_table(tmp_path, monkeypatch):
     assert table.cap_bytes == 1048576 and not table.require_pod_identity
     assert table.broker.image == _HOLDER and table.broker.node_name == "node-a"
     assert server._build_slots(server._parse_args(_SLOT_ARGS[:10])) is None
+    # v2 slots must use the toucher holder, not a v1 service pod.
+    assert table.broker.toucher is True
+    claim = _Claim_pool("p1")
+    state = {"pod_name": "n", "creation_id": "c", "socket_path": "/n/p/s.sock"}
+    container = table.broker._pod(claim, state)["spec"]["containers"][0]
+    assert container["command"] == ["python", "-m", "kvcr.service.holder"]
+
+
+def _Claim_pool(name):
+    return node_service.PoolClaim(name, 1, "g")
+
+
+def test_service_main_passes_the_slot_table_to_the_service(tmp_path, monkeypatch):
+    seen = {}
+
+    class Fake:
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+
+        def serve_forever(self):
+            raise server._ShutdownRequested
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server, "InClusterPodAPI", lambda namespace: FakeAPI())
+    monkeypatch.setattr(server, "_KVCRService", Fake)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["kvcr-service"]
+        + _SLOT_ARGS
+        + ["--holder-image", _HOLDER, "--slot-root", str(tmp_path)],
+    )
+    server.main()
+    assert isinstance(seen["slots"], SlotTable)
+    assert seen["slots"].broker.toucher is True
 
 
 def test_service_slots_require_a_holder_image():

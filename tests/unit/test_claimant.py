@@ -24,6 +24,7 @@ from test_kvcr_service import (  # noqa: F401 - _channels_are_taken is an autous
 from test_node_service import _SPECS, make_broker
 from test_node_service_v2 import HEADROOM, pools  # noqa: F401 - fixture
 
+from kvcr.runtime.control_channels import KVCRMsgFramingError
 from kvcr.service import claimant
 from kvcr.service.node_service import SlotTable
 
@@ -130,14 +131,25 @@ def test_mapping_failure_frees_the_claim_and_exits_2(
         assert not table.get("t/l/0").held
 
 
-def test_default_receive_timeout_covers_the_service_ensure():
-    action = (
-        next(
-            a
-            for a in claimant.argparse.ArgumentParser._get_optional_actions  # noqa: B018
-            if False
-        )
-        if False
-        else None
-    )
-    assert action is None
+def test_default_receive_timeout_covers_the_service_ensure(monkeypatch):
+    seen = {}
+
+    def capture(self, argv=None, namespace=None):
+        seen["actions"] = {a.dest: a for a in self._actions}
+        raise SystemExit(0)
+
+    monkeypatch.setattr(claimant.argparse.ArgumentParser, "parse_args", capture)
+    with pytest.raises(SystemExit):
+        claimant.main([])
+    assert seen["actions"]["receive_timeout_s"].default >= 180
+
+
+@pytest.mark.parametrize("error", [EOFError("eof"), KVCRMsgFramingError("bad frame")])
+def test_eof_and_framing_errors_exit_2_as_transport(error, capsys, monkeypatch):
+    def boom(args):
+        raise error
+
+    monkeypatch.setattr(claimant, "run", boom)
+    code = claimant.main(["--socket", "s", "--tenant", "t", "--lineage", "l"])
+    assert code == 2
+    assert '"reason": "transport"' in capsys.readouterr().out.replace('":"', '": "')
