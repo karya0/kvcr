@@ -721,7 +721,9 @@ class KVCRClient:
     ) -> _Shrunk:
         """Drop regions from a slot; each must be unmapped by the caller first."""
         return self._resize(
-            _Shrink(_PROTOCOL_VERSION, slot_name, tuple(region_indices), claim_generation)
+            _Shrink(
+                _PROTOCOL_VERSION, slot_name, tuple(region_indices), claim_generation
+            )
         )
 
     def _resize(self, request: "_Grow | _Shrink") -> Any:

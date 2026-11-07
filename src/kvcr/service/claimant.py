@@ -235,7 +235,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except KVCRSocketError as error:  # the client wraps connect and claim I/O
         timed_out = isinstance(error.__cause__, (TimeoutError, socket.timeout))
-        _step("error", reason="timeout" if timed_out else "transport", message=str(error))
+        _step(
+            "error", reason="timeout" if timed_out else "transport", message=str(error)
+        )
         return 2
     except KVCRMsgFramingError as error:
         _step("error", reason="transport", message=str(error))

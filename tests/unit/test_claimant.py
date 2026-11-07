@@ -40,7 +40,6 @@ from kvcr.runtime.control_channels import (
 from kvcr.service import claimant
 from kvcr.service.node_service import SlotTable
 from kvcr.service.protocol import (
-    KVCRClient,
     KVCRServiceReasonError,
     _Claim,
     _ClaimV2,
@@ -334,7 +333,8 @@ def test_claim_guarded_pool_logs_the_v2_grant(tmp_path, pools, caplog):  # noqa:
             assert claimed.hold.slot_name == "t/l/0"
         finally:
             claimed.hold.release()
-    messages = [r.getMessage() for r in caplog.records if "gaas claim" in r.getMessage()]
+    messages = [r.getMessage() for r in caplog.records]
+    messages = [m for m in messages if "gaas claim" in m]
     assert len(messages) == 1
     assert messages[0].startswith(
         "gaas claim granted slot=t/l/0 claim_gen=1 layout_gen=1 effective_max="
