@@ -697,7 +697,6 @@ class KVCRClient:
                 raise KVCRSocketError(f"KVCR-Service claim failed: {error}") from error
             raise
 
-
     def grow(
         self,
         slot_name: str,

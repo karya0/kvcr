@@ -239,9 +239,12 @@ def test_client_without_tenant_and_lineage_sends_the_v1_claim(tmp_path):
         sent.append(type(message))
         return real(self, message, *fds)
 
-    with _running_server(tmp_path) as harness, patch.object(
-        FramedConnection, "send_with_fd", spy
+    with (
+        _running_server(tmp_path) as harness,
+        patch.object(FramedConnection, "send_with_fd", spy),
     ):
+        for guard in harness.server._server.registry._guards.values():
+            guard._prepare_core = Mock()  # NIXL registration is not under test
         for gaas in (None, GaaSSettings()):
             hold = harness.client.claim(
                 0, [("pool0", 1024)], _TEST_DIGEST, _control_bind(0), gaas=gaas
@@ -259,9 +262,12 @@ def test_client_v2_claim_is_a_claim_v2_and_v1_server_refuses_it(tmp_path):
         sent.append(type(message))
         return real(self, message, *fds)
 
-    with _running_server(tmp_path) as harness, patch.object(
-        FramedConnection, "send_with_fd", spy
+    with (
+        _running_server(tmp_path) as harness,
+        patch.object(FramedConnection, "send_with_fd", spy),
     ):
+        for guard in harness.server._server.registry._guards.values():
+            guard._prepare_core = Mock()  # NIXL registration is not under test
         with pytest.raises(KVCRServiceReasonError) as refused:
             _claim(harness)
     assert sent == [_ClaimV2]
