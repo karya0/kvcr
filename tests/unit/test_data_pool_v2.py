@@ -23,9 +23,16 @@ from test_claimant import (  # noqa: F401 - fixtures
     _claim,
     _serve,
 )
-from test_kvcr_service import _channels_are_taken  # noqa: F401 - autouse fixture
+from test_kvcr_service import (  # noqa: F401 - _channels_are_taken is autouse
+    _TEST_DIGEST,
+    _channels_are_taken,
+    _control_bind,
+)
 from test_node_service_v2 import pools  # noqa: F401 - used through pytestmark
 
+from kvcr.backends.local_disk import _G3Residency
+from kvcr.config import GaaSSettings
+from kvcr.runtime.core import _BlockRecord
 from kvcr.service import guard as guard_module
 from kvcr.service.protocol import (
     DATA_POOL_LAYOUT,
@@ -33,7 +40,13 @@ from kvcr.service.protocol import (
     PoolRegion,
     region_table_digest,
 )
+from kvcr.service.recovery_journal import (
+    _RECORD_BLOCK,
+    _RECOVERY_ENCODER,
+    _project_recovery_record,
+)
 from kvcr.service.regions import RegionMapping
+from kvcr.types import BlockKey
 
 pytestmark = pytest.mark.usefixtures("pools")
 
@@ -124,10 +137,6 @@ def test_two_pool_tier_fails_closed(short_dir):
     server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
-        from test_kvcr_service import _TEST_DIGEST, _control_bind
-
-        from kvcr.config import GaaSSettings
-
         with pytest.raises(KVCRServiceReasonError, match="one pool") as refused:
             harness.client.claim(
                 0,
@@ -266,5 +275,95 @@ def test_an_unwritten_header_does_not_drop_the_mirror(
             with caplog.at_level(logging.WARNING):
                 guard._recovery.take_for_promotion()
             assert not any("stale_layout" in m for m in caplog.messages)
+        finally:
+            hold.release()
+
+
+_KEY = BlockKey(b"slot-a-record")
+
+
+def _seed(guard):
+    """One record in the Guard's mirror, as a primary's journal would publish it."""
+    record = _BlockRecord(g3=_G3Residency(("pool0",), (0,)))
+    payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
+    guard._recovery.mirror.apply(_RECORD_BLOCK, bytes(_KEY), payload)
+
+
+def _claim_layout(harness, layout):
+    return harness.client.claim(
+        0,
+        [("pool0", 1024)],
+        _TEST_DIGEST,
+        _control_bind(0),
+        gaas=GaaSSettings("t", layout, 4 * PAGE, 2 * PAGE, 8 * PAGE),
+        receive_timeout_s=10,
+    )
+
+
+def _released_with_a_record(harness, guard, layout="l"):
+    first = _claim_layout(harness, layout)
+    _seed(guard)
+    first.release()
+
+
+@pytest.mark.parametrize("wrote_digest", [False, True])
+def test_another_slots_claim_does_not_adopt_the_released_slots_records(
+    short_dir, caplog, wrote_digest
+):
+    """Slot A's snapshot is its own: B on the same rank never inherits it."""
+    server, table = _serve(short_dir)
+    with server as harness:
+        _attach(harness, table)
+        guard = harness.server._server.registry._guards[0]
+        with caplog.at_level(logging.WARNING):
+            _released_with_a_record(harness, guard)
+            second = _claim_layout(harness, "other")
+            try:
+                if wrote_digest:
+                    second._attachment.set_layout_digest(
+                        region_table_digest(
+                            second.regions,
+                            second.region_fds,
+                            second.slot_name,
+                            second.claim_generation,
+                        )
+                    )
+                else:
+                    second._attachment.set_layout_digest(bytes(32))
+                assert guard._recovery.take_for_promotion() == {}
+            finally:
+                second.release()
+        assert any("stale_layout" in m for m in caplog.messages)
+
+
+def test_reclaiming_the_same_backing_keeps_the_mirror(short_dir, caplog):
+    """A claimant that dies before writing its digest resumes warm on its own slot."""
+    server, table = _serve(short_dir)
+    with server as harness:
+        _attach(harness, table)
+        guard = harness.server._server.registry._guards[0]
+        _released_with_a_record(harness, guard)
+        again = _claim_layout(harness, "l")
+        try:
+            again._attachment.set_layout_digest(bytes(32))
+            with caplog.at_level(logging.WARNING):
+                assert list(guard._recovery.take_for_promotion()) == [_KEY]
+            assert not any("stale_layout" in m for m in caplog.messages)
+        finally:
+            again.release()
+
+
+def test_a_mirror_of_unknown_provenance_is_dropped(short_dir, caplog):
+    server, table = _serve(short_dir)
+    with server as harness:
+        _attach(harness, table)
+        guard = harness.server._server.registry._guards[0]
+        hold = _claim_layout(harness, "l")
+        try:
+            _seed(guard)
+            guard._recovery._backing = None
+            with caplog.at_level(logging.WARNING):
+                assert guard._recovery.take_for_promotion() == {}
+            assert any("stale_layout" in m for m in caplog.messages)
         finally:
             hold.release()

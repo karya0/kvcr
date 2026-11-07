@@ -229,7 +229,7 @@ class _PoolRegistry:
         tier_config: _TierConfig,
         liveness: PidfdLiveness,
         control_bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[[], bytes]] | None = None,
+        data_pool: tuple[int, int, Callable[..., bytes]] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give a pool group to a primary and return its Guard endpoint.
 
@@ -400,11 +400,17 @@ class _PoolRegistry:
         self.on_uncontained_failure(error)
 
 
-def _live_layout_digest(slot: Any, claim_generation: int) -> bytes:
-    """The slot's layout now, so a Grow or Shrink after the claim changes it."""
+def _live_layout_digest(
+    slot: Any, claim_generation: int, backing_only: bool = False
+) -> bytes:
+    """The slot's layout now, so a Grow or Shrink after the claim changes it.
+
+    ``backing_only`` drops the claim generation: it names the memory alone."""
     pool = slot.pool
     try:
-        return region_table_digest(pool.regions, [pool.fd], slot.name, claim_generation)
+        return region_table_digest(
+            pool.regions, [pool.fd], slot.name, 0 if backing_only else claim_generation
+        )
     except OSError:  # the pool is closed: nothing matches
         return b""
 
@@ -755,7 +761,9 @@ class _ThreadingUnixServer(
                 else (
                     slot.pool.address(slot.pool.regions[0]),
                     slot.pool.used_bytes,
-                    lambda: _live_layout_digest(slot, generation),
+                    lambda backing_only=False: _live_layout_digest(
+                        slot, generation, backing_only
+                    ),
                 ),
             )
             if guard is None:

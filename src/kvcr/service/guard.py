@@ -200,7 +200,12 @@ class _RecoveryState:
         # v2: digest of the region table this Guard registered; the claimant must
         # have written the same one in the journal header, or its records are not
         # at the offsets this Guard serves.
-        self.layout_digest: Callable[[], bytes] | None = None
+        # ``layout_digest(backing_only=True)`` leaves out the claim generation: it
+        # names the memory, which a later claim of the same slot shares.
+        self.layout_digest: Callable[..., bytes] | None = None
+        # The backing the mirror and the retained snapshot were recorded under;
+        # None is unknown provenance, which a v2 pool never trusts.
+        self._backing: bytes | None = None
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
@@ -232,7 +237,20 @@ class _RecoveryState:
         if self.mirror is None:
             self.mirror = _RecoveryMirror(tuple(pool.name for pool in self.pools))
         self._journal.reset()
-        if self.layout_digest is not None:  # until the claimant writes its own
+        if self.layout_digest is not None:
+            backing = self.layout_digest(backing_only=True)
+            if self._backing != backing:
+                # Records of another slot's memory, or of unknown provenance:
+                # adopting them would serve this claim's bytes under their keys.
+                if self._backing is not None:  # the first claim retains nothing
+                    logger.warning(
+                        "KVCR discarding retained recovery state recorded under "
+                        "another backing (stale_layout)"
+                    )
+                self.mirror = _RecoveryMirror(tuple(pool.name for pool in self.pools))
+                self.attachment.release_snapshot_region()
+                self._backing = backing
+            # Zeros until the claimant writes its own.
             self.attachment.set_layout_digest(bytes(LAYOUT_DIGEST_BYTES))
 
     def poll(self) -> bool:
@@ -265,6 +283,14 @@ class _RecoveryState:
         else:
             try:
                 header = self.attachment.layout_digest()
+                if self.layout_digest is not None and (
+                    self._backing is None
+                    or self._backing != self.layout_digest(backing_only=True)
+                ):
+                    raise RecoveryJournalError(
+                        "recovery state has no matching backing digest; "
+                        "refusing its records (stale_layout)"
+                    )
                 # All zeros: the claimant wrote no digest, so no records either.
                 if (
                     self.layout_digest is not None
@@ -420,7 +446,7 @@ class _Guard:
         # Owned by the current primary.
         self._control: ZmqPeerControlChannel | None = None
         self._configured: _TierConfig | None = None
-        self._data_pool: tuple[int, int, Callable[[], bytes]] | None = None
+        self._data_pool: tuple[int, int, Callable[..., bytes]] | None = None
         self._recovery = _RecoveryState(spec, compatibility_digest, pool_sizes_bytes)
         self._core = None
         # Released cores still registering; _poll closes each once registered.
@@ -483,7 +509,7 @@ class _Guard:
         liveness: PidfdLiveness,
         tier_config: _TierConfig,
         bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[[], bytes]] | None = None,
+        data_pool: tuple[int, int, Callable[..., bytes]] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give this pool group to a primary, with its Guard's endpoint.
         Reserved on the requesting thread: a mid-transition pool answers busy
@@ -842,7 +868,7 @@ class _Guard:
         liveness: PidfdLiveness,
         tier_config: _TierConfig,
         bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[[], bytes]] | None = None,
+        data_pool: tuple[int, int, Callable[..., bytes]] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give the pool to a primary, and take up the endpoint it named.
         All fallible work runs before the lease exists, and commit and refusal
