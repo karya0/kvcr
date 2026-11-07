@@ -47,8 +47,10 @@ _TOUCHER_OVERHEAD_BYTES = 128 << 20
 
 
 def _toucher_overhead_bytes(data_bytes: int) -> int:
-    """Fixed holder RSS plus the page tables for 4 KiB shmem pages (data / 512)."""
-    return _TOUCHER_OVERHEAD_BYTES + -(-data_bytes // 512)
+    """Fixed holder RSS plus kernel memory charged per shmem page: page tables
+    (data / 512) and page-cache xarray slab (~data / 430), measured as 210 MB for
+    46 GiB; data / 256 covers both."""
+    return _TOUCHER_OVERHEAD_BYTES + -(-data_bytes // 256)
 _LINEAGE_LABEL = "nvidia.com/dynamo-graph-deployment-name"
 _DYNAMO_NAMESPACE_LABEL = "nvidia.com/dynamo-namespace"
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")

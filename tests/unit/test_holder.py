@@ -194,9 +194,10 @@ def test_toucher_memory_covers_page_tables(tmp_path):
         pod = v2._pod(PoolClaim("p1", gib, DIGEST), state)
         return int(pod["spec"]["containers"][0]["resources"]["limits"]["memory"][:-2])
 
-    # shmem page tables cost data / 512; the 46 GiB c5 pool was OOM-killed at +128 MiB.
-    assert 46 * 1024 + 92 + 128 <= limit_mib(46) <= 46 * 1024 + 92 + 128 + 1
-    assert limit_mib(1) <= 1024 + 131
+    # shmem page tables (92 MiB) and page-cache slab (~108 MiB) are charged to the
+    # holder; the 46 GiB c5 pool was OOM-killed at +128 MiB.
+    assert 46 * 1024 + 92 + 128 <= limit_mib(46) <= 46 * 1024 + 128 + 184
+    assert limit_mib(1) <= 1024 + 136
 
 
 def test_slot_claim_feeds_toucher(tmp_path):
