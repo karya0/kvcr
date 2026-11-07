@@ -420,7 +420,10 @@ class NodeBroker:
     def _toucher_pod(
         self, pod: dict[str, Any], claim: PoolClaim, state: dict[str, Any]
     ) -> dict[str, Any]:
-        """Guaranteed QoS: fractional CPU, memory = pool maximum + overhead.
+        """Guaranteed QoS: one CPU, memory = pool maximum + overhead.
+
+        Population is single-threaded and CPU-bound, so a fractional CPU would
+        throttle it far below the ensure window.
 
         The overhead is a fixed part plus page tables, which the holder's memcg is
         charged for; sized any lower, populating a full pool is OOM-killed.
@@ -434,7 +437,7 @@ class NodeBroker:
         container.pop("readinessProbe")
         container["volumeMounts"] = container["volumeMounts"][:1]
         spec["volumes"] = spec["volumes"][:1]
-        resources = {"cpu": "100m", "memory": memory}
+        resources = {"cpu": "1", "memory": memory}
         container["resources"] = {"requests": dict(resources), "limits": resources}
         return pod
 

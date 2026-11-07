@@ -181,7 +181,9 @@ def test_toucher_pod_is_guaranteed_and_v1_unchanged(tmp_path):
     assert container["args"] == ["--socket", "/n/p/holder.sock"]
     resources = container["resources"]
     assert resources["requests"] == resources["limits"]
-    assert resources["requests"]["cpu"] == "100m"
+    assert resources["requests"]["cpu"] == "1"
+    assert resources["limits"]["cpu"] == "1"
+    assert old["spec"]["containers"][0]["resources"]["requests"]["cpu"] == "100m"
     assert "readinessProbe" not in container
 
 
