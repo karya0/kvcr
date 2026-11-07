@@ -753,7 +753,9 @@ class _ThreadingUnixServer(
                 heartbeat_enabled=guard.heartbeat_enabled,
             )
         else:
-            host = getattr(self, "advertise_host", None) or request.control_host
+            host = request.control_host
+            if host == "0.0.0.0" and self.advertise_host:
+                host = self.advertise_host
             granted = _GrantedV2(
                 *common,
                 slot_name=slot.name,
@@ -761,8 +763,9 @@ class _ThreadingUnixServer(
                 regions=slot.pool.regions,
                 layout_generation=slot.pool.layout_generation,
                 claim_generation=generation,
-                # The Guard binds the claimant-requested control address; the
-                # grant advertises a reachable host when one is configured.
+                # The Guard binds the claimant-requested control address. Only a
+                # wildcard bind is replaced by the configured reachable host; a
+                # claimant that bound a specific address is advertised as bound.
                 guard_endpoint=f"{host}:{request.control_port}",
                 dead_incarnations=guard.dead_incarnations,
                 heartbeat_enabled=guard.heartbeat_enabled,
@@ -1070,6 +1073,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("KVCR_LOG_LEVEL", "INFO"),
     )
     args = parser.parse_args(argv)
+    if args.advertise_host is not None and (
+        not args.advertise_host.strip()
+        or args.advertise_host != args.advertise_host.strip()
+        or any(c in args.advertise_host for c in ":/ \t")
+        or args.advertise_host in ("0.0.0.0", "::")
+    ):
+        parser.error(
+            "--advertise-host must be a bare reachable host name or address "
+            "(no port, URL, whitespace or wildcard)"
+        )
     if args.guard_count < 1:
         parser.error("--guard-count must be at least 1")
     if args.health_port is not None and not 1 <= args.health_port <= 65535:
@@ -1187,11 +1200,12 @@ def main() -> None:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                 logger.info(
                     "KVCR service ready: socket=%s guards=%d pool_sizes_bytes=%s "
-                    "journal_bytes=%d",
+                    "journal_bytes=%d advertise_host=%s",
                     args.socket_path,
                     args.guard_count,
                     args.pool_sizes_bytes,
                     _DEFAULT_JOURNAL_BYTES,
+                    args.advertise_host,
                 )
                 server.serve_forever()
             except _ShutdownRequested:

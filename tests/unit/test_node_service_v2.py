@@ -638,7 +638,7 @@ def test_server_path_grant_advertises_a_reachable_guard_endpoint(tmp_path, pools
         def claim(self, *args):
             return None, None, -1, None
 
-    def endpoint(advertise_host, incarnation):
+    def endpoint(advertise_host, incarnation, control_host="0.0.0.0"):
         server = SimpleNamespace(
             compatibility_digest=DIGEST,
             slots=table,
@@ -649,7 +649,7 @@ def test_server_path_grant_advertises_a_reachable_guard_endpoint(tmp_path, pools
             0,
             DIGEST,
             _TierConfig([("pool", 4096)], None),
-            "0.0.0.0",
+            control_host,
             55001,
             1,
             "t",
@@ -668,6 +668,9 @@ def test_server_path_grant_advertises_a_reachable_guard_endpoint(tmp_path, pools
     assert endpoint(None, "a") == "0.0.0.0:55001"
     table.vacate("t/l/0", ME, 1)
     assert endpoint("10.1.2.3", "a") == "10.1.2.3:55001"
+    table.vacate("t/l/0", ME, 1)
+    # A claimant that bound a specific address is advertised as bound.
+    assert endpoint("10.1.2.3", "a", "10.9.9.9") == "10.9.9.9:55001"
 
 
 def test_claim_returns_its_own_generation(tmp_path, pools):
@@ -811,11 +814,25 @@ def test_service_main_passes_the_slot_table_to_the_service(tmp_path, monkeypatch
         "argv",
         ["kvcr-service"]
         + _SLOT_ARGS
-        + ["--holder-image", _HOLDER, "--slot-root", str(tmp_path)],
+        + ["--holder-image", _HOLDER, "--slot-root", str(tmp_path)]
+        + ["--advertise-host", "10.1.2.3"],
     )
     server.main()
+    assert seen["advertise_host"] == "10.1.2.3"
     assert isinstance(seen["slots"], SlotTable)
     assert seen["slots"].broker.toucher is True
+
+
+@pytest.mark.parametrize(
+    "value", ["", " ", "a b", "10.1.2.3:55001", "http://h", "h/x", "0.0.0.0", "::"]
+)
+def test_advertise_host_rejects_non_hosts(tmp_path, value):
+    with pytest.raises(SystemExit):
+        server._parse_args(
+            _SLOT_ARGS
+            + ["--holder-image", _HOLDER, "--slot-root", str(tmp_path)]
+            + ["--advertise-host", value]
+        )
 
 
 def test_service_slots_require_a_holder_image():
