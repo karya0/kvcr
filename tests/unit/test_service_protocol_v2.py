@@ -16,6 +16,7 @@ from kvcr.service.protocol import (
     _CLAIM_RESPONSE_DECODER,
     _RESIZE_RESPONSE_DECODER,
     CAPACITY_BELOW_MINIMUM,
+    DATA_POOL_LAYOUT,
     ERROR_REASONS,
     IDENTITY_MISMATCH,
     INCOMPATIBLE_LINEAGE,
@@ -230,8 +231,9 @@ def test_error_reason_default_and_codes():
         REGION_BUSY,
         NOT_IMPLEMENTED,
         INTERNAL,
+        DATA_POOL_LAYOUT,
     }
-    assert codes == ERROR_REASONS and len(codes) == 8
+    assert codes == ERROR_REASONS and len(codes) == 9
     for code in codes:
         error = _reason_error(code, "why")
         assert _roundtrip(error, _RESIZE_RESPONSE_DECODER) == error

@@ -486,9 +486,7 @@ class _Guard:
         (address, bytes, region-table digest) already mapped in this process.
         """
         self._reserve_claim()
-        return self._submit(
-            _Command("claim", (liveness, tier_config, bind, data_pool))
-        )
+        return self._submit(_Command("claim", (liveness, tier_config, bind, data_pool)))
 
     def release(self, lease: "_Lease") -> None:
         """End a lease. The pool keeps its Guard, and the Guard its records."""

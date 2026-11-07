@@ -8,7 +8,7 @@ import mmap
 import os
 import sys
 import time
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -79,7 +79,8 @@ def test_region_mapping_refuses_a_layout_it_cannot_make_contiguous(regions, fds)
 
 
 def test_client_pool_is_the_regions_and_the_journal_records_their_digest(
-    tmp_path, pools  # noqa: F811
+    tmp_path,
+    pools,  # noqa: F811
 ):
     server, table = _serve(tmp_path)
     with server as harness:
@@ -91,9 +92,7 @@ def test_client_pool_is_the_regions_and_the_journal_records_their_digest(
             with mmap.mmap(hold.region_fds[0], size, offset=0) as direct:
                 direct[:5] = b"hello"
             assert ctypes.string_at(address, 5) == b"hello"
-            assert hold._attachment.layout_digest() == region_table_digest(
-                hold.regions
-            )
+            assert hold._attachment.layout_digest() == region_table_digest(hold.regions)
         finally:
             hold.release()
 
@@ -116,8 +115,9 @@ def test_two_pool_tier_fails_closed(tmp_path, pools):  # noqa: F811
     server, table = _serve(tmp_path)
     with server as harness:
         _attach(harness, table)
-        from kvcr.config import GaaSSettings
         from test_kvcr_service import _TEST_DIGEST, _control_bind
+
+        from kvcr.config import GaaSSettings
 
         with pytest.raises(KVCRServiceError, match="one pool"):
             harness.client.claim(
@@ -161,7 +161,10 @@ def test_guard_registers_the_regions_not_pool_rank(tmp_path, pools):  # noqa: F8
 
 @pytest.mark.parametrize("skew", [False, True])
 def test_guard_refuses_records_written_under_another_layout(
-    tmp_path, pools, caplog, skew  # noqa: F811
+    tmp_path,
+    pools,
+    caplog,
+    skew,  # noqa: F811
 ):
     server, table = _serve(tmp_path)
     with server as harness:
