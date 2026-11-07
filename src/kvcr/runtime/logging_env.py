@@ -24,7 +24,9 @@ def apply_env_log_level() -> None:
     if not raw:
         return
     lg = logging.getLogger("kvcr")
-    level = logging.getLevelName(raw.strip().upper())
+    name = raw.strip().upper()
+    mapping = getattr(logging, "getLevelNamesMapping", None)
+    level = mapping().get(name) if mapping else getattr(logging, name, None)
     if not isinstance(level, int):
         lg.warning("ignoring invalid KVCR_LOG_LEVEL=%r", raw)
         return
