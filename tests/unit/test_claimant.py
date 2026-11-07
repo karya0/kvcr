@@ -167,3 +167,11 @@ def test_receive_timeout_default_outlasts_the_server_wait():
         claimant._receive_timeout_s(args(maximum_bytes=150 * gib, receive_timeout_s=7))
         == 7
     )
+
+
+def test_readiness_wait_is_shared_by_service_and_protocol():
+    from test_node_service import broker_module
+
+    from kvcr.service.protocol import READINESS_WAIT_S
+
+    assert broker_module.READINESS_WAIT_S == READINESS_WAIT_S == 180.0

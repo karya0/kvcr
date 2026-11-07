@@ -38,8 +38,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
 
-from .protocol import READINESS_WAIT_S
-
+# Loaded standalone (no package): mirrors protocol.READINESS_WAIT_S, not imported.
+READINESS_WAIT_S = 180.0
 _GIB = 1 << 30
 _JOURNAL_BYTES = 100 << 20
 _HEADROOM_BYTES = 2 * _GIB

@@ -143,8 +143,8 @@ def run(args: argparse.Namespace) -> None:
         maximum_bytes=args.maximum_bytes,
     )
     connection = FramedConnection.connect(args.socket)
-    # connect() leaves its 60 s timeout; the service spends up to READINESS_WAIT_S on the
-    # holder pod, then populate_wait_s() on its report; wait 20 s longer than both.
+    # connect() leaves its 60 s timeout; the service spends up to READINESS_WAIT_S
+    # on the holder pod, then populate_wait_s() on its report; wait 20 s longer.
     connection._connection.settimeout(_receive_timeout_s(args))
     fds: list[int] = []
     views: dict = {}
