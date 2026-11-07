@@ -10,6 +10,7 @@ terminal drain acknowledgment from that same holder.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import fcntl
 import hashlib
@@ -44,6 +45,7 @@ _LABEL = "kvcr.nvidia.com/manager"
 _ANNOTATION = "kvcr.nvidia.com/"
 _MAX_MESSAGE = 65536
 _TOUCHER_OVERHEAD_BYTES = 128 << 20
+_EXIT_REASON_DEADLINE_S = 5.0
 
 
 def _toucher_overhead_bytes(data_bytes: int) -> int:
@@ -1389,9 +1391,12 @@ class SlotTable:
 
     def _holder_exit_reason(self, slot: _Slot) -> str | None:
         """The holder container's terminated reason (e.g. OOMKilled), if readable."""
-        try:  # api.get has a 10 s timeout (InClusterPodAPI._request)
-            pod = self.broker.api.get(
-                "gaas-pool-" + self.broker._key(PoolClaim.parse(slot.holder))
+        # urlopen's timeout is per socket operation, so bound the whole lookup.
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            name = "gaas-pool-" + self.broker._key(PoolClaim.parse(slot.holder))
+            pod = pool.submit(self.broker.api.get, name).result(
+                timeout=_EXIT_REASON_DEADLINE_S
             )
             for status in (pod or {}).get("status", {}).get("containerStatuses", []):
                 for key in ("state", "lastState"):
@@ -1400,6 +1405,8 @@ class SlotTable:
                         return str(reason)
         except Exception:  # best effort; never mask the original failure
             pass
+        finally:
+            pool.shutdown(wait=False)
         return None
 
     def _feed_holder(self, slot: _Slot) -> None:

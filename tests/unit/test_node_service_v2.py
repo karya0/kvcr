@@ -11,6 +11,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -434,6 +435,22 @@ def test_failed_holder_ack_rolls_the_grow_back(tmp_path, pools):
     regions, generation = table.grow("t/l/0", ME, 2 * PAGE, None)  # retry grows once
     assert [r.index for r in regions] == [1] and generation == before[1] + 1
     assert len(slot.pool.regions) == 2
+
+
+def test_slow_exit_reason_lookup_is_bounded(tmp_path, pools, monkeypatch):
+    table, api = _table(tmp_path)
+    slot = _claim(table, total=2, minimum=2, maximum=8)
+    monkeypatch.setattr(node_service, "_EXIT_REASON_DEADLINE_S", 0.2)
+    real_get = api.get
+    api.get = lambda name: (time.sleep(2), real_get(name))[1]
+    supervisor_end, holder_end = socket.socketpair()
+    holder_end.close()
+    slot.holder_conn = supervisor_end
+    start = time.monotonic()
+    with pytest.raises(SlotError) as raised:
+        table.grow("t/l/0", ME, 2 * PAGE, None)
+    assert time.monotonic() - start < 1.5
+    assert str(raised.value).endswith("holder closed before reporting")
 
 
 def test_shrink_fallocate_failure_is_internal(tmp_path, pools, monkeypatch):
