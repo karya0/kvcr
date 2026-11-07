@@ -24,23 +24,19 @@ import signal
 import socket
 import struct
 import sys
-import uuid
 from typing import Any
 
-from kvcr.runtime.control_channels import FramedConnection, KVCRMsgFramingError
+from kvcr.config import GaaSSettings
+from kvcr.runtime.control_channels import (
+    KVCRMsgFramingError,
+    KVCRServiceError,
+    KVCRSocketError,
+)
 from kvcr.service.protocol import (
-    _CLAIM_RESPONSE_DECODER,
-    _PROTOCOL_VERSION,
-    _RESIZE_RESPONSE_DECODER,
-    READINESS_WAIT_S,
-    _ClaimV2,
-    _Grow,
-    _Release,
-    _response_fd_counts,
-    _send_release,
-    _Shrink,
-    _TierConfig,
-    populate_wait_s,
+    KVCRClient,
+    KVCRPoolHold,
+    KVCRServiceReasonError,
+    claim_wait_s,
 )
 
 _STRIDE = 1 << 20
@@ -102,96 +98,66 @@ def _map(fds: list[int], region: Any) -> mmap.mmap:
     )
 
 
-def _resize(socket_path: str, request: Any) -> Any:
-    channel = FramedConnection.connect(socket_path)
-    try:
-        channel.send(request)
-        response = channel.receive(_RESIZE_RESPONSE_DECODER)
-    finally:
-        channel.close()
-    if hasattr(response, "message"):
-        raise _Failure(2, getattr(response, "reason", "error"), response.message)
-    return response
-
-
-def _tier_config(text: str) -> _TierConfig:
-    layouts = [(n, int(b)) for n, b in (p.split(":") for p in text.split(","))]
-    return _TierConfig(layouts, None)
+def _tier_layouts(text: str) -> list[tuple[str, int]]:
+    return [(n, int(b)) for n, b in (p.split(":") for p in text.split(","))]
 
 
 def _receive_timeout_s(args: argparse.Namespace) -> float:
     if args.receive_timeout_s is not None:
         return args.receive_timeout_s
-    return (
-        READINESS_WAIT_S + populate_wait_s(args.maximum_bytes or args.total_bytes) + 20
-    )
+    return claim_wait_s(args.maximum_bytes or args.total_bytes)
 
 
 def run(args: argparse.Namespace) -> None:
-    request = _ClaimV2(
+    client = KVCRClient(args.socket)
+    hold = client.claim(
         args.guard_index,
+        _tier_layouts(args.tier_config),
         args.compatibility_digest,
-        _tier_config(args.tier_config),
-        args.control_host,
-        args.control_port,
-        _PROTOCOL_VERSION,
-        args.tenant,
-        args.lineage,
-        uuid.uuid4().hex,
-        total_bytes=args.total_bytes,
-        minimum_bytes=args.minimum_bytes,
-        maximum_bytes=args.maximum_bytes,
+        (args.control_host, args.control_port),
+        gaas=GaaSSettings(
+            tenant=args.tenant,
+            lineage=args.lineage,
+            total_bytes=args.total_bytes,
+            minimum_bytes=args.minimum_bytes,
+            maximum_bytes=args.maximum_bytes,
+        ),
+        receive_timeout_s=_receive_timeout_s(args),
     )
-    connection = FramedConnection.connect(args.socket)
-    # connect() leaves its 60 s timeout; the service spends up to READINESS_WAIT_S
-    # on the holder pod, then populate_wait_s() on its report; wait 20 s longer.
-    connection._connection.settimeout(_receive_timeout_s(args))
-    fds: list[int] = []
     views: dict = {}
     try:
-        # The worker pidfd lets the service watch this process, as the v1 client does.
-        pidfd = os.pidfd_open(os.getpid())
-        try:
-            connection.send_with_fd(request, pidfd)
-        finally:
-            os.close(pidfd)
-        grant, fds = connection.receive_with_fd(
-            _CLAIM_RESPONSE_DECODER, _response_fd_counts
-        )
-        if hasattr(grant, "message"):
-            raise _Failure(2, getattr(grant, "reason", "error"), grant.message)
-        # fds: pool, control listener, then region memfds (all closed in finally).
-        region_fds = fds[2:]
         _step(
             "granted",
-            slot_name=grant.slot_name,
-            regions=len(grant.regions),
-            bytes=sum(r.size for r in grant.regions),
-            layout_generation=grant.layout_generation,
-            claim_generation=grant.claim_generation,
+            slot_name=hold.slot_name,
+            regions=len(hold.regions),
+            bytes=sum(r.size for r in hold.regions),
+            layout_generation=hold.layout_generation,
+            claim_generation=hold.claim_generation,
         )
-        for r in grant.regions:
-            views[r.index] = (_map(region_fds, r), r)
-        _mode(args, grant, region_fds, views)
+        for r in hold.regions:
+            views[r.index] = (_map(hold.region_fds, r), r)
+        _mode(args, client, hold, views)
+        for view, _region in views.values():
+            view.close()
+        views.clear()
         if args.release:
-            _send_release(connection)
+            hold.release()
             _step("released")
     except BaseException:
         # Bare EOF frees nothing: the lease and slot would stay held until this
-        # process dies. Say the claim was never served; best effort, no reply awaited.
-        with contextlib.suppress(BaseException):
-            connection.send(_Release(_PROTOCOL_VERSION, False))
-        raise
-    finally:
+        # process dies. Say the claim was never served; best effort.
         for view, _region in views.values():
             view.close()
-        for fd in fds:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        connection.close()
+        with contextlib.suppress(BaseException):
+            hold.release(activated=False)
+        raise
+    finally:
+        hold.close_local()  # a no-op once released
 
 
-def _mode(args: argparse.Namespace, grant: Any, fds: list[int], views: dict) -> None:
+def _mode(
+    args: argparse.Namespace, client: KVCRClient, grant: KVCRPoolHold, views: dict
+) -> None:
     sizes = sum(r.size for _v, r in views.values())
     if args.mode == "verify":
         generations = {i: _verify(v, i, r.size) for i, (v, r) in views.items()}
@@ -207,12 +173,7 @@ def _mode(args: argparse.Namespace, grant: Any, fds: list[int], views: dict) -> 
     _step("written", regions=len(views), bytes=sizes)
     if args.mode == "write":
         return
-    grown = _resize(
-        args.socket,
-        _Grow(
-            _PROTOCOL_VERSION, grant.slot_name, args.grow_bytes, grant.claim_generation
-        ),
-    )
+    grown = client.grow(grant.slot_name, args.grow_bytes, grant.claim_generation)
     end = max(r.offset + r.size for _v, r in views.values())
     if grown.layout_generation != grant.layout_generation + 1 or any(
         r.offset < end for r in grown.regions
@@ -220,7 +181,7 @@ def _mode(args: argparse.Namespace, grant: Any, fds: list[int], views: dict) -> 
         raise _Failure(3, "mismatch", "grown layout moved or skipped a generation")
     for index, (view, region) in views.items():
         _verify(view, index, region.size)
-    added = {r.index: (_map(fds, r), r) for r in grown.regions}
+    added = {r.index: (_map(grant.region_fds, r), r) for r in grown.regions}
     for index, (view, region) in added.items():
         _write(view, index, region.size, grown.layout_generation)
     _step(
@@ -231,12 +192,7 @@ def _mode(args: argparse.Namespace, grant: Any, fds: list[int], views: dict) -> 
     )
     for view, _region in added.values():
         view.close()  # a region must be unmapped before it is shrunk away
-    shrunk = _resize(
-        args.socket,
-        _Shrink(
-            _PROTOCOL_VERSION, grant.slot_name, tuple(added), grant.claim_generation
-        ),
-    )
+    shrunk = client.shrink(grant.slot_name, tuple(added), grant.claim_generation)
     if shrunk.layout_generation != grant.layout_generation + 2:
         raise _Failure(3, "mismatch", "layout_generation did not increment twice")
     _step(
@@ -274,10 +230,23 @@ def main(argv: list[str] | None = None) -> int:
     except _Failure as failure:
         _step("error", reason=failure.reason, message=str(failure))
         return failure.code
+    except KVCRServiceReasonError as error:
+        _step("error", reason=error.reason, message=error.message)
+        return 2
+    except KVCRSocketError as error:  # the client wraps connect and claim I/O
+        timed_out = isinstance(error.__cause__, (TimeoutError, socket.timeout))
+        _step("error", reason="timeout" if timed_out else "transport", message=str(error))
+        return 2
+    except KVCRMsgFramingError as error:
+        _step("error", reason="transport", message=str(error))
+        return 2
+    except KVCRServiceError as error:
+        _step("error", reason="error", message=str(error))
+        return 2
     except (TimeoutError, socket.timeout) as error:
         _step("error", reason="timeout", message=str(error))
         return 2
-    except (OSError, EOFError, KVCRMsgFramingError) as error:  # incl. ConnectionError
+    except (OSError, EOFError) as error:  # incl. ConnectionError
         _step("error", reason="transport", message=str(error))
         return 2
     return 0
