@@ -131,7 +131,7 @@ def test_mapping_failure_frees_the_claim_and_exits_2(
         assert not table.get("t/l/0").held
 
 
-def test_default_receive_timeout_covers_the_service_ensure(monkeypatch):
+def test_receive_timeout_defaults_to_computed_wait(monkeypatch):
     seen = {}
 
     def capture(self, argv=None, namespace=None):
@@ -141,7 +141,7 @@ def test_default_receive_timeout_covers_the_service_ensure(monkeypatch):
     monkeypatch.setattr(claimant.argparse.ArgumentParser, "parse_args", capture)
     with pytest.raises(SystemExit):
         claimant.main([])
-    assert seen["actions"]["receive_timeout_s"].default >= 180
+    assert seen["actions"]["receive_timeout_s"].default is None
 
 
 @pytest.mark.parametrize("error", [EOFError("eof"), KVCRMsgFramingError("bad frame")])
