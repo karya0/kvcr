@@ -202,6 +202,17 @@ def test_slot_held_queue_and_release(tmp_path, pools):
     assert len(api.creates) == 2
 
 
+def test_release_drops_queued_waiters(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    _claim(table, "a")
+    with pytest.raises(SlotError) as raised:
+        _claim(table, "b")
+    assert raised.value.reason == SLOT_HELD
+    assert table.release("t/l/0") == ["b"]
+    assert table.waiters("t/l/0") == []
+    assert _claim(table, "d").claim_id == "d"  # granted at once, no SLOT_HELD
+
+
 def test_holder_death_recreates_once(tmp_path, pools):
     table, api = _table(tmp_path)
     slot = _claim(table)

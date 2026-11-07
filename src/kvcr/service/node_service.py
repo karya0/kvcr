@@ -1298,6 +1298,9 @@ class SlotTable:
                 return
             if self._slots.get(slot.name) is slot:
                 del self._slots[slot.name]
+            for waiter in self._waiters.get(slot.name, ()):
+                waiter.close()
+            self._waiters.pop(slot.name, None)
             self._persist()
         with slot.lock:
             if slot.holder_conn is not None:
@@ -1525,6 +1528,7 @@ class SlotTable:
             waiters = self.waiters(name)
             for waiter in self._waiters.get(name, ()):
                 waiter.close()
+            self._waiters.pop(name, None)
         with slot.lock:
             self._drop_holder_conn(slot)
             slot.pool.close()
