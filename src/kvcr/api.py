@@ -27,6 +27,7 @@ from .runtime.core import (  # noqa: F401 - public re-exports
     TRANSFER_BYTES_METRIC,
     _KVCRCore,
 )
+from .runtime.logging_env import apply_env_log_level
 from .service import recovery_journal as _recovery
 from .service.protocol import KVCRPoolHold
 from .types import (
@@ -92,6 +93,7 @@ class KVCR:
         backend_configs: KVCRBackendConfigs,
         guard_config: KVCRGuardConfig | None = None,
     ) -> None:
+        apply_env_log_level()
         claimed: _recovery.ClaimedPool | None = None
         pool_hold: KVCRPoolHold | None = None
         core: _KVCRCore | None = None
