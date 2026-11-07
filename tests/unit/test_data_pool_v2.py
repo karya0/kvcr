@@ -91,7 +91,9 @@ def test_client_pool_is_the_regions_and_the_journal_records_their_digest(
             with mmap.mmap(hold.region_fds[0], size, offset=0) as direct:
                 direct[:5] = b"hello"
             assert ctypes.string_at(address, 5) == b"hello"
-            assert hold._attachment.layout_digest() == region_table_digest(hold.regions)
+            assert hold._attachment.layout_digest() == region_table_digest(
+                hold.regions, hold.region_fds, hold.slot_name, hold.claim_generation
+            )
         finally:
             hold.release()
 
