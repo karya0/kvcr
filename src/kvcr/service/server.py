@@ -713,6 +713,8 @@ class _ThreadingUnixServer(
                 if request.state_agent
                 else None,
             )
+        elif slots is not None:  # a v1 claim must not take the Guard from a slot
+            raise SlotError(NOT_IMPLEMENTED, "this service takes v2 claims only")
         try:
             # Retain the Guard across a concurrent close; claim validates the request.
             guard = self.registry._guards.get(request.guard_index)

@@ -666,3 +666,19 @@ def test_resize_rechecks_ownership_under_the_slot_lock(
             table.grow("t/l/0", ME, PAGE, None)
     assert raised.value.reason == IDENTITY_MISMATCH
     assert (slot.pool.regions, slot.pool.layout_generation) == before
+
+
+def test_v1_claim_is_refused_on_a_slot_service(tmp_path, pools):
+    from types import SimpleNamespace
+
+    from kvcr.service.protocol import NOT_IMPLEMENTED, _Claim, _TierConfig
+    from kvcr.service.server import _ThreadingUnixServer
+
+    table, _ = _table(tmp_path)
+    server = SimpleNamespace(compatibility_digest=DIGEST, slots=table, registry=None)
+    request = _Claim(
+        0, DIGEST, _TierConfig([("pool", 4096)], None), "127.0.0.1", 5555, 1
+    )
+    with pytest.raises(SlotError) as raised:
+        _ThreadingUnixServer.dispatch(server, request, SimpleNamespace())
+    assert raised.value.reason == NOT_IMPLEMENTED
