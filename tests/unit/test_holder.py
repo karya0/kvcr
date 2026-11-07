@@ -54,7 +54,7 @@ def _read_report(conn):
     return json.loads(conn.makefile("rb").readline())
 
 
-def test_holder_touches_and_reports():
+def test_holder_touches_and_reports(capsys):
     fd = os.memfd_create("t")
     os.ftruncate(fd, 2 * PAGE)
     os.pwrite(fd, b"keep", 0)
@@ -67,6 +67,9 @@ def test_holder_touches_and_reports():
         "touched_bytes": 2 * PAGE,
         "layout_generation": 3,
     }
+    lines = [json.loads(x) for x in capsys.readouterr().err.splitlines()]
+    assert [x["holder"] for x in lines] == ["populate_start", "populate_end"]
+    assert lines[1]["bytes"] == 2 * PAGE
     assert os.pread(fd, 4, 0) == b"keep"  # touching does not clobber data
     # A Grow re-sends the full layout; only the new region is mapped.
     os.ftruncate(fd, 3 * PAGE)

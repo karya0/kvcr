@@ -23,6 +23,7 @@ import os
 import select
 import signal
 import socket
+import sys
 import threading
 import time
 from typing import Any
@@ -32,15 +33,33 @@ _MAX_LINE = 1 << 20
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 
 
-def _touch(view: mmap.mmap, size: int) -> None:
+def _log(event: str, **fields: Any) -> None:
+    print(json.dumps({"holder": event, **fields}), file=sys.stderr, flush=True)
+
+
+def _touch(view: mmap.mmap, size: int, index: int = 0) -> None:
     """Fault every page in without changing its contents."""
+    _log("populate_start", region=index, bytes=size)
+    started = time.monotonic()
     try:
         view.madvise(_MADV_POPULATE_WRITE, 0, size)
+        _log(
+            "populate_end",
+            region=index,
+            bytes=size,
+            elapsed_s=round(time.monotonic() - started, 3),
+        )
         return
     except (OSError, ValueError):
-        pass
+        _log("populate_fallback", region=index, bytes=size)
     for offset in range(0, size, mmap.PAGESIZE):
         view[offset] = view[offset]
+    _log(
+        "populate_end",
+        region=index,
+        bytes=size,
+        elapsed_s=round(time.monotonic() - started, 3),
+    )
 
 
 def _receive(connection: socket.socket) -> tuple[dict[str, Any], list[int]] | None:
@@ -106,7 +125,7 @@ def handle_layout(
                 offset=region["offset"],
             )
             mappings[index] = (view, region["size"])
-            _touch(view, region["size"])
+            _touch(view, region["size"], index)
     finally:
         for fd in fds:
             os.close(fd)
@@ -160,6 +179,7 @@ def serve(
         connection = connect(path, connect_timeout_s, stop)
     except InterruptedError:
         return
+    _log("connected", socket=path)
     reset = False
     while not stop.is_set():
         if select.select([connection], [], [], 1.0)[0]:
