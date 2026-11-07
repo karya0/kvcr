@@ -452,10 +452,11 @@ class _RequestHandler(socketserver.BaseRequestHandler):
     server: "_ThreadingUnixServer"
     request: socket.socket
 
+    _slot_name: str | None = None
+    _peer: tuple[int, int, str | None] | None = None
+
     def setup(self) -> None:
         self.channel = FramedConnection(self.request)
-        self._slot_name: str | None = None
-        self._peer: tuple[int, int, str | None] | None = None
 
     def _resize(self, request: "_Grow | _Shrink") -> "_Grown | _Shrunk | _Error":
         slots = self.server.slots
@@ -509,9 +510,12 @@ class _RequestHandler(socketserver.BaseRequestHandler):
         grant: "tuple[int, int, _Lease] | None" = None
         try:
             liveness = PidfdLiveness.from_peer_socket(self.request, worker_pidfd)
-            response, grant = self.server.dispatch(
-                request, liveness, _peer_identity(self.request)
-            )
+            if request.tenant and request.lineage:  # v2 claim: slot + peer identity
+                response, grant = self.server.dispatch(
+                    request, liveness, _peer_identity(self.request)
+                )
+            else:  # v1 claim: untouched path
+                response, grant = self.server.dispatch(request, liveness)
         except SlotError as error:
             response = _reason_error(error.reason, str(error))
         except KVCRServiceError as error:
@@ -528,8 +532,9 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             return
 
         guard_index, listener_fd, lease = grant
-        self._slot_name = response.slot_name
-        self._peer = _peer_identity(self.request)
+        self._slot_name = getattr(response, "slot_name", None)
+        if self._slot_name is not None:
+            self._peer = _peer_identity(self.request)
         try:
             pool_fd = _open_pool_fd(response.spec)
         except Exception:  # noqa: BLE001 - nothing sent yet: take the grant back
@@ -544,8 +549,8 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             self.request.settimeout(None)
             region_fds = (
                 []
-                if response.slot_name is None or self.server.slots is None
-                else self.server.slots.get(response.slot_name).pool.pass_fd_list()
+                if self._slot_name is None or self.server.slots is None
+                else self.server.slots.get(self._slot_name).pool.pass_fd_list()
             )
             self.channel.send_with_fd(response, pool_fd, listener_fd, *region_fds)
         # The lease is already granted and the send may have partially
@@ -580,7 +585,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 self.server.registry.heartbeat(guard_index, lease)
                 continue
             if self._release_or_fail(guard_index, lease, message.activated):
-                if self._slot_name and self.server.slots is not None:
+                if self._slot_name and getattr(self.server, "slots", None) is not None:
                     self.server.slots.vacate(self._slot_name, self._peer)
                 with contextlib.suppress(OSError):
                     self.channel.send(_Released(_PROTOCOL_VERSION))

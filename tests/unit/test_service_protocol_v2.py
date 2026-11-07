@@ -6,7 +6,7 @@ import pytest
 from test_kvcr_service import _running_server, _send_raw_request
 
 from kvcr.service import protocol
-from kvcr.service.memory import KVCRPoolSpec
+from kvcr.service.memory import KVCRPoolSpec, _pool_filename
 from kvcr.service.protocol import (
     _CLAIM_DECODER,
     _CLAIM_RESPONSE_DECODER,
@@ -35,7 +35,7 @@ from kvcr.service.protocol import (
     _TierConfig,
 )
 
-_TIER = _TierConfig((("pool", 4096),), None)
+_TIER = _TierConfig([("pool", 4096)], None)  # the declared type is a list
 _REGIONS = (PoolRegion(0, 0, 4096, None), PoolRegion(1, 4096, 8192, 1))
 
 
@@ -86,7 +86,9 @@ def test_state_agent_and_placement_defaults():
 
 
 def _granted_wire() -> dict:
-    spec = KVCRPoolSpec("p", "/x", "0" * 32, 1, 2, 8192, 4096)
+    spec = KVCRPoolSpec(
+        "p", "/x/" + _pool_filename("p", "0" * 32), "0" * 32, 1, 2, 8192, 4096
+    )
     return {
         "type": "granted",
         "guard_index": 0,
