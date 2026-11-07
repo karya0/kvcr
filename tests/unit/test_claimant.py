@@ -161,8 +161,8 @@ def test_receive_timeout_default_outlasts_the_server_wait():
         return claimant.argparse.Namespace(**{**base, **kw})
 
     gib = 1 << 30
-    assert claimant._receive_timeout_s(args(maximum_bytes=150 * gib)) == 500
-    assert claimant._receive_timeout_s(args(total_bytes=62 * gib)) == 324
+    assert claimant._receive_timeout_s(args(maximum_bytes=150 * gib)) == 680
+    assert claimant._receive_timeout_s(args(total_bytes=62 * gib)) == 504
     assert (
         claimant._receive_timeout_s(args(maximum_bytes=150 * gib, receive_timeout_s=7))
         == 7

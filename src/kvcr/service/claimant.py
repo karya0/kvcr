@@ -32,6 +32,7 @@ from kvcr.service.protocol import (
     _CLAIM_RESPONSE_DECODER,
     _PROTOCOL_VERSION,
     _RESIZE_RESPONSE_DECODER,
+    READINESS_WAIT_S,
     _ClaimV2,
     _Grow,
     _Release,
@@ -121,7 +122,9 @@ def _tier_config(text: str) -> _TierConfig:
 def _receive_timeout_s(args: argparse.Namespace) -> float:
     if args.receive_timeout_s is not None:
         return args.receive_timeout_s
-    return populate_wait_s(args.maximum_bytes or args.total_bytes) + 20
+    return (
+        READINESS_WAIT_S + populate_wait_s(args.maximum_bytes or args.total_bytes) + 20
+    )
 
 
 def run(args: argparse.Namespace) -> None:
@@ -140,8 +143,8 @@ def run(args: argparse.Namespace) -> None:
         maximum_bytes=args.maximum_bytes,
     )
     connection = FramedConnection.connect(args.socket)
-    # connect() leaves its 60 s timeout; the service waits populate_wait_s() for
-    # the holder, so the grant is awaited 20 s longer unless set explicitly.
+    # connect() leaves its 60 s timeout; the service spends up to READINESS_WAIT_S on the
+    # holder pod, then populate_wait_s() on its report; wait 20 s longer than both.
     connection._connection.settimeout(_receive_timeout_s(args))
     fds: list[int] = []
     views: dict = {}

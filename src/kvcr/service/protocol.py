@@ -41,10 +41,11 @@ _HEARTBEAT_SECONDS = 0.05
 # A missed deadline SIGKILLs the primary, so keep the floor clear of GC pauses.
 _MIN_HEARTBEAT_TIMEOUT_SECONDS = 20 * _HEARTBEAT_SECONDS
 
+READINESS_WAIT_S = 180.0
 POPULATE_RATE_FLOOR_BYTES_PER_S = 512 << 20
 
 
-def populate_wait_s(data_bytes: int, base_s: float = 180.0) -> float:
+def populate_wait_s(data_bytes: int, base_s: float = READINESS_WAIT_S) -> float:
     """Seconds to wait for a holder to populate ``data_bytes`` of pool memory.
 
     ``base_s`` covers pod readiness and handshake; the rest assumes the holder

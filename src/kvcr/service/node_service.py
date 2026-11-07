@@ -38,6 +38,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
 
+from .protocol import READINESS_WAIT_S
+
 _GIB = 1 << 30
 _JOURNAL_BYTES = 100 << 20
 _HEADROOM_BYTES = 2 * _GIB
@@ -985,7 +987,7 @@ class SlotTable:
         cap_bytes: int,
         local_requests: Callable[[str], int] = lambda tenant: 0,
         headroom_bytes: int = _HEADROOM_BYTES,
-        ensure_timeout_s: float = 180,
+        ensure_timeout_s: float = READINESS_WAIT_S,
         *,
         require_pod_identity: bool = True,
         clock: Callable[[], float] = time.monotonic,
@@ -1361,7 +1363,10 @@ class SlotTable:
     # -- holder upkeep (caller holds slot.lock) -----------------------------
 
     def _holder_wait_s(self, slot: _Slot) -> float:
-        """Holder wait: readiness base plus populate time for the whole layout."""
+        """Holder wait: readiness base plus populate time for the whole layout.
+
+        Grow/shrink resends cover the whole slot, a conservative bound.
+        """
         from .protocol import populate_wait_s
 
         total = sum(r.size for r in slot.pool.regions)
@@ -1433,7 +1438,7 @@ class SlotTable:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
             listener.bind(path)
             listener.listen(1)
-            listener.settimeout(self._holder_wait_s(slot))
+            listener.settimeout(self.ensure_timeout_s)
             try:
                 slot.holder_conn, _ = listener.accept()
             finally:
