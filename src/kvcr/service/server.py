@@ -42,6 +42,7 @@ from .memory import (
     _unlink_if_identity,
 )
 from .protocol import (
+    NOT_IMPLEMENTED,
     _CLAIM_DECODER,
     _HOLD_DECODER,
     _MIN_HEARTBEAT_TIMEOUT_SECONDS,
@@ -52,11 +53,14 @@ from .protocol import (
     _Drain,
     _Error,
     _Granted,
+    _Grow,
     _Heartbeat,
     _PoolDescriptor,
+    _reason_error,
     _Released,
     _ServiceInfo,
     _ServiceState,
+    _Shrink,
     _TierConfig,
 )
 
@@ -423,6 +427,14 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             )
             with contextlib.suppress(OSError):
                 self.channel.send(_ServiceState(info, _PROTOCOL_VERSION))
+            return
+
+        if isinstance(request, (_Grow, _Shrink)):
+            # The supervisor that owns slots arrives with the resize logic.
+            with contextlib.suppress(OSError):
+                self.channel.send(
+                    _reason_error(NOT_IMPLEMENTED, "resize is not implemented")
+                )
             return
 
         liveness: PidfdLiveness | None = None

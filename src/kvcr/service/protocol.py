@@ -87,7 +87,53 @@ class _TierConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                 )
 
 
-class _Claim(msgspec.Struct, frozen=True, tag="claim"):
+class PlacementHints(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    node: str | None = None
+    numa_node: Annotated[int, msgspec.Meta(ge=0)] | None = None
+    hugepage_size: Annotated[int, msgspec.Meta(gt=0)] | None = None
+
+
+class StateAgentSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    namespace: str | None = None
+    component: str | None = None
+    endpoint: str | None = None
+    advertise: bool = True
+
+
+class PoolRegion(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """One region of a slot's pool: a byte range, optionally in its own fd."""
+
+    index: Annotated[int, msgspec.Meta(ge=0)]
+    offset: Annotated[int, msgspec.Meta(ge=0)]
+    size: Annotated[int, msgspec.Meta(gt=0)]
+    fd_index: Annotated[int, msgspec.Meta(ge=0)] | None = None
+
+
+# Reason codes carried by _Error; a client branches on these, not on message.
+CAPACITY_BELOW_MINIMUM = "capacity_below_minimum"
+SLOT_HELD = "slot_held"
+IDENTITY_MISMATCH = "identity_mismatch"
+INCOMPATIBLE_LINEAGE = "incompatible_lineage"
+UNKNOWN_SLOT = "unknown_slot"
+REGION_BUSY = "region_busy"
+NOT_IMPLEMENTED = "not_implemented"
+INTERNAL = "internal"
+ERROR_REASONS = frozenset(
+    {
+        CAPACITY_BELOW_MINIMUM,
+        SLOT_HELD,
+        IDENTITY_MISMATCH,
+        INCOMPATIBLE_LINEAGE,
+        UNKNOWN_SLOT,
+        REGION_BUSY,
+        NOT_IMPLEMENTED,
+        INTERNAL,
+    }
+)
+
+
+# omit_defaults keeps a v1 claim byte-identical on the wire.
+class _Claim(msgspec.Struct, frozen=True, tag="claim", omit_defaults=True):
     guard_index: Annotated[int, msgspec.Meta(ge=0)]
     compatibility_digest: str
     tier_config: _TierConfig
@@ -95,6 +141,13 @@ class _Claim(msgspec.Struct, frozen=True, tag="claim"):
     control_port: Annotated[int, msgspec.Meta(ge=1, le=65535)]
     version: ProtocolVersion
     incarnation: Annotated[str, msgspec.Meta(min_length=1)] | None = None
+    tenant: str | None = None
+    lineage: str | None = None
+    total_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
+    minimum_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
+    maximum_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
+    placement: PlacementHints | None = None
+    state_agent: StateAgentSettings | None = None
 
     def __post_init__(self) -> None:
         # A literal address, because the service binds this holding the lock
@@ -120,7 +173,7 @@ class _Heartbeat(msgspec.Struct, frozen=True, tag="heartbeat"):
     version: ProtocolVersion
 
 
-class _Granted(msgspec.Struct, frozen=True, tag="granted"):
+class _Granted(msgspec.Struct, frozen=True, tag="granted", omit_defaults=True):
     guard_index: int
     spec: KVCRPoolSpec
     tier_config: _TierConfig
@@ -128,15 +181,53 @@ class _Granted(msgspec.Struct, frozen=True, tag="granted"):
     version: ProtocolVersion
     dead_incarnations: tuple[str, ...] = ()
     heartbeat_enabled: bool = False
+    slot_name: str | None = None
+    effective_maximum_bytes: int | None = None
+    regions: tuple[PoolRegion, ...] = ()
+    layout_generation: int = 0
+    guard_endpoint: str | None = None
+
+
+class _Grow(msgspec.Struct, frozen=True, tag="grow"):
+    version: ProtocolVersion
+    slot_name: str
+    additional_bytes: Annotated[int, msgspec.Meta(gt=0)]
+    # Number of regions to add the bytes as; None lets the service choose.
+    split: Annotated[int, msgspec.Meta(gt=0)] | None = None
+
+
+class _Shrink(msgspec.Struct, frozen=True, tag="shrink"):
+    version: ProtocolVersion
+    slot_name: str
+    region_indices: tuple[int, ...]
+
+
+class _Grown(msgspec.Struct, frozen=True, tag="grown"):
+    version: ProtocolVersion
+    regions: tuple[PoolRegion, ...]
+    layout_generation: int
+
+
+class _Shrunk(msgspec.Struct, frozen=True, tag="shrunk"):
+    version: ProtocolVersion
+    region_indices: tuple[int, ...]
+    layout_generation: int
 
 
 class _Released(msgspec.Struct, frozen=True, tag="released"):
     version: ProtocolVersion
 
 
-class _Error(msgspec.Struct, frozen=True, tag="error"):
+class _Error(msgspec.Struct, frozen=True, tag="error", omit_defaults=True):
     message: str
     version: ProtocolVersion
+    reason: str = INTERNAL
+
+
+def _reason_error(reason: str, message: str) -> _Error:
+    if reason not in ERROR_REASONS:
+        raise ValueError(f"unknown error reason: {reason}")
+    return _Error(message, _PROTOCOL_VERSION, reason)
 
 
 class _ServiceInfo(msgspec.Struct, frozen=True, tag="service_info"):
@@ -152,7 +243,9 @@ class _ServiceState(msgspec.Struct, frozen=True, tag="service_state"):
     version: ProtocolVersion
 
 
-def _claim_fd_counts(request: _Claim | _ServiceInfo | _Drain) -> tuple[int, ...]:
+def _claim_fd_counts(
+    request: "_Claim | _ServiceInfo | _Drain | _Grow | _Shrink",
+) -> tuple[int, ...]:
     return (0, 1) if isinstance(request, _Claim) else (0,)
 
 
@@ -161,9 +254,12 @@ def _response_fd_counts(response: "_Granted | _Error") -> tuple[int, ...]:
     return (0,) if isinstance(response, _Error) else (2,)
 
 
-_CLAIM_DECODER = msgspec.msgpack.Decoder(_Claim | _ServiceInfo | _Drain)
+_CLAIM_DECODER = msgspec.msgpack.Decoder(
+    _Claim | _ServiceInfo | _Drain | _Grow | _Shrink
+)
 _HOLD_DECODER = msgspec.msgpack.Decoder(_Heartbeat | _Release)
 _CLAIM_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Granted | _Error)
+_RESIZE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Grown | _Shrunk | _Error)
 _RELEASE_RESPONSE_DECODER = msgspec.msgpack.Decoder(_Released | _Error)
 _SERVICE_STATE_DECODER = msgspec.msgpack.Decoder(_ServiceState | _Error)
 
