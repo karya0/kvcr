@@ -10,6 +10,7 @@ import types
 from kvcr.service.memmap import round_up
 from kvcr.service.protocol import PoolRegion
 
+_PROT_NONE = 0  # the mmap module does not export it
 _MAP_FIXED = 0x10
 _MAP_NORESERVE = 0x4000
 _FALLOC_PUNCH = 0x01 | 0x02  # FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE
@@ -80,7 +81,7 @@ class RegionPool:
             addr = self._libc.mmap(
                 None,
                 self._reserve,
-                mmap.PROT_NONE,
+                _PROT_NONE,
                 mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_NORESERVE,
                 -1,
                 0,
@@ -195,7 +196,7 @@ class RegionPool:
             addr = self._libc.mmap(
                 self._base + region.offset,
                 region.size,
-                mmap.PROT_NONE,
+                _PROT_NONE,
                 mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_NORESERVE | _MAP_FIXED,
                 -1,
                 0,
