@@ -492,7 +492,7 @@ def _ids(regions):
 def test_server_path_waiters_keep_fifo_after_slot_held_replies(tmp_path, pools):
     from types import SimpleNamespace
 
-    from kvcr.errors import KVCRServiceError
+    from kvcr import KVCRServiceError
     from kvcr.service.protocol import PidfdLiveness, _ClaimV2, _TierConfig
     from kvcr.service.server import _ThreadingUnixServer
 
