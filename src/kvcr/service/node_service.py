@@ -662,6 +662,8 @@ class NodeBroker:
 
     def ensure(self, value: dict[str, Any], timeout_s: float = 180) -> dict[str, Any]:
         claim = PoolClaim.parse(value)
+        # Population time ~ data_bytes / (per-core populate rate x holder cpu);
+        # 256 GiB at 1 CPU may need a size-aware wait (follow-up).
         if not 0 < timeout_s <= 180:
             raise ValueError("ensure timeout must be in (0, 180]")
         with self._lock:
