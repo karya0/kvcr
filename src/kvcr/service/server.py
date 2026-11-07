@@ -229,7 +229,7 @@ class _PoolRegistry:
         tier_config: _TierConfig,
         liveness: PidfdLiveness,
         control_bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[..., bytes]] | None = None,
+        data_pool: tuple[int, int, Callable[..., bytes], str, int] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give a pool group to a primary and return its Guard endpoint.
 
@@ -764,6 +764,8 @@ class _ThreadingUnixServer(
                     lambda backing_only=False: _live_layout_digest(
                         slot, generation, backing_only
                     ),
+                    slot.name,
+                    len(slot.pool.regions),
                 ),
             )
             if guard is None:

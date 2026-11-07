@@ -446,7 +446,7 @@ class _Guard:
         # Owned by the current primary.
         self._control: ZmqPeerControlChannel | None = None
         self._configured: _TierConfig | None = None
-        self._data_pool: tuple[int, int, Callable[..., bytes]] | None = None
+        self._data_pool: tuple[int, int, Callable[..., bytes], str, int] | None = None
         self._recovery = _RecoveryState(spec, compatibility_digest, pool_sizes_bytes)
         self._core = None
         # Released cores still registering; _poll closes each once registered.
@@ -509,7 +509,7 @@ class _Guard:
         liveness: PidfdLiveness,
         tier_config: _TierConfig,
         bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[..., bytes]] | None = None,
+        data_pool: tuple[int, int, Callable[..., bytes], str, int] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give this pool group to a primary, with its Guard's endpoint.
         Reserved on the requesting thread: a mid-transition pool answers busy
@@ -868,7 +868,7 @@ class _Guard:
         liveness: PidfdLiveness,
         tier_config: _TierConfig,
         bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[..., bytes]] | None = None,
+        data_pool: tuple[int, int, Callable[..., bytes], str, int] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give the pool to a primary, and take up the endpoint it named.
         All fallible work runs before the lease exists, and commit and refusal
@@ -1163,7 +1163,7 @@ class _Guard:
         """Register the Guard's pool without accepting control traffic."""
 
         if self._data_pool is not None:
-            address, size, _digest = self._data_pool
+            address, size, _digest, slot_name, regions = self._data_pool
             pools = [(self._recovery.pools[0].name, address, size)]
         else:
             pools = [
@@ -1194,6 +1194,16 @@ class _Guard:
         )
         self._core = core
         self._log_promotion_stage("core_init_done")
+        if self._data_pool is not None:
+            logger.info(
+                "KVCR_EVENT guard_data_pool_registered guard=%d slot=%s "
+                "base=0x%x bytes=%d regions=%d",
+                self._guard_index,
+                slot_name,
+                address,
+                size,
+                regions,
+            )
         # Registration can take long; promotion's start() waits for it.
         core._progress.prepare(wait=False)
 
