@@ -91,7 +91,15 @@ def _table(tmp_path, api=None, pages=64, **kwargs):
     )
 
 
-def _claim(table, claim_id="a", total=4, minimum=2, maximum=None, alive=lambda: True):
+def _claim(
+    table,
+    claim_id="a",
+    total=4,
+    minimum=2,
+    maximum=None,
+    alive=lambda: True,
+    waiter_alive=None,
+):
     return table.claim(
         "t",
         "l",
@@ -103,6 +111,7 @@ def _claim(table, claim_id="a", total=4, minimum=2, maximum=None, alive=lambda: 
         claim_id=claim_id,
         peer=ME,
         owner_alive=alive,
+        waiter_alive=waiter_alive,
     )
 
 
@@ -402,7 +411,7 @@ def test_dead_queue_head_is_dropped(tmp_path, pools):
     owner, head = [True], [True]
     _claim(table, "a", alive=lambda: owner[0])
     with pytest.raises(SlotError):
-        _claim(table, "b", alive=lambda: head[0])
+        _claim(table, "b", waiter_alive=lambda: head[0])
     with pytest.raises(SlotError):
         _claim(table, "c")
     owner[0] = head[0] = False  # the owner and the head both died
@@ -474,3 +483,126 @@ def test_terminating_holders_still_count_toward_the_budget(tmp_path):
         broker.ensure(claims[2])
     del api.pods[held]
     broker.ensure(claims[2])
+
+
+def _ids(regions):
+    return [(r["index"], r["offset"], r["size"]) for r in regions]
+
+
+def test_server_path_waiters_keep_fifo_after_slot_held_replies(tmp_path, pools):
+    from types import SimpleNamespace
+
+    from kvcr.errors import KVCRServiceError
+    from kvcr.service.protocol import PidfdLiveness, _ClaimV2, _TierConfig
+    from kvcr.service.server import _ThreadingUnixServer
+
+    table, _ = _table(tmp_path)
+    owner = [True]
+    _claim(table, "a", alive=lambda: owner[0])
+
+    class Registry:
+        _guards = {0: object()}
+
+        def claim(self, *args):
+            raise KVCRServiceError("reached the guard")
+
+    server = SimpleNamespace(
+        compatibility_digest=DIGEST, slots=table, registry=Registry()
+    )
+
+    def server_claim(incarnation):
+        request = _ClaimV2(
+            0,
+            DIGEST,
+            _TierConfig([("pool", 4096)], None),
+            "127.0.0.1",
+            5555,
+            1,
+            "t",
+            "l",
+            incarnation,
+            total_bytes=4 * PAGE,
+            minimum_bytes=2 * PAGE,
+        )
+        liveness = PidfdLiveness(os.pidfd_open(os.getpid()))
+        try:
+            _ThreadingUnixServer.dispatch(server, request, liveness, ME)
+        except SlotError as error:
+            return error.reason
+        except KVCRServiceError:
+            return "admitted"
+        finally:
+            liveness.close()  # the handler closes it with every SLOT_HELD reply
+
+    assert server_claim("b") == SLOT_HELD
+    assert server_claim("c") == SLOT_HELD
+    assert table.waiters("t/l/0") == ["b", "c"]
+    owner[0] = False  # A releases
+    assert server_claim("c") == SLOT_HELD  # B is still head
+    assert server_claim("b") == "admitted"
+
+
+def test_claim_returns_its_own_generation(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    alive = {"a": True, "b": True}
+    kwargs = dict(
+        tenant="t", lineage="l", guard_index=0, total=4 * PAGE, minimum=2 * PAGE,
+        maximum=None, digest=DIGEST, peer=ME,
+    )
+    slot, gen_a = table.claim_with_generation(
+        claim_id="a", owner_alive=lambda: alive["a"], **kwargs
+    )
+    alive["a"] = False
+    slot_b, gen_b = table.claim_with_generation(
+        claim_id="b", owner_alive=lambda: alive["b"], **kwargs
+    )
+    assert slot_b is slot and gen_b == gen_a + 1
+    table.vacate("t/l/0", ME, gen_a)  # A's late vacate with its own generation
+    assert slot.held and slot.claim_id == "b"
+
+
+def test_failed_grow_is_never_persisted(tmp_path, pools, monkeypatch):
+    table, _ = _table(tmp_path)
+    slot = _claim(table, total=2, minimum=2, maximum=8)
+    path = Path(table._state_path)
+    before = _ids(json.loads(path.read_text())["slots"]["t/l/0"]["regions"])
+    seen = []
+
+    def failing_send(_slot):
+        with table._lock:  # another slot's claim persists the table mid-grow
+            table._persist()
+        seen.append(_ids(json.loads(path.read_text())["slots"]["t/l/0"]["regions"]))
+        raise OSError("no ack")
+
+    slot.holder_conn = socket.socketpair()[0]
+    monkeypatch.setattr(table, "_send_layout", failing_send)
+    with pytest.raises(SlotError):
+        table.grow("t/l/0", ME, 2 * PAGE, None)
+    with table._lock:
+        table._persist()
+    after = _ids(json.loads(path.read_text())["slots"]["t/l/0"]["regions"])
+    assert seen == [before] and after == before
+
+
+@pytest.mark.parametrize("op", ["shrink", "grow"])
+def test_resize_rechecks_ownership_under_the_slot_lock(tmp_path, pools, monkeypatch, op):
+    table, _ = _table(tmp_path)
+    alive = {"a": True, "b": True}
+    slot = _claim(table, "a", total=2, minimum=2, maximum=8, alive=lambda: alive["a"])
+    real = table._owned
+
+    def owned_then_b_claims(name, peer):
+        result = real(name, peer)
+        alive["a"] = False  # A dies; B claims between validation and the lock
+        _claim(table, "b", total=2, minimum=2, maximum=8, alive=lambda: alive["b"])
+        return result
+
+    monkeypatch.setattr(table, "_owned", owned_then_b_claims)
+    before = (slot.pool.regions, slot.pool.layout_generation)
+    with pytest.raises(SlotError) as raised:
+        if op == "shrink":
+            table.shrink("t/l/0", ME, (0,))
+        else:
+            table.grow("t/l/0", ME, PAGE, None)
+    assert raised.value.reason == IDENTITY_MISMATCH
+    assert (slot.pool.regions, slot.pool.layout_generation) == before

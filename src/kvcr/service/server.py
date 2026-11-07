@@ -443,6 +443,14 @@ def _peer_identity(connection: socket.socket) -> tuple[int, int, str | None]:
     return pid, uid, pod_uid
 
 
+def _dup_liveness_fd(liveness: PidfdLiveness) -> int | None:
+    """An independent pidfd for a queued waiter (the connection's closes at reply)."""
+    try:
+        return os.dup(liveness.fileno())
+    except (OSError, ValueError):
+        return None
+
+
 def _pidfd_alive(liveness: PidfdLiveness) -> bool:
     try:
         return not select.select([liveness], [], [], 0)[0]
@@ -688,7 +696,7 @@ class _ThreadingUnixServer(
         if isinstance(request, _ClaimV2):
             if slots is None:
                 raise SlotError(NOT_IMPLEMENTED, "this service has no slot table")
-            slot = slots.claim(
+            slot, generation = slots.claim_with_generation(
                 request.tenant,
                 request.lineage,
                 request.guard_index,
@@ -700,11 +708,11 @@ class _ThreadingUnixServer(
                 or f"{request.control_host}:{request.control_port}",
                 peer=peer,
                 owner_alive=lambda: _pidfd_alive(liveness),
+                waiter_fd=lambda: _dup_liveness_fd(liveness),
                 namespace=request.state_agent.namespace
                 if request.state_agent
                 else None,
             )
-            generation = slot.claim_generation
         try:
             # Retain the Guard across a concurrent close; claim validates the request.
             guard = self.registry._guards.get(request.guard_index)
