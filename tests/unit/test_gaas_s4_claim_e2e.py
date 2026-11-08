@@ -56,6 +56,7 @@ Client-side consumers of the stub pool size (``response.pools``):
 """
 
 import copy
+import mmap
 import os
 import subprocess
 import sys
@@ -74,7 +75,7 @@ from test_kvcr_service import (  # noqa: F401 - _channels_are_taken is autouse
     _control_bind,
 )
 from test_node_service import FakeAPI, no_cluster  # noqa: F401 - autouse
-from test_node_service_v2 import pools  # noqa: F401 - fixture
+from test_node_service_v2 import pools  # noqa: F401 - used through pytestmark
 
 import kvcr
 from kvcr.config import (
@@ -98,6 +99,8 @@ HOLDER_IMAGE = (
     "82f0e57a6f01886cd635f6362750a6464b939f0aee442085b2cf40560b995ccb"
 )
 SRC = str(Path(kvcr.__file__).resolve().parent.parent)
+
+pytestmark = pytest.mark.usefixtures("pools")  # closes the slot RegionPools
 
 
 class _HolderProcessAPI(FakeAPI):
@@ -212,11 +215,20 @@ def _claim_like_vllm(socket_path):
 
 
 def _pool_rank_files(pool_dir):
-    return {
+    """Each Guard rank's pool_{rank} file: (size, allocated bytes).
+
+    The guard-daemonset.yaml comment sizes the supervisor at guard-count x (pool
+    size + 100 MiB) of posix_fallocate'd /node-shm; with slots, pool_{rank} is a
+    sparse 2-page-journal + 1-page stub whatever --pool-sizes-gb says.
+    """
+    files = {
         p.name: (p.stat().st_size, p.stat().st_blocks * 512)
         for p in sorted(Path(pool_dir).iterdir())
-        if p.name.startswith("pool_")
+        if "pool_" in p.name and p.is_file()
     }
+    assert len(files) == 2  # --guard-count 2
+    assert set(files.values()) == {(3 * mmap.PAGESIZE, 0)}
+    return files
 
 
 def _vmas_covering(address, size):
@@ -232,7 +244,7 @@ def _vmas_covering(address, size):
     return found
 
 
-def test_one_page_stub_pool_refuses_the_vllm_claim(tmp_path, pools, monkeypatch):
+def test_one_page_stub_pool_refuses_the_vllm_claim(tmp_path, monkeypatch):
     """r7: --pool-sizes-gb 0.00001 is 8192 B, less than one 51380224 B block."""
     args, service, thread, api = _start_supervisor(tmp_path, "0.00001", monkeypatch)
     try:
@@ -249,7 +261,7 @@ def test_one_page_stub_pool_refuses_the_vllm_claim(tmp_path, pools, monkeypatch)
         _stop_supervisor(service, thread, api)
 
 
-def test_one_block_stub_pool_serves_the_vllm_claim(tmp_path, pools, monkeypatch):
+def test_one_block_stub_pool_serves_the_vllm_claim(tmp_path, monkeypatch):
     """0.0478515625 GB = 51380224 B: one block per rank, and the v2 claim is served."""
     args, service, thread, api = _start_supervisor(
         tmp_path, "0.0478515625", monkeypatch
