@@ -3,9 +3,10 @@
 """v2 holder: a Guaranteed pod that faults in a slot's pool so the kubelet charges it.
 
 It connects to the supervisor's private socket, receives one JSON layout line
-(``regions`` + ``layout_generation``) with the region memfd(s) over SCM_RIGHTS,
-maps each region MAP_SHARED, touches every page, reports
-``{"touched_bytes": N, "layout_generation": g}`` as one JSON line, then sleeps
+(``regions`` + ``layout_generation``, plus ``meta``: the slot's journal and snapshot
+memfd) with the memfd(s) over SCM_RIGHTS, maps each MAP_SHARED, touches every page,
+reports ``{"touched_bytes": N, "layout_generation": g}`` (plus ``meta_bytes`` when
+there is a meta memfd) as one JSON line, then sleeps
 until SIGTERM with the mappings kept so the pages stay resident. A later layout
 line (after a Grow) maps and touches the new regions and reports again.
 
@@ -29,6 +30,7 @@ import time
 from typing import Any
 
 _MAX_FDS = 8
+_META = -1  # the meta memfd's key among the mappings; region indices are >= 0
 _MAX_LINE = 1 << 20
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 
@@ -97,10 +99,11 @@ def handle_layout(
 ) -> bool:
     """Receive one layout, map and touch new regions, report. False on EOF.
 
-    ``mappings`` maps region index to (mmap, size) and is kept by the caller so
-    the pages stay resident; regions absent from the layout are unmapped. With
-    ``reset`` (the first layout after a reconnect) every old mapping is dropped
-    first: a restarted supervisor feeds a new memfd, so old mappings are stale.
+    ``mappings`` maps region index (``_META`` for the meta memfd) to (mmap, size)
+    and is kept by the caller so the pages stay resident; regions absent from the
+    layout are unmapped. With ``reset`` (the first layout after a reconnect) every
+    old mapping is dropped first: a restarted supervisor feeds a new memfd, so old
+    mappings are stale.
     """
     received = _receive(connection)
     if received is None:
@@ -112,6 +115,9 @@ def handle_layout(
                 view.close()
             mappings.clear()
         wanted = {region["index"]: region for region in layout["regions"]}
+        meta = layout.get("meta")  # the slot's journal and snapshot memfd
+        if meta:
+            wanted[_META] = {"offset": 0, **meta}
         for index in set(mappings) - set(wanted):
             mappings.pop(index)[0].close()
         for index, region in wanted.items():
@@ -130,9 +136,13 @@ def handle_layout(
         for fd in fds:
             os.close(fd)
     report = {
-        "touched_bytes": sum(size for _view, size in mappings.values()),
+        "touched_bytes": sum(
+            size for index, (_view, size) in mappings.items() if index != _META
+        ),
         "layout_generation": layout["layout_generation"],
     }
+    if _META in mappings:
+        report["meta_bytes"] = mappings[_META][1]
     connection.sendall(json.dumps(report).encode() + b"\n")
     return True
 

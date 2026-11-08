@@ -150,6 +150,7 @@ def _running_server(
     pool_sizes_bytes: tuple[int, ...] = _TEST_POOL_SIZES_BYTES,
     journal_bytes: int = _TEST_JOURNAL_BYTES,
     heartbeat_timeout_seconds: float | None = None,
+    slots=None,
 ) -> Iterator[_ServerHarness]:
     socket_path = _test_socket_path()
     pool_dir = tmp_path / "pools"
@@ -162,6 +163,7 @@ def _running_server(
         compatibility_digest=_TEST_DIGEST,
         journal_bytes=journal_bytes,
         heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+        slots=slots,
     )
     thread = threading.Thread(target=server.serve_forever)
     thread.start()

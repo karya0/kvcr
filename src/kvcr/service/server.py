@@ -25,6 +25,8 @@ from types import FrameType
 from typing import Any
 from urllib.parse import urlsplit
 
+import msgspec
+
 from ..runtime.control_channels import (
     FramedConnection,
     KVCRGuardProtocolError,
@@ -44,6 +46,7 @@ from .memory import (
     _reclaim_pool_if_orphaned,
     _unlink_if_identity,
 )
+from .node_service import _JOURNAL_BYTES as _NODE_JOURNAL_BYTES
 from .node_service import InClusterPodAPI, NodeBroker, SlotError, SlotTable
 from .protocol import (
     _CLAIM_DECODER,
@@ -81,7 +84,8 @@ _PRIVATE_SOCKET_UMASK = 0o177
 _CLIENT_IDLE_TIMEOUT_SECONDS = 30.0
 _REGISTRY_TRANSITION_TIMEOUT_SECONDS = 30.0
 _STALE_SOCKET_PROBE_SECONDS = 1.0
-_DEFAULT_JOURNAL_BYTES = 100 * (1 << 20)
+_DEFAULT_JOURNAL_BYTES = _NODE_JOURNAL_BYTES  # one source: node_service's
+_V2_STUB_JOURNAL_BYTES = 2 * 4096  # smallest valid journal: header plus one page
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 # Matches names produced by memory._pool_filename: "kvcr-<pool_id>-<32 hex>".
 _ORPHANED_POOL_NAME = re.compile(rf"{re.escape(_POOL_PREFIX)}-.+-[0-9a-f]{{32}}")
@@ -104,6 +108,7 @@ class _PoolRegistry:
         compatibility_digest: str,
         heartbeat_timeout_seconds: float | None = None,
         startup_timeout_seconds: int | None = None,
+        v2_slots: bool = False,
     ) -> None:
         self._pool_dir = Path(pool_dir).resolve()
         if not self._pool_dir.is_dir():
@@ -124,18 +129,39 @@ class _PoolRegistry:
         mapping_bytes = journal_bytes + sum(pool_sizes_bytes)
         for rank in range(guard_count):
             try:
+                # v2 journals and snapshots in the slot's holder-charged meta memfd
+                # and serves the slot's regions, so pool_{rank} is a sparse stub the
+                # supervisor is not charged for. The grant still describes the full
+                # layout (journal_bytes sizes the meta journal); only the file is small.
                 owner = _KVCRPoolOwner.allocate(
                     pool_id=f"pool_{rank}",
-                    pool_size_bytes=mapping_bytes,
-                    journal_bytes=journal_bytes,
+                    pool_size_bytes=(
+                        _V2_STUB_JOURNAL_BYTES + mmap.PAGESIZE
+                        if v2_slots
+                        else mapping_bytes
+                    ),
+                    journal_bytes=(
+                        _V2_STUB_JOURNAL_BYTES if v2_slots else journal_bytes
+                    ),
                     pool_dir=self._pool_dir,
+                    populate=not v2_slots,
+                )
+                grant_spec = (
+                    msgspec.structs.replace(
+                        owner.spec,
+                        mapping_bytes=mapping_bytes,
+                        journal_bytes=journal_bytes,
+                    )
+                    if v2_slots
+                    else owner.spec
                 )
                 # Built with the group, not a claim: a Guard that cannot attach its
                 # allocation is better discovered at startup than when a worker dies.
                 try:
                     guard = _Guard(
-                        owner.spec,
+                        grant_spec,
                         functools.partial(self._guard_failed, rank),
+                        pool_spec=owner.spec,
                         compatibility_digest=compatibility_digest,
                         guard_index=rank,
                         pool_sizes_bytes=pool_sizes_bytes,
@@ -229,7 +255,7 @@ class _PoolRegistry:
         tier_config: _TierConfig,
         liveness: PidfdLiveness,
         control_bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[..., bytes], str, int] | None = None,
+        data_pool: tuple[int, int, Callable[..., bytes], str, int, int] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give a pool group to a primary and return its Guard endpoint.
 
@@ -766,6 +792,7 @@ class _ThreadingUnixServer(
                     ),
                     slot.name,
                     len(slot.pool.regions),
+                    slot.pool.meta_fd,
                 ),
             )
             if guard is None:
@@ -869,6 +896,9 @@ class _KVCRService:
         # One daemon owns a socket path: the deployment runs a single service
         # per pod and clears the path before starting it.
         _unlink_stale_socket(self.socket_path)
+        if slots is not None:
+            # Before any pool or Guard thread exists, so a refusal leaks nothing.
+            slots.bind_journal_bytes(journal_bytes)
         self._registry = _PoolRegistry(
             pool_dir,
             guard_count,
@@ -877,6 +907,7 @@ class _KVCRService:
             compatibility_digest,
             heartbeat_timeout_seconds,
             startup_timeout_seconds,
+            v2_slots=slots is not None,
         )
         try:
             self._server = _ThreadingUnixServer(
@@ -1182,7 +1213,10 @@ def _build_slots(args: argparse.Namespace) -> SlotTable | None:
         toucher=True,
     )
     return SlotTable(
-        broker, args.slot_cap_bytes, require_pod_identity=args.require_pod_identity
+        broker,
+        args.slot_cap_bytes,
+        require_pod_identity=args.require_pod_identity,
+        journal_bytes=_DEFAULT_JOURNAL_BYTES,
     )
 
 

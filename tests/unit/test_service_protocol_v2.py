@@ -143,12 +143,13 @@ def test_v2_granted_roundtrip():
     assert granted.regions == _REGIONS and granted.layout_generation == 2
     assert granted.claim_generation == 5
     assert _roundtrip(granted, _CLAIM_RESPONSE_DECODER) == granted
-    assert _response_fd_counts(granted) == (4,)  # pool, listener, two region fds
+    # pool, listener, two region fds, the meta fd
+    assert _response_fd_counts(granted) == (5,)
 
 
-def test_response_receives_three_fds_over_a_socketpair():
-    # A v2 grant with one region memfd carries three descriptors; the receive
-    # buffer must hold them (it once held two and failed with MSG_CTRUNC).
+def test_response_receives_four_fds_over_a_socketpair():
+    # A v2 grant with one region memfd carries four descriptors (the meta memfd
+    # last); the receive buffer must hold them (it once held two: MSG_CTRUNC).
     wire = _granted_wire() | {
         "type": "granted2",
         "slot_name": "slot-a",
@@ -160,13 +161,13 @@ def test_response_receives_three_fds_over_a_socketpair():
     }
     granted = _CLAIM_RESPONSE_DECODER.decode(msgspec.msgpack.encode(wire))
     sender, receiver = socket.socketpair()
-    owned = [os.open("/dev/null", os.O_RDONLY) for _ in range(3)]
+    owned = [os.open("/dev/null", os.O_RDONLY) for _ in range(4)]
     try:
         FramedConnection(sender).send_with_fd(granted, *owned)
         response, received = FramedConnection(receiver).receive_with_fd(
             _CLAIM_RESPONSE_DECODER, _response_fd_counts
         )
-        assert response == granted and len(received) == 3
+        assert response == granted and len(received) == 4
         for fd in received:
             os.close(fd)
     finally:

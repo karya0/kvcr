@@ -68,13 +68,20 @@ class RegionPool:
     Region indices are never reused. Pool data does not travel through the control
     socket: peers get ``pass_fd_list()`` over SCM_RIGHTS and map the regions.
 
-    The pool owns ``fd`` from the moment ``__init__`` is entered: a failed
-    construction closes it, and so does ``close()``, each exactly once.
+    A v2 slot also has a ``meta`` memfd (recovery journal and snapshot region),
+    sent after the region memfd and untouched by grow and shrink: the holder maps
+    and populates it, so the kubelet charges it to the holder, not the supervisor.
+
+    The pool owns ``fd`` and ``meta_fd`` from the moment ``__init__`` is entered: a
+    failed construction closes them, and so does ``close()``, each exactly once.
     """
 
-    def __init__(self, fd: int, maximum: int, page_size: int) -> None:
+    def __init__(
+        self, fd: int, maximum: int, page_size: int, meta_fd: int = -1
+    ) -> None:
         self._libc = _libc()
         self._fd = fd
+        self._meta_fd = meta_fd
         self._max = maximum
         self._page = page_size
         self._regions: list[PoolRegion] = []
@@ -107,6 +114,7 @@ class RegionPool:
         *,
         page_size: int | None = None,
         hugetlb: bool = False,
+        meta_bytes: int = 0,
     ) -> "RegionPool":
         page = page_size or (_DEFAULT_HUGE_PAGE if hugetlb else mmap.PAGESIZE)
         maximum = round_up(effective_maximum_bytes, page)
@@ -117,11 +125,27 @@ class RegionPool:
         except BaseException:
             os.close(fd)
             raise
-        return cls(fd, maximum, page)  # owns fd, closing it if construction fails
+        meta_fd = -1
+        try:
+            if meta_bytes:
+                meta_fd = os.memfd_create("kvcr-meta-region", os.MFD_CLOEXEC)
+                os.ftruncate(meta_fd, meta_bytes)
+                os.fchmod(meta_fd, 0o600)  # an attachment demands the pool mode
+        except BaseException:
+            os.close(fd)
+            if meta_fd >= 0:
+                os.close(meta_fd)
+            raise
+        return cls(fd, maximum, page, meta_fd)  # owns both, closing them on failure
 
     @property
     def fd(self) -> int:
         return self._fd
+
+    @property
+    def meta_fd(self) -> int:
+        """The slot's journal and snapshot memfd, or -1 if it has none."""
+        return self._meta_fd
 
     @property
     def regions(self) -> tuple[PoolRegion, ...]:
@@ -144,8 +168,8 @@ class RegionPool:
         return self._base + region.offset
 
     def pass_fd_list(self) -> list[int]:
-        """The fds to send over SCM_RIGHTS; regions index into the memfd by offset."""
-        return [self._fd]
+        """The fds to send over SCM_RIGHTS: the region memfd, then the meta memfd."""
+        return [self._fd, *([self._meta_fd] if self._meta_fd >= 0 else [])]
 
     def grow(
         self, additional_bytes: int, split: int | None = None
@@ -281,6 +305,9 @@ class RegionPool:
         if self._fd >= 0:
             os.close(self._fd)
             self._fd = -1
+        if self._meta_fd >= 0:
+            os.close(self._meta_fd)
+            self._meta_fd = -1
         self._regions.clear()
 
     def __enter__(self) -> "RegionPool":

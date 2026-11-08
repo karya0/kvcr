@@ -16,6 +16,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import mmap
 import os
 import re
 import select
@@ -41,7 +42,29 @@ from typing import Any, Protocol
 # Loaded standalone (no package): mirrors protocol.READINESS_WAIT_S, not imported.
 READINESS_WAIT_S = 180.0
 _GIB = 1 << 30
-_JOURNAL_BYTES = 100 << 20
+_JOURNAL_BYTES = 100 << 20  # the service's default journal (server re-exports it)
+_JOURNAL_HEADER_BYTES = (
+    4096  # memory._JOURNAL_HEADER_BYTES; this module loads standalone
+)
+
+
+def meta_region_bytes(journal_bytes: int) -> int:
+    """Size of a v2 slot's meta memfd, from the pool spec's journal size.
+
+    Layout (memory.meta_spec): the journal, a header-sized stub where a pool's
+    data would start, then the snapshot region at the next mapping granularity.
+    The snapshot budget is journal_bytes plus one header page. That is an
+    explicit cap, NOT a bound by construction: the journal is a ring of
+    unconsumed deltas (padded to 8 B), the snapshot is one unpadded frame per
+    live recoverable record, so it scales with the record count. A snapshot over
+    the budget gets ENOSPC, which the Guard treats as recovery disabled
+    (guard._RECOVERY_CAPACITY_ERRORS): the pool stays claimable but cold.
+    """
+    stub = journal_bytes + _JOURNAL_HEADER_BYTES
+    offset = -(-stub // mmap.ALLOCATIONGRANULARITY) * mmap.ALLOCATIONGRANULARITY
+    return offset + journal_bytes + _JOURNAL_HEADER_BYTES
+
+
 _HEADROOM_BYTES = 2 * _GIB
 _LABEL = "kvcr.nvidia.com/manager"
 _ANNOTATION = "kvcr.nvidia.com/"
@@ -352,6 +375,9 @@ class NodeBroker:
         # v2: the holder is a Guaranteed toucher fed by the supervisor, not a
         # kvcr-service pool holder.
         self.toucher = toucher
+        self.meta_bytes = (
+            0  # set by the SlotTable: the meta memfd the holder also charges
+        )
 
     @staticmethod
     def _service_info(path: str) -> dict[str, Any]:
@@ -430,7 +456,9 @@ class NodeBroker:
         The overhead is a fixed part plus page tables, which the holder's memcg is
         charged for; sized any lower, populating a full pool is OOM-killed.
         """
-        total = claim.data_bytes + _toucher_overhead_bytes(claim.data_bytes)
+        # The holder maps and populates the whole meta memfd as well as the data.
+        charged = claim.data_bytes + self.meta_bytes
+        total = charged + _toucher_overhead_bytes(charged)
         memory = f"{-(-total // (1 << 20))}Mi"
         spec = pod["spec"]
         container = spec["containers"][0]
@@ -992,8 +1020,17 @@ class SlotTable:
         require_pod_identity: bool = True,
         clock: Callable[[], float] = time.monotonic,
         state_path: Path | None = None,
+        meta_bytes: int | None = None,
+        journal_bytes: int = _JOURNAL_BYTES,
     ):
+        # None: sized from the service's configured journal (bind_journal_bytes).
+        self._meta_explicit = meta_bytes is not None
+        self._bound_journal: int | None = None
+        if meta_bytes is None:
+            meta_bytes = meta_region_bytes(journal_bytes)
+        self.meta_bytes = meta_bytes
         self.broker, self.cap_bytes = broker, cap_bytes
+        broker.meta_bytes = meta_bytes
         self.local_requests, self.headroom_bytes = local_requests, headroom_bytes
         self.ensure_timeout_s = ensure_timeout_s
         self.require_pod_identity = require_pod_identity
@@ -1007,6 +1044,29 @@ class SlotTable:
         root = getattr(broker, "root", None)
         self._state_path = state_path or (root and Path(root) / "slot-table.json")
         self._restore()
+
+    def bind_journal_bytes(self, journal_bytes: int) -> None:
+        """Size the meta memfd from the service's journal, unless a size was given.
+
+        Called once by the service before it builds any pool. Restored slots own
+        fresh, empty meta memfds (a restart loses their contents), so they are
+        resized in place; a table already bound to another journal is refused.
+        """
+        if self._meta_explicit:
+            return
+        if self._bound_journal not in (None, journal_bytes):
+            raise ValueError(
+                f"slot table is bound to journal_bytes={self._bound_journal}; "
+                f"refusing journal_bytes={journal_bytes}"
+            )
+        meta_bytes = meta_region_bytes(journal_bytes)
+        with self._lock:
+            if meta_bytes != self.meta_bytes:
+                for slot in self._slots.values():
+                    if slot.pool.meta_fd >= 0:
+                        os.ftruncate(slot.pool.meta_fd, meta_bytes)
+                self.meta_bytes = self.broker.meta_bytes = meta_bytes
+            self._bound_journal = journal_bytes
 
     @staticmethod
     def slot_name(tenant: str, lineage: str, guard_index: int) -> str:
@@ -1070,7 +1130,9 @@ class SlotTable:
         self._epochs = {k: int(v) for k, v in data.get("epochs", {}).items()}
         self._generations = {k: int(v) for k, v in data.get("generations", {}).items()}
         for name, rec in data.get("slots", {}).items():
-            pool = RegionPool.create(rec["effective_maximum_bytes"])
+            pool = RegionPool.create(
+                rec["effective_maximum_bytes"], meta_bytes=self.meta_bytes
+            )
             try:
                 pool.restore(
                     [
@@ -1274,7 +1336,7 @@ class SlotTable:
                     raise SlotError(
                         CAPACITY_BELOW_MINIMUM, f"capacity below minimum for {name}"
                     )
-                pool = RegionPool.create(effective)
+                pool = RegionPool.create(effective, meta_bytes=self.meta_bytes)
                 try:
                     pool.grow(min(size, effective))
                 except BaseException as error:
@@ -1370,6 +1432,8 @@ class SlotTable:
         from .protocol import populate_wait_s
 
         total = sum(r.size for r in slot.pool.regions)
+        if slot.pool.meta_fd >= 0:
+            total += os.fstat(slot.pool.meta_fd).st_size
         return populate_wait_s(total, self.ensure_timeout_s)
 
     def _send_layout(self, slot: _Slot) -> None:
@@ -1382,6 +1446,10 @@ class SlotTable:
             ],
             "layout_generation": slot.pool.layout_generation,
         }
+        meta_size = -1
+        if slot.pool.meta_fd >= 0:  # the fd follows the region memfd
+            meta_size = os.fstat(slot.pool.meta_fd).st_size
+            layout["meta"] = {"fd_index": 1, "size": meta_size}
         wait_s = self._holder_wait_s(slot)
         conn.settimeout(wait_s)
         line = b""
@@ -1404,6 +1472,13 @@ class SlotTable:
                 f"holder closed before reporting{f' ({reason})' if reason else ''}"
             ) from error
         report = json.loads(line)
+        if report.get("meta_bytes", -1) != meta_size:
+            # An old holder image would leave the meta memfd unpopulated and
+            # uncharged: fail the claim closed.
+            raise RuntimeError(
+                f"holder populated {report.get('meta_bytes')} meta bytes, "
+                f"expected {meta_size}"
+            )
         slot.touched_bytes = report["touched_bytes"]
         slot.layout_generation = report["layout_generation"]
 

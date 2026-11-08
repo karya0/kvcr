@@ -45,13 +45,44 @@ def tmp_path():
         yield Path(directory)
 
 
-def _send_layout(conn, regions, generation, fds):
+def _send_layout(conn, regions, generation, fds, meta=None):
     layout = {"regions": regions, "layout_generation": generation}
+    if meta:
+        layout["meta"] = meta
     socket.send_fds(conn, [json.dumps(layout).encode() + b"\n"], fds)
 
 
 def _read_report(conn):
     return json.loads(conn.makefile("rb").readline())
+
+
+def test_holder_touches_the_meta_memfd_and_keeps_it_out_of_touched_bytes(capsys):
+    data, meta = os.memfd_create("d"), os.memfd_create("m")
+    os.ftruncate(data, PAGE)
+    os.ftruncate(meta, 3 * PAGE)
+    supervisor, worker = socket.socketpair()
+    mappings = {}
+    region = {"index": 0, "offset": 0, "size": PAGE, "fd_index": 0}
+    _send_layout(
+        supervisor, [region], 1, [data, meta], {"fd_index": 1, "size": 3 * PAGE}
+    )
+    assert holder.handle_layout(worker, mappings) is True
+    assert _read_report(supervisor) == {
+        "touched_bytes": PAGE,
+        "meta_bytes": 3 * PAGE,
+        "layout_generation": 1,
+    }
+    started = [json.loads(x) for x in capsys.readouterr().err.splitlines()]
+    assert [x["bytes"] for x in started if x["holder"] == "populate_end"] == [
+        PAGE,
+        3 * PAGE,
+    ]
+    for view, _size in mappings.values():
+        view.close()
+    for fd in (data, meta):
+        os.close(fd)
+    supervisor.close()
+    worker.close()
 
 
 def test_holder_touches_and_reports(capsys):
@@ -105,11 +136,12 @@ def test_response_fd_counts():
         1,
         "h:1",
     )
-    assert _response_fd_counts(v2) == (3,)
+    # The pool and listener fds, one region memfd, then the meta memfd.
+    assert _response_fd_counts(v2) == (4,)
     two_fds = msgspec.structs.replace(
         v2, regions=(PoolRegion(0, 0, PAGE, 0), PoolRegion(1, PAGE, PAGE, 1))
     )
-    assert _response_fd_counts(two_fds) == (4,)
+    assert _response_fd_counts(two_fds) == (5,)
     v1 = _Granted(0, v2.spec, v2.tier_config, v2.pools, 1)
     assert _response_fd_counts(v1) == (2,)
     assert _response_fd_counts(_Error("x", 2)) == (0,)
@@ -227,7 +259,8 @@ def test_slot_claim_feeds_toucher(tmp_path):
         conn = holder.connect(args[1], 10)
         mappings = {}
         holder.handle_layout(conn, mappings)
-        reports.append(sum(size for _v, size in mappings.values()))
+        reports.append(sum(size for i, (_v, size) in mappings.items() if i >= 0))
+        reports.append(-1 in mappings)  # the slot's meta memfd is touched too
         for view, _ in mappings.values():
             view.close()
         conn.close()
@@ -238,6 +271,7 @@ def test_slot_claim_feeds_toucher(tmp_path):
         slot = _claim(table)
         thread.join(10)
         assert slot.touched_bytes == 4 * PAGE == reports[0]
+        assert reports[1] is True
         assert slot.layout_generation == slot.pool.layout_generation
     finally:
         thread.join(10)
@@ -251,7 +285,11 @@ def test_slow_holder_wait_is_size_aware(tmp_path, monkeypatch):
     broker = make_broker(tmp_path, api)
     broker.toucher = True
     table = SlotTable(
-        broker, HEADROOM + 64 * PAGE, ensure_timeout_s=1, require_pod_identity=False
+        broker,
+        HEADROOM + 64 * PAGE,
+        ensure_timeout_s=1,
+        require_pod_identity=False,
+        meta_bytes=0,  # the wait covers the meta memfd too; this pins the data part
     )
     done = threading.Event()
 

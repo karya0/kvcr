@@ -3,11 +3,13 @@
 """The v2 data pool is the granted regions, in the client and in the Guard."""
 
 import ctypes
+import errno
 import logging
 import mmap
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -27,6 +29,7 @@ from test_kvcr_service import (  # noqa: F401 - _channels_are_taken is autouse
     _TEST_DIGEST,
     _channels_are_taken,
     _control_bind,
+    _running_server,
 )
 from test_node_service_v2 import pools  # noqa: F401 - used through pytestmark
 
@@ -34,6 +37,10 @@ from kvcr.backends.local_disk import _G3Residency
 from kvcr.config import GaaSSettings
 from kvcr.runtime.core import _BlockRecord
 from kvcr.service import guard as guard_module
+from kvcr.service import memmap
+from kvcr.service import memory as memory_module
+from kvcr.service import node_service
+from kvcr.service.node_service import SlotTable
 from kvcr.service.protocol import (
     DATA_POOL_LAYOUT,
     KVCRServiceReasonError,
@@ -44,6 +51,9 @@ from kvcr.service.recovery_journal import (
     _RECORD_BLOCK,
     _RECOVERY_ENCODER,
     _project_recovery_record,
+    read_handback,
+    read_recovery_snapshot,
+    write_recovery_snapshot,
 )
 from kvcr.service.regions import RegionMapping
 from kvcr.types import BlockKey
@@ -396,3 +406,216 @@ def test_a_mirror_of_unknown_provenance_is_dropped(short_dir, caplog):
             assert any("stale_layout" in m for m in caplog.messages)
         finally:
             hold.release()
+
+
+def test_journal_lives_in_the_slot_meta_memfd_not_pool_rank(short_dir, caplog):
+    server, table = _serve(short_dir)
+    with server as harness:
+        _attach(harness, table)
+        guard = harness.server._server.registry._guards[0]
+        hold = _claim(harness)
+        try:
+            meta_fd = table.get("t/l/0").pool.meta_fd
+            digest = bytes(range(32))
+            hold._attachment.set_layout_digest(digest)
+            # The client wrote through its mapping of the memfd the supervisor owns.
+            assert os.pread(meta_fd, 32, 256) == digest
+            # The Guard now reads the same bytes: its attachment is the meta memfd.
+            assert guard._recovery.attachment.layout_digest() == digest
+            spec = guard._recovery.attachment._spec
+            assert (spec.device, spec.inode) == (
+                os.fstat(meta_fd).st_dev,
+                os.fstat(meta_fd).st_ino,
+            )
+            # pool_{rank} was left alone: nothing grew past it, no header written.
+            pool_spec = guard._recovery._pool_spec
+            assert os.stat(guard._spec.path).st_size == pool_spec.mapping_bytes
+            with open(guard._spec.path, "rb") as pool_rank:
+                pool_rank.seek(256)
+                assert pool_rank.read(32) == bytes(32)
+            assert len(hold.region_fds) == 1  # the meta fd is not a region fd
+            with caplog.at_level(logging.INFO, logger=guard_module.logger.name):
+                guard._core = MagicMock()
+                with patch.object(guard._recovery, "prepare_to_serve", lambda r: r):
+                    with patch.object(guard._recovery, "release_snapshot_region"):
+                        guard._serve({}, time.monotonic(), time.monotonic())
+            size = os.fstat(meta_fd).st_size
+            offset = memmap.region_offset(meta_fd, spec.mapping_bytes)
+            assert (
+                f"KVCR_EVENT gaas_meta_region guard=0 slot=t/l/0 bytes={size} "
+                f"journal_bytes={spec.journal_bytes} snapshot_budget={size - offset}"
+            ) in caplog.messages
+        finally:
+            guard._serving = False
+            guard._core = None
+            hold.release()
+
+
+def test_snapshot_round_trips_through_the_meta_memfd_and_reaches_a_replacement_client(
+    short_dir,
+):
+    # The replacement is a new client on the same Guard process; a Guard process
+    # restart is not a supported recovery path.
+    server, table = _serve(short_dir)
+    with server as harness:
+        _attach(harness, table)
+        guard = harness.server._server.registry._guards[0]
+        _released_with_a_record(harness, guard)
+        meta_fd = table.get("t/l/0").pool.meta_fd
+        size = os.fstat(meta_fd).st_size  # the handback kept the memfd's size
+        assert size == table.meta_bytes
+        assert os.stat(guard._spec.path).st_size == (
+            guard._recovery._pool_spec.mapping_bytes
+        )
+        replacement = _claim_layout(harness, "l")
+        try:
+            # The replacement client reads what the Guard left, from the same memfd.
+            recovered = read_handback(
+                replacement._attachment, _TEST_DIGEST, replacement._pools
+            )
+            assert list(recovered.take_records()) == [_KEY]
+            assert os.fstat(meta_fd).st_size == size
+        finally:
+            replacement.release()
+
+
+def test_supervisor_pool_rank_is_a_sparse_stub_no_populate_touches(short_dir):
+    # The supervisor cgroup pays for process memory only: journal and snapshot
+    # live in the holder-charged meta memfd, so pool_{rank} is journal + one data
+    # page (the smallest valid journal is a header plus one page) and unbacked.
+    # This runs on tmpfs or a regular filesystem only; hugetlbfs page rounding of
+    # the stub is out of scope here.
+    populated = []
+    real = memory_module._populate_pages
+
+    def spy(fd, offset, length):
+        populated.append((os.fstat(fd).st_ino, offset, length))
+        return real(fd, offset, length)
+
+    with patch.object(memory_module, "_populate_pages", spy):
+        server, table = _serve(short_dir)
+        with server as harness:
+            _attach(harness, table)
+            guard = harness.server._server.registry._guards[0]
+            path = guard._recovery._pool_spec.path
+            inode = guard._recovery._pool_spec.inode
+            assert os.stat(path).st_size == 3 * PAGE  # 2 journal pages + 1 data
+            assert os.stat(path).st_blocks == 0
+            _released_with_a_record(harness, guard)  # a full v2 promotion and handback
+            second = _claim_layout(harness, "l")
+            second.release()
+            assert os.stat(path).st_size == 3 * PAGE
+            assert os.stat(path).st_blocks == 0  # nothing faulted a page in
+            assert all(call[0] != inode for call in populated)
+            # The grant still describes the configured journal, which the meta uses.
+            assert guard._spec.mapping_bytes > 3 * PAGE
+
+
+def test_meta_region_follows_the_configured_journal_bytes(short_dir):
+    journal = 256 << 20  # the default constant would leave no room for this journal
+    server, table = _serve(short_dir, journal_bytes=journal)
+    with server as harness:
+        _attach(harness, table)
+        assert table.meta_bytes == node_service.meta_region_bytes(journal)
+        hold = _claim(harness)
+        try:
+            attachment = hold._attachment
+            assert attachment._spec.journal_bytes == journal
+            assert attachment.snapshot_budget_bytes >= journal + 4096
+        finally:
+            hold.release()
+
+
+def test_configured_journal_survives_a_restart_with_a_persisted_slot(short_dir):
+    journal = 256 << 20
+    server, table = _serve(short_dir, journal_bytes=journal)
+    with server as harness:
+        _attach(harness, table)
+        _claim(harness).release()
+    assert (short_dir / "slot-table.json").exists()
+    # A new process: a default-sized table restores the slot, then the service binds.
+    reborn = SlotTable(table.broker, table.cap_bytes, require_pod_identity=False)
+    assert "t/l/0" in reborn._slots
+    second = short_dir / "second"
+    second.mkdir()
+    with _running_server(second, slots=reborn, journal_bytes=journal) as harness:
+        _attach(harness, reborn)
+        assert reborn.meta_bytes == node_service.meta_region_bytes(journal)
+        meta_fd = reborn._slots["t/l/0"].pool.meta_fd
+        assert os.fstat(meta_fd).st_size == reborn.meta_bytes
+        hold = _claim(harness)
+        try:
+            assert hold._attachment._spec.journal_bytes == journal
+        finally:
+            hold.release()
+
+
+def test_journal_bind_refusal_leaks_no_guard_or_pool(short_dir):
+    _, table = _serve(short_dir)
+    table.bind_journal_bytes(256 << 20)  # bound to a journal the service will not use
+    before = {t.ident for t in threading.enumerate()}
+    with pytest.raises(ValueError, match="bound to journal_bytes"):
+        with _running_server(short_dir, slots=table, journal_bytes=1 << 20):
+            pass
+    assert {t.ident for t in threading.enumerate()} <= before
+    assert list((short_dir / "pools").iterdir()) == []
+
+
+def test_snapshot_beyond_the_meta_budget_is_refused_and_leaves_none(short_dir):
+    # The journal is two pages in these services; the snapshot budget is one page.
+    start = memmap.round_up(2 * PAGE + 4096, mmap.ALLOCATIONGRANULARITY)
+    server, table = _serve(short_dir, meta_bytes=start + PAGE)
+    with server as harness:
+        _attach(harness, table)
+        hold = _claim(harness)
+        try:
+            attachment = hold._attachment
+            assert attachment.snapshot_budget_bytes == PAGE
+            frame = (_RECORD_BLOCK, b"k", b"v" * 16)
+            write_recovery_snapshot(attachment, b"terms", [frame])
+            assert [f[1] for f in read_recovery_snapshot(attachment, b"terms")] == [
+                b"k"
+            ]
+            big = (_RECORD_BLOCK, b"k", b"v" * 50000)
+            with pytest.raises(OSError) as full:
+                write_recovery_snapshot(attachment, b"terms", [big, big])
+            assert full.value.errno == errno.ENOSPC
+            assert list(read_recovery_snapshot(attachment, b"terms")) == []
+        finally:
+            hold.release()
+
+
+@pytest.mark.parametrize("meta_bytes", [0, PAGE])
+def test_claim_fails_closed_without_a_usable_meta_region(short_dir, meta_bytes):
+    server, table = _serve(short_dir, meta_bytes=meta_bytes)
+    with server as harness:
+        _attach(harness, table)
+        with pytest.raises(KVCRServiceReasonError, match="meta region") as refused:
+            _claim(harness)
+        assert refused.value.reason == DATA_POOL_LAYOUT
+        deadline = time.monotonic() + 5
+        while table.get("t/l/0").held and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not table.get("t/l/0").held
+
+
+def test_meta_fd_identity_is_fixed_at_claim_and_fails_closed():
+    recovery = object.__new__(guard_module._RecoveryState)
+    recovery.meta_fd = recovery.meta_identity = None
+    first = os.memfd_create("meta-a")
+    second = os.memfd_create("meta-b")
+    try:
+        recovery.set_meta_fd(first)
+        assert recovery.meta_fd not in (None, first)  # a dup, owned by the state
+        assert recovery.meta_identity == (
+            os.fstat(first).st_dev,
+            os.fstat(first).st_ino,
+        )
+        os.dup2(second, recovery.meta_fd)  # the held descriptor is swapped
+        with pytest.raises(ValueError, match="not the one"):
+            recovery._attach_meta()
+        recovery.set_meta_fd(None)
+        assert recovery.meta_fd is None and recovery.meta_identity is None
+    finally:
+        os.close(first)
+        os.close(second)

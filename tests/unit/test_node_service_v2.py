@@ -479,7 +479,7 @@ def test_shrink_resends_the_reduced_layout(tmp_path, pools):
         thread.join(10)
         assert slot.touched_bytes == 2 * PAGE
         assert slot.layout_generation == generation
-        assert list(mappings) == [0]
+        assert list(mappings) == [0, -1]  # the meta memfd stays mapped
     finally:
         for view, _size in mappings.values():
             view.close()
@@ -849,3 +849,48 @@ def test_resize_recheck_rejects_a_slot_vacated_after_the_check(tmp_path, pools):
     with pytest.raises(SlotError) as error:
         table._recheck_owner(slot, ME, granted.claim_generation)
     assert error.value.reason == IDENTITY_MISMATCH
+
+
+def test_holder_pod_limit_covers_data_meta_and_overhead(tmp_path):
+    table, _ = _table(tmp_path)
+    table.broker.toucher = True
+    claim = node_service.PoolClaim("p46", 46, "g")  # a 46 GiB slot
+    state = {"pod_name": "n", "creation_id": "c", "socket_path": "/n/p/s.sock"}
+    container = table.broker._pod(claim, state)["spec"]["containers"][0]
+    limit = container["resources"]["limits"]["memory"]
+    assert limit.endswith("Mi")
+    assert container["resources"]["requests"]["memory"] == limit
+    charged = claim.data_bytes + table.meta_bytes
+    floor = charged + node_service._TOUCHER_OVERHEAD_BYTES + charged // 200
+    assert int(limit[:-2]) << 20 >= floor
+    assert table.meta_bytes > (100 << 20)  # the meta memfd is real memory here
+
+
+def test_meta_region_is_derived_from_the_journal_size():
+    journal = 100 << 20
+    size = node_service.meta_region_bytes(journal)
+    offset = size - journal - node_service._JOURNAL_HEADER_BYTES
+    assert offset >= journal + node_service._JOURNAL_HEADER_BYTES
+    assert not hasattr(node_service, "_META_BYTES")  # the journal, not a constant
+
+
+def test_holder_report_must_cover_the_meta_memfd(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    slot = _claim(table)
+    supervisor_end, holder_end = socket.socketpair()
+    slot.holder_conn = supervisor_end
+
+    def old_holder():  # an image that predates the meta memfd: no meta_bytes
+        socket.recv_fds(holder_end, 65536, 4)
+        report = {"touched_bytes": 4 * PAGE, "layout_generation": 0}
+        holder_end.sendall(json.dumps(report).encode() + b"\n")
+
+    thread = threading.Thread(target=old_holder)
+    thread.start()
+    try:
+        with pytest.raises(RuntimeError, match="meta bytes"):
+            table._send_layout(slot)
+    finally:
+        thread.join(10)
+        supervisor_end.close()
+        holder_end.close()

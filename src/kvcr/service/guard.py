@@ -34,6 +34,7 @@ from .memory import (
     KVCRPoolAttachment,
     KVCRPoolSpec,
     _KVCRPoolOwner,
+    meta_spec,
 )
 from .protocol import (
     _MIN_HEARTBEAT_TIMEOUT_SECONDS,
@@ -187,8 +188,12 @@ class _RecoveryState:
         spec: KVCRPoolSpec,
         compatibility_digest: str,
         pool_sizes_bytes: tuple[int, ...],
+        pool_spec: KVCRPoolSpec | None = None,
     ) -> None:
         self._spec = spec
+        # The file this Guard attaches. v2 grants ``spec`` (the layout and the meta
+        # journal size) over a small sparse stub, which nothing here may write.
+        self._pool_spec = pool_spec or spec
         self._compatibility_digest = compatibility_digest
         self._pool_sizes_bytes = pool_sizes_bytes
         self.pools: tuple[_PoolDescriptor, ...] = ()
@@ -203,13 +208,16 @@ class _RecoveryState:
         # ``layout_digest(backing_only=True)`` leaves out the claim generation: it
         # names the memory, which a later claim of the same slot shares.
         self.layout_digest: Callable[..., bytes] | None = None
+        # v2: the slot's meta memfd, where this claim's journal and snapshot live.
+        self.meta_fd: int | None = None  # a dup this object owns
+        self.meta_identity: tuple[int, int] | None = None  # (st_dev, st_ino) at claim
         # The backing the mirror and the retained snapshot were recorded under;
         # None is unknown provenance, which a v2 pool never trusts.
         self._backing: bytes | None = None
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
-        self.attachment = KVCRPoolAttachment.attach(self._spec, collapse=True)
+        self.attachment = KVCRPoolAttachment.attach(self._pool_spec, collapse=True)
         self._journal = RecoveryJournal(self.attachment)
 
     def configure(self, pool_layouts: PoolBlockLayouts) -> None:
@@ -227,13 +235,51 @@ class _RecoveryState:
             offset += size_bytes
         pools = tuple(descriptors)
         mirror = self.mirror
-        if mirror is None:
+        on_stub = self._pool_spec != self._spec and (
+            self.attachment._spec == self._pool_spec
+        )
+        if mirror is None and not on_stub:
             mirror = read_handback(self.attachment, self._compatibility_digest, pools)
+        # Before _attach_meta, self.attachment is pool_{rank} on a first claim. A v2
+        # stub holds no handback and its mapping does not reach these offsets, so
+        # nothing is read or written there (harmless: the meta is born with the slot
+        # and this Guard object is never rebuilt); start_primary builds the mirror
+        # once on the meta memfd. Later claims read the meta handback as before.
         self.pools = pools
         self.mirror = mirror
 
+    def set_meta_fd(self, fd: int | None) -> None:
+        """Keep a dup of the slot's meta memfd, and the identity validated at claim."""
+        if self.meta_fd is not None:
+            with suppress(OSError):
+                os.close(self.meta_fd)
+        self.meta_fd = self.meta_identity = None
+        if fd is not None:
+            file_stat = os.fstat(fd)
+            self.meta_fd = os.dup(fd)
+            self.meta_identity = (file_stat.st_dev, file_stat.st_ino)
+
+    def _attach_meta(self) -> None:
+        """Move journal and snapshot region from pool_{rank} to the slot's meta memfd.
+
+        After any hand-back, which went to the attachment the last primary used.
+        """
+        current = os.fstat(self.meta_fd)
+        if (current.st_dev, current.st_ino) != self.meta_identity:
+            raise ValueError("KVCR meta memfd is not the one this claim validated")
+        spec = self.attachment._spec
+        if (current.st_dev, current.st_ino) == (spec.device, spec.inode):
+            return  # the same slot again
+        meta = KVCRPoolAttachment.attach_meta_fd(
+            os.dup(self.meta_fd), self._spec, expected=self.meta_identity
+        )
+        self.attachment.close()
+        self.attachment, self._journal = meta, RecoveryJournal(meta)
+
     def start_primary(self) -> None:
         """Arm recovery for the accepted primary and reset its journal."""
+        if self.meta_fd is not None:
+            self._attach_meta()
         if self.mirror is None:
             self.mirror = _RecoveryMirror(tuple(pool.name for pool in self.pools))
         self._journal.reset()
@@ -373,12 +419,15 @@ class _RecoveryState:
     def _write_handback(self, records: Mapping[BlockKey, _BlockRecord]) -> None:
         write_recovery_snapshot(
             self.attachment,
-            canonical_pool_terms(self._compatibility_digest, self.pools, self._spec),
+            canonical_pool_terms(
+                self._compatibility_digest, self.pools, self.attachment._spec
+            ),
             _recovery_frames(records),
         )
 
     def close(self) -> None:
         """Close the attachment, retaining it if close must be retried."""
+        self.set_meta_fd(None)
         if self.attachment is not None:
             self.attachment.close()
             self.attachment = None
@@ -430,6 +479,7 @@ class _Guard:
         refusing: Callable[[], bool] = lambda: False,
         heartbeat_timeout_seconds: float | None = None,
         startup_timeout_seconds: int | None = None,
+        pool_spec: KVCRPoolSpec | None = None,
     ) -> None:
         if heartbeat_timeout_seconds is not None and not (
             _MIN_HEARTBEAT_TIMEOUT_SECONDS <= heartbeat_timeout_seconds < float("inf")
@@ -446,8 +496,12 @@ class _Guard:
         # Owned by the current primary.
         self._control: ZmqPeerControlChannel | None = None
         self._configured: _TierConfig | None = None
-        self._data_pool: tuple[int, int, Callable[..., bytes], str, int] | None = None
-        self._recovery = _RecoveryState(spec, compatibility_digest, pool_sizes_bytes)
+        self._data_pool: tuple[int, int, Callable[..., bytes], str, int, int] | None = (
+            None
+        )
+        self._recovery = _RecoveryState(
+            spec, compatibility_digest, pool_sizes_bytes, pool_spec
+        )
         self._core = None
         # Released cores still registering; _poll closes each once registered.
         self._orphans: list[_KVCRCore] = []
@@ -509,7 +563,7 @@ class _Guard:
         liveness: PidfdLiveness,
         tier_config: _TierConfig,
         bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[..., bytes], str, int] | None = None,
+        data_pool: tuple[int, int, Callable[..., bytes], str, int, int] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give this pool group to a primary, with its Guard's endpoint.
         Reserved on the requesting thread: a mid-transition pool answers busy
@@ -868,12 +922,14 @@ class _Guard:
         liveness: PidfdLiveness,
         tier_config: _TierConfig,
         bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[..., bytes], str, int] | None = None,
+        data_pool: tuple[int, int, Callable[..., bytes], str, int, int] | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give the pool to a primary, and take up the endpoint it named.
         All fallible work runs before the lease exists, and commit and refusal
         share one lock: a lease is never half-granted.
         """
+        # A v2 Guard maps a stub pool; only a data-pool claim may be served there.
+        assert data_pool is not None or self._recovery._pool_spec == self._spec
         listener, bound_here = self._pool_lease.bind(bind)
         granted_fd = -1
         try:
@@ -881,8 +937,17 @@ class _Guard:
                 raise KVCRServiceReasonError(
                     "a v2 data pool is one pool", DATA_POOL_LAYOUT
                 )
+            if data_pool is not None:
+                try:
+                    meta_spec(self._spec, data_pool[5])
+                except (OSError, ValueError) as error:
+                    raise KVCRServiceReasonError(
+                        f"v2 slot has no usable meta region: {error}",
+                        DATA_POOL_LAYOUT,
+                    ) from error
             self._data_pool = data_pool
             self._recovery.layout_digest = data_pool and data_pool[2]
+            self._recovery.set_meta_fd(data_pool and data_pool[5])
             granted_fd = os.dup(listener.fileno())
             # from_shared_listener detaches its argument; give it a duplicate.
             duplicate = socket.socket(fileno=os.dup(listener.fileno()))
@@ -1159,7 +1224,7 @@ class _Guard:
             (serving - started) * 1000,
         )
         if self._data_pool is not None:
-            address, size, _digest, slot_name, regions = self._data_pool
+            address, size, _digest, slot_name, regions, _fd = self._data_pool
             logger.info(
                 "KVCR_EVENT guard_data_pool_serving guard=%d slot=%s "
                 "base=0x%x bytes=%d regions=%d",
@@ -1168,6 +1233,16 @@ class _Guard:
                 address,
                 size,
                 regions,
+            )
+            meta = self._recovery.attachment
+            logger.info(
+                "KVCR_EVENT gaas_meta_region guard=%d slot=%s bytes=%d "
+                "journal_bytes=%d snapshot_budget=%d",
+                self._guard_index,
+                slot_name,
+                os.fstat(meta._file_descriptor).st_size,
+                self._spec.journal_bytes,
+                meta.snapshot_budget_bytes,
             )
 
     def _prepare_core(self) -> None:

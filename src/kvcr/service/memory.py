@@ -25,6 +25,8 @@ _JOURNAL_HEADER_BYTES = 4096
 # Past the ring cursors (recovery_journal.py): the digest of the region table the
 # claimant mapped as its data pool; zero until a v2 claimant writes it.
 _LAYOUT_DIGEST_OFFSET, LAYOUT_DIGEST_BYTES = 256, 32
+# Zeroed to retire a snapshot region that stays allocated; covers its header.
+_RETIRED_BYTES = 64
 # The errnos that mean "another holder has this lock" rather than "locking is
 # broken here". Anything outside this set must propagate.
 _CONTENTION_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
@@ -67,6 +69,25 @@ class KVCRPoolSpec(msgspec.Struct, frozen=True):
         _validate_pool_layout(self.mapping_bytes, self.journal_bytes)
 
 
+def meta_spec(spec: KVCRPoolSpec, file_descriptor: int) -> KVCRPoolSpec:
+    """The spec a v2 slot's meta memfd is attached under.
+
+    The memfd is the journal, then a stub page where a pool's data would start,
+    then the snapshot region (``region_offset`` of that mapping); the identity is
+    the memfd's own. The data pool is the slot's regions, not part of this mapping.
+    """
+    file_stat = os.fstat(file_descriptor)
+    meta = msgspec.structs.replace(
+        spec,
+        device=file_stat.st_dev,
+        inode=file_stat.st_ino,
+        mapping_bytes=spec.journal_bytes + _JOURNAL_HEADER_BYTES,
+    )
+    if file_stat.st_size <= memmap.region_offset(file_descriptor, meta.mapping_bytes):
+        raise ValueError("KVCR meta region has no room for a snapshot")
+    return meta
+
+
 class KVCRPoolAttachment:
     """Map a KVCR pool without taking ownership of its backing file."""
 
@@ -80,6 +101,9 @@ class KVCRPoolAttachment:
         self._file_descriptor = _file_descriptor
         self._mapping: memmap.PoolMapping | None = _mapping
         self._spec = _spec
+        # A v2 meta memfd keeps its size: the holder charged its pages, and a
+        # truncate would hand them back. Its snapshot region is cleared in place.
+        self._fixed_size = False
 
     @classmethod
     def attach(
@@ -131,6 +155,42 @@ class KVCRPoolAttachment:
             os.close(file_descriptor)
             raise
 
+    @classmethod
+    def attach_meta_fd(
+        cls,
+        file_descriptor: int,
+        spec: KVCRPoolSpec,
+        *,
+        expected: tuple[int, int] | None = None,
+    ) -> "KVCRPoolAttachment":
+        """Map a v2 slot's meta memfd: the journal at 0, the snapshot region past it.
+
+        ``spec`` is the Guard's pool spec; the memfd is attached under ``meta_spec``,
+        so both sides agree on it. Takes ownership of the descriptor.
+        """
+        try:
+            file_stat = os.fstat(file_descriptor)
+            # meta_spec takes the identity from the descriptor itself, so the
+            # check against the grant cannot catch a swapped one; this does.
+            if (
+                expected is not None
+                and (file_stat.st_dev, file_stat.st_ino) != expected
+            ):
+                raise ValueError("KVCR meta memfd is not the one the claim validated")
+            meta = meta_spec(spec, file_descriptor)
+        except BaseException:
+            os.close(file_descriptor)
+            raise
+        attachment = cls.attach_fd(file_descriptor, meta)  # closes it on failure
+        attachment._fixed_size = True
+        return attachment
+
+    @property
+    def snapshot_budget_bytes(self) -> int:
+        """How much a snapshot region may hold in the backing as it stands."""
+        offset = memmap.region_offset(self._file_descriptor, self._spec.mapping_bytes)
+        return os.fstat(self._file_descriptor).st_size - offset
+
     @property
     def data_address(self) -> int:
         """Where the cache starts, past the journal at the head of the pool."""
@@ -164,18 +224,23 @@ class KVCRPoolAttachment:
         registered with NIXL and mremap may move it.
         """
         offset = memmap.region_offset(self._file_descriptor, self._spec.mapping_bytes)
-        size = memmap.align(self._file_descriptor, size)  # the backing's page multiple
-        os.ftruncate(self._file_descriptor, offset + size)
+        if not self._fixed_size:
+            size = memmap.align(self._file_descriptor, size)  # a whole page multiple
+            os.ftruncate(self._file_descriptor, offset + size)
         try:
-            _populate_pages(self._file_descriptor, offset, size)
+            if self._fixed_size:
+                if size > self.snapshot_budget_bytes:
+                    raise OSError(errno.ENOSPC, "snapshot exceeds the meta region")
+            else:
+                _populate_pages(self._file_descriptor, offset, size)
             # Mapping must close before the truncate; shrinking under it would fault.
             with memmap.map_range(self._file_descriptor, size, offset) as region:
                 yield region
         except BaseException:
-            # Truncate back: a partial or stale tail still reads as a region; a
+            # Retired: a partial or stale tail still reads as a region; a
             # claimant replaying it would diverge from the failed Guard's mirror.
             with contextlib.suppress(OSError):
-                os.ftruncate(self._file_descriptor, offset)
+                self.release_snapshot_region()
             raise
 
     @contextlib.contextmanager
@@ -189,19 +254,22 @@ class KVCRPoolAttachment:
         with memmap.map_range(
             self._file_descriptor, size, offset, writable=False
         ) as region:
-            yield region
+            # A fixed-size tail is always there; a retired one reads as zeros.
+            retired = self._fixed_size and not any(region[:_RETIRED_BYTES])
+            yield None if retired else region
 
     def release_snapshot_region(self) -> None:
         """Give the region back once its records have been installed.
 
         Truncated, which both retires it and returns its pages. Safe because both
         readers map it inside a context manager and a pool grants itself to one
-        claimant at a time.
+        claimant at a time. A meta memfd is zeroed at its head instead, keeping pages.
         """
-        os.ftruncate(
-            self._file_descriptor,
-            memmap.region_offset(self._file_descriptor, self._spec.mapping_bytes),
-        )
+        offset = memmap.region_offset(self._file_descriptor, self._spec.mapping_bytes)
+        if self._fixed_size:
+            os.pwrite(self._file_descriptor, bytes(_RETIRED_BYTES), offset)
+        else:
+            os.ftruncate(self._file_descriptor, offset)
 
     def close(self) -> None:
         """Unmap the pool without unlinking the server-owned file."""
@@ -241,8 +309,12 @@ class _KVCRPoolOwner:
         pool_size_bytes: int,
         journal_bytes: int,
         pool_dir: str | os.PathLike[str],
+        populate: bool = True,
     ) -> "_KVCRPoolOwner":
         """Create the file and reserve its data space.
+
+        ``populate=False`` leaves it sparse: a v2 service's pool_{rank} carries no
+        journal or data, so the supervisor cgroup is charged for none of it.
 
         Created and locked under the directory guard, which a purge takes
         exclusively, so a pool under construction cannot be reclaimed.
@@ -252,7 +324,7 @@ class _KVCRPoolOwner:
             pool_dir,
             pool_size_bytes,
             lambda directory, backing: cls._create(
-                pool_id, pool_size_bytes, journal_bytes, directory, backing
+                pool_id, pool_size_bytes, journal_bytes, directory, backing, populate
             ),
         )
 
@@ -264,6 +336,7 @@ class _KVCRPoolOwner:
         journal_bytes: int,
         directory: Path,
         backing_bytes: int,
+        populate: bool = True,
     ) -> "_KVCRPoolOwner":
         generation = uuid.uuid4().hex
         path = directory / _pool_filename(pool_id, generation)
@@ -293,7 +366,8 @@ class _KVCRPoolOwner:
         try:
             os.fchmod(file_descriptor, _POOL_MODE)
             os.ftruncate(file_descriptor, backing_bytes)
-            _populate_pages(file_descriptor, 0, backing_bytes)
+            if populate:
+                _populate_pages(file_descriptor, 0, backing_bytes)
             memmap.map_range(file_descriptor, backing_bytes).close()  # refuse early
         except BaseException:
             os.close(file_descriptor)

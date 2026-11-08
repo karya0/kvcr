@@ -172,3 +172,21 @@ def test_failed_split_grow_leaves_the_layout_untouched(pool, monkeypatch):
     monkeypatch.undo()
     assert (pool.regions, pool.layout_generation, pool.next_index) == layout
     assert pool.grow(PAGE)[0].index == layout[2]
+
+
+def test_meta_memfd_is_the_pools_second_fd_and_survives_grow_and_shrink():
+    with RegionPool.create(8 * PAGE, meta_bytes=4 * PAGE) as pool:
+        assert pool.pass_fd_list() == [pool.fd, pool.meta_fd]
+        assert os.fstat(pool.meta_fd).st_size == 4 * PAGE
+        assert os.fstat(pool.meta_fd).st_mode & 0o777 == 0o600
+        os.pwrite(pool.meta_fd, b"journal", 0)
+        low, high = pool.grow(2 * PAGE, split=2)
+        pool.mark_quiescent(high.index)
+        pool.shrink([high.index])
+        assert os.pread(pool.meta_fd, 7, 0) == b"journal"
+        fds = (pool.fd, pool.meta_fd)
+    for fd in fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    with RegionPool.create(PAGE) as bare:  # no meta: only the region memfd
+        assert bare.meta_fd == -1 and bare.pass_fd_list() == [bare.fd]

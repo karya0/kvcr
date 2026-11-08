@@ -354,13 +354,13 @@ def _claim_fd_counts(
 def _response_fd_counts(response: "_Granted | _GrantedV2 | _Error | _ErrorV2"):
     """An error carries none; a grant the pool, then the control listener.
 
-    A v2 grant appends one region memfd per distinct fd_index.
+    A v2 grant appends one region memfd per distinct fd_index, then the meta memfd.
     """
     if isinstance(response, _ERRORS):
         return (0,)
     if isinstance(response, _Granted):
         return (2,)
-    return (2 + len({region.fd_index or 0 for region in response.regions} or {0}),)
+    return (3 + len({region.fd_index or 0 for region in response.regions} or {0}),)
 
 
 _CLAIM_DECODER = msgspec.msgpack.Decoder(
@@ -652,6 +652,7 @@ class KVCRClient:
         data_map: RegionMapping | None = None
         listener_fd: int | None = None
         pool_fd: int | None = None
+        meta_fd: int | None = None
         region_fds: list[int] = []
         grant_received = False
         try:
@@ -674,18 +675,31 @@ class KVCRClient:
                 for region_fd in region_fds:
                     os.close(region_fd)
                 region_fds = []
+            else:
+                meta_fd = region_fds.pop()  # the journal and snapshot memfd, last
             grant_received = True
             spec, granted_pools = _grant_layout(
                 response, guard_index, request.tier_config
             )
             fd, pool_fd = pool_fd, None
-            attachment = KVCRPoolAttachment.attach_fd(fd, spec)
-            dram_pools = [
-                (pool.name, attachment.address + pool.offset_bytes, pool.size_bytes)
-                for pool in granted_pools
-            ]
-            if v2:
-                # The data pool is the granted regions; pool_fd keeps the journal.
+            if meta_fd is None:
+                attachment = KVCRPoolAttachment.attach_fd(fd, spec)
+            else:
+                os.close(fd)  # v2 journals in the meta memfd, not pool_{rank}
+                fd, meta_fd = meta_fd, None
+                try:
+                    attachment = KVCRPoolAttachment.attach_meta_fd(fd, spec)
+                except (OSError, ValueError) as error:
+                    raise KVCRServiceReasonError(
+                        f"v2 meta region refused: {error}", DATA_POOL_LAYOUT
+                    ) from error
+            if not v2:
+                dram_pools = [
+                    (pool.name, attachment.address + pool.offset_bytes, pool.size_bytes)
+                    for pool in granted_pools
+                ]
+            else:
+                # The data pool is the regions; the meta memfd keeps the journal.
                 data_map = _map_data_pool(response, gaas, region_fds)
                 attachment.set_layout_digest(
                     region_table_digest(
@@ -715,7 +729,7 @@ class KVCRClient:
         except BaseException as error:
             # Release the lease only after local access has stopped, or the
             # next claimant could map bytes this process can still reach.
-            for leftover in (listener_fd, pool_fd, *region_fds):
+            for leftover in (listener_fd, pool_fd, meta_fd, *region_fds):
                 if leftover is not None:
                     with contextlib.suppress(OSError):
                         os.close(leftover)
