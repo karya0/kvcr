@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -45,6 +46,7 @@ from kvcr.service.protocol import (
     DATA_POOL_LAYOUT,
     KVCRServiceReasonError,
     PoolRegion,
+    _map_data_pool,
     region_table_digest,
 )
 from kvcr.service.recovery_journal import (
@@ -619,3 +621,35 @@ def test_meta_fd_identity_is_fixed_at_claim_and_fails_closed():
     finally:
         os.close(first)
         os.close(second)
+
+
+def test_data_pool_refuses_a_total_that_is_not_whole_blocks():
+    # GaaS S4 r6: 50 GiB claimed, vLLM chunk 49 MiB (16 attention-sized pages of
+    # 784 tokens), so the engine region is 1044 chunks and 44 MiB is left over.
+    block = 49 << 20
+    total = 50 << 30
+    aligned = total // block * block
+    assert (aligned, total - aligned) == (51156 << 20, 44 << 20)
+
+    def grant(size):
+        return SimpleNamespace(
+            pools=(SimpleNamespace(block_size_bytes=block),),
+            regions=(PoolRegion(0, 0, size, 0),),
+        )
+
+    with pytest.raises(KVCRServiceReasonError, match="whole number") as refused:
+        _map_data_pool(grant(total), GaaSSettings("t", "l", total, total, total), [])
+    assert refused.value.reason == DATA_POOL_LAYOUT
+
+    fd = os.memfd_create("data-pool-aligned")  # sparse: nothing is touched
+    try:
+        os.ftruncate(fd, aligned)
+        mapping = _map_data_pool(
+            grant(aligned), GaaSSettings("t", "l", aligned, aligned, aligned), [fd]
+        )
+        try:
+            assert mapping.size_bytes == aligned
+        finally:
+            mapping.close()
+    finally:
+        os.close(fd)
