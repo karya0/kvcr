@@ -1420,6 +1420,18 @@ def test_dgd_retained_rebind_fail_closed(tmp_path, pools, caplog, deleting):
     assert raised.value.reason == SLOT_STALE
 
 
+def test_dgd_rebind_again_after_successor_deleted(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path)
+    dgd.put("l", "X")
+    slot = _lineage_claim(table)
+    for episode, uid in enumerate(["Y", "Z"]):
+        del dgd.crs["l"]
+        table.poll_dgds()
+        dgd.put("l", uid)
+        assert _lineage_claim(table, claim_id=f"successor-{episode}") is slot
+        assert table._lineages["t/l"]["dgd_uid"] == uid
+
+
 def test_dgd_pressure_reclaims_expired_first_and_stands_down(
     tmp_path, pools, monkeypatch
 ):

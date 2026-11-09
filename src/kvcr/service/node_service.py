@@ -1450,6 +1450,8 @@ class SlotTable:
                         if deletion
                         else self._wall_clock()
                     )
+                    # The bound CR is gone: the next successor may rebind once.
+                    rec["rebound"] = False
                     logger.info(
                         "lineage retained lineage=%s slots=%s",
                         key,
