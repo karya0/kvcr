@@ -2,17 +2,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Cold recovery and promotion use the index, independently of G2 frames."""
 
+import ctypes
+import mmap
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from _kvcr_test_utils import _recovered_record
+from _kvcr_test_utils import (
+    FakeNixlAgent,
+    FakePrimaryPinning,
+    _mem_descriptor,
+    _new_kvcr,
+    _poll_until,
+    _recovered_record,
+)
 
+from kvcr.config import KVCRConfig, LocalDramOptions
 from kvcr.service import recovery_journal as recovery
 from kvcr.service.g2_index import G2Index
 from kvcr.service.guard import _RecoveryState
+from kvcr.service.memory import SOFT_KEY_MAX, index_slots
 from kvcr.service.protocol import _PoolDescriptor
-from kvcr.types import BlockKey
+from kvcr.types import BlockKey, RegionDescriptor
 
 
 def _index():
@@ -135,3 +146,50 @@ def test_g2_journal_depends_on_index_presence(monkeypatch, indexed):
     assert (
         list(recovery._recovery_frames({BlockKey(b"key"): record}, g3_only=True)) == []
     )
+
+
+@pytest.mark.parametrize("key_bytes", [105, 233, 1024])
+def test_empty_label_production_geometry_deposit_rebuild_parity(key_bytes):
+    pool_bytes, data_slots = 53_640_953_856, 1044
+    block_bytes = pool_bytes // data_slots
+    # Sparse CPU backing retains production data/index geometry, not GPU transport.
+    with mmap.mmap(-1, pool_bytes) as backing:
+        address = ctypes.addressof(ctypes.c_char.from_buffer(backing))
+        source = ctypes.create_string_buffer(block_bytes)
+        agent = FakeNixlAgent()
+        agent.state = "DONE"
+        kvcr = _new_kvcr(
+            agent,
+            FakePrimaryPinning(),
+            None,
+            KVCRConfig(nixl_agent_name="target", pool_layouts=[("", block_bytes)]),
+            local_dram=LocalDramOptions([("", address, pool_bytes)]),
+            framework_regions=[
+                RegionDescriptor(addr=ctypes.addressof(source), size=block_bytes)
+            ],
+        )
+        try:
+            slots = index_slots(pool_bytes)
+            data = bytearray(64 + slots * (64 + SOFT_KEY_MAX))
+            G2Index.initialize(data, slots, SOFT_KEY_MAX)
+            index = G2Index(data)
+            pools = kvcr._core._local_dram._pools
+            pools._recovery_indexes = {"": index}
+            pools.observe_residency(pools.publish_recovery)
+            # vLLM make_offload_key: opaque hash bytes + four-byte big-endian group.
+            block_hash = (bytes(range(256)) * 4)[: key_bytes - 4]
+            key = BlockKey(block_hash + (7).to_bytes(4, "big"))
+            op = kvcr.deposit({key: [_mem_descriptor()]})
+            assert dict(_poll_until(kvcr, bool, timeout=5))[op][key].success
+            before = _projection(kvcr._core._block_record_map)
+            cold = G2Index(bytearray(data))
+            pool = Mock(g2_index=Mock(return_value=cold))
+            mirror = recovery._RecoveryMirror(("",))
+            recovery.rebuild_g2_mirror(pool, ("",), mirror, promotion=True)
+            records = mirror.take_records()
+            assert _projection(records) == before
+            assert list(records) == [key]
+            assert bytes(next(iter(records)))[:-4] == block_hash
+            assert int.from_bytes(next(iter(records))[-4:], "big") == 7
+        finally:
+            kvcr.close()
