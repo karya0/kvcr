@@ -894,3 +894,85 @@ def test_holder_report_must_cover_the_meta_memfd(tmp_path, pools):
         thread.join(10)
         supervisor_end.close()
         holder_end.close()
+
+
+def test_restored_slot_adopts_the_holders_handback(tmp_path, pools, monkeypatch):
+    table, _ = _table(tmp_path)
+    slot = _claim(table)
+    os.pwrite(slot.pool.fd, b"S", 0)
+    restarted = SlotTable(
+        table.broker, HEADROOM + 64 * PAGE, require_pod_identity=False
+    )
+    again = restarted.get("t/l/0")
+    fresh = again.pool.pass_fd_list()
+    sup, peer = socket.socketpair()
+    again.holder_conn = sup
+    held = {
+        "layout": {
+            "regions": [
+                {"index": r.index, "offset": r.offset, "size": r.size, "fd_index": 0}
+                for r in slot.pool.regions
+            ],
+            "layout_generation": slot.pool.layout_generation,
+            "meta": {"fd_index": 1, "size": table.meta_bytes},
+        },
+        "fds": slot.pool.pass_fd_list(),
+    }
+
+    def no_create(*args, **kwargs):
+        raise AssertionError("adoption must not create memfds")
+
+    monkeypatch.setattr(os, "memfd_create", no_create)
+    try:
+        holder.hello(peer, held)
+        restarted._adopt_handback(again)
+        for adopted, original in zip(again.pool.pass_fd_list(), held["fds"]):
+            assert os.fstat(adopted)[:3] == os.fstat(original)[:3]
+            assert not os.get_inheritable(adopted)
+        for fd in fresh:
+            with pytest.raises(OSError) as error:
+                os.fstat(fd)
+            assert error.value.errno == errno.EBADF
+        assert os.pread(again.pool.fd, 1, 0) == b"S"
+
+        def report():
+            layout, fds = holder.receive_line_with_fds(peer)
+            for fd in fds:
+                os.close(fd)
+            peer.sendall(
+                json.dumps(
+                    {
+                        "touched_bytes": 4 * PAGE,
+                        "layout_generation": layout["layout_generation"],
+                        "meta_bytes": layout["meta"]["size"],
+                    }
+                ).encode()
+                + b"\n"
+            )
+
+        thread = threading.Thread(target=report)
+        thread.start()
+        restarted._send_layout(again)
+        thread.join(10)
+        assert not thread.is_alive()
+        assert again.touched_bytes == 4 * PAGE
+        identities = [os.fstat(fd)[:3] for fd in again.pool.pass_fd_list()]
+        bad = {**held, "layout": {**held["layout"], "layout_generation": 999}}
+        real_close = os.close
+        closed = []
+
+        def close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        monkeypatch.setattr(os, "close", close)
+        holder.hello(peer, bad)
+        restarted._adopt_handback(again)
+        assert len(closed) == 2
+        for fd in closed:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+        assert [os.fstat(fd)[:3] for fd in again.pool.pass_fd_list()] == identities
+    finally:
+        sup.close()
+        peer.close()

@@ -64,7 +64,9 @@ def _touch(view: mmap.mmap, size: int, index: int = 0) -> None:
     )
 
 
-def _receive(connection: socket.socket) -> tuple[dict[str, Any], list[int]] | None:
+def receive_line_with_fds(
+    connection: socket.socket,
+) -> tuple[dict[str, Any], list[int]] | None:
     """One JSON line and its fds; None on EOF."""
     data = b""
     fds = array.array("i")
@@ -96,6 +98,7 @@ def handle_layout(
     connection: socket.socket,
     mappings: dict[int, tuple[mmap.mmap, int]],
     reset: bool = False,
+    held: dict[str, Any] | None = None,
 ) -> bool:
     """Receive one layout, map and touch new regions, report. False on EOF.
 
@@ -103,14 +106,40 @@ def handle_layout(
     and is kept by the caller so the pages stay resident; regions absent from the
     layout are unmapped. With ``reset`` (the first layout after a reconnect) every
     old mapping is dropped first: a restarted supervisor feeds a new memfd, so old
-    mappings are stale.
+    mappings are stale. With ``held``, fd identity decides which mappings survive.
     """
-    received = _receive(connection)
+    received = receive_line_with_fds(connection)
     if received is None:
         return False
     layout, fds = received
     try:
-        if reset:
+        if held is not None:
+            previous = held.get("layout") or {"regions": []}
+            old_regions = {r["index"]: r for r in previous["regions"]}
+            if previous.get("meta"):
+                old_regions[_META] = {"offset": 0, **previous["meta"]}
+            new_regions = {r["index"]: r for r in layout["regions"]}
+            if layout.get("meta"):
+                new_regions[_META] = {"offset": 0, **layout["meta"]}
+            old_fds = held.get("fds", [])
+            for index in list(mappings):
+                old, new = old_regions[index], new_regions.get(index)
+                if (
+                    new != old
+                    or os.fstat(old_fds[old.get("fd_index") or 0])[:2]
+                    != os.fstat(fds[new.get("fd_index") or 0])[:2]
+                ):
+                    mappings.pop(index)[0].close()
+            for i, fd in enumerate(fds):
+                if i < len(old_fds) and os.fstat(fd)[:2] == os.fstat(old_fds[i])[:2]:
+                    os.close(fd)
+                    fds[i] = old_fds[i]
+                elif i < len(old_fds):
+                    os.close(old_fds[i])
+            for fd in old_fds[len(fds) :]:
+                os.close(fd)
+            held.update(layout=layout, fds=fds)
+        elif reset:
             for view, _size in mappings.values():
                 view.close()
             mappings.clear()
@@ -133,8 +162,9 @@ def handle_layout(
             mappings[index] = (view, region["size"])
             _touch(view, region["size"], index)
     finally:
-        for fd in fds:
-            os.close(fd)
+        if held is None:
+            for fd in fds:
+                os.close(fd)
     report = {
         "touched_bytes": sum(
             size for index, (_view, size) in mappings.items() if index != _META
@@ -185,27 +215,47 @@ def serve(
     mappings: dict[int, tuple[mmap.mmap, int]],
 ) -> None:
     """Hold the mappings; on EOF reconnect with backoff rather than sleeping forever."""
+    held: dict[str, Any] = {"layout": None, "fds": []}
+    connection = None
     try:
-        connection = connect(path, connect_timeout_s, stop)
-    except InterruptedError:
-        return
-    _log("connected", socket=path)
-    reset = False
-    while not stop.is_set():
-        if select.select([connection], [], [], 1.0)[0]:
-            try:
-                alive = handle_layout(connection, mappings, reset)
-            except OSError:
-                alive = False
-            if alive:
-                reset = False
-                continue
+        try:
+            connection = connect(path, connect_timeout_s, stop)
+        except InterruptedError:
+            return
+        _log("connected", socket=path)
+        hello(connection, held)
+        while not stop.is_set():
+            if select.select([connection], [], [], 1.0)[0]:
+                try:
+                    alive = handle_layout(connection, mappings, held=held)
+                except OSError:
+                    alive = False
+                if alive:
+                    continue
+                connection.close()
+                try:
+                    connection = connect(path, 0, stop)
+                except InterruptedError:
+                    return
+                hello(connection, held)
+    finally:
+        if connection is not None:
             connection.close()
-            try:
-                connection = connect(path, 0, stop)
-            except InterruptedError:
-                return
-            reset = True
+        for fd in held["fds"]:
+            os.close(fd)
+
+
+def hello(connection: socket.socket, held: dict[str, Any] | None) -> None:
+    """Offer the retained layout and fds before every supervisor feed."""
+    socket.send_fds(
+        connection,
+        [json.dumps({"handback": held["layout"] if held else None}).encode() + b"\n"],
+        held["fds"] if held else [],
+    )
+
+
+# Retain the private name used by existing receiver tests.
+_receive = receive_line_with_fds
 
 
 def main() -> None:

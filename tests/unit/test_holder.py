@@ -4,6 +4,7 @@
 
 import copy
 import json
+import mmap
 import os
 import socket
 import sys
@@ -148,47 +149,97 @@ def test_response_fd_counts():
     assert _response_fd_counts(_ErrorV2("x", 2)) == (0,)
 
 
-def test_holder_reconnects_after_eof_and_remaps(tmp_path):
+def test_holder_reconnects_after_eof_hands_back_and_keeps_pages(tmp_path, capsys):
     path = str(tmp_path / "h.sock")
     stop = threading.Event()
     mappings = {}
     thread = threading.Thread(
         target=holder.serve, args=(path, 10, stop, mappings), daemon=True
     )
+    data, meta = os.memfd_create("data"), os.memfd_create("meta")
+    os.ftruncate(data, PAGE)
+    os.ftruncate(meta, 3 * PAGE)
+    identities = [os.fstat(fd)[:3] for fd in (data, meta)]
+    region = {"index": 0, "offset": 0, "size": PAGE, "fd_index": 0}
+    meta_layout = {"fd_index": 1, "size": 3 * PAGE}
+    conn = None
+    returned = []
 
-    def feed(listener, size):
-        conn, _ = listener.accept()
-        fd = os.memfd_create("x")
-        os.ftruncate(fd, size)
-        layout = {
-            "regions": [{"index": 0, "offset": 0, "size": size, "fd_index": 0}],
-            "layout_generation": 1,
-        }
-        socket.send_fds(conn, [json.dumps(layout).encode() + b"\n"], [fd])
-        os.close(fd)
-        return conn, _read_report(conn)
+    def populate_count():
+        return sum(
+            json.loads(x).get("holder") == "populate_start"
+            for x in capsys.readouterr().err.splitlines()
+        )
 
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-        listener.bind(path)
-        listener.listen(1)
-        listener.settimeout(10)
-        thread.start()
-        conn, report = feed(listener, PAGE)
-        assert report["touched_bytes"] == PAGE
-        conn.close()  # the supervisor goes away
-        listener.close()
-        os.unlink(path)  # holder now retries with backoff, not sleeping forever
-        time.sleep(0.5)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as second:
-            second.bind(path)
-            second.listen(1)
-            second.settimeout(10)
-            conn, report = feed(second, 2 * PAGE)
-            # Remapped from the new memfd, not left on the stale mapping.
-            assert report["touched_bytes"] == 2 * PAGE
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(path)
+            listener.listen(1)
+            listener.settimeout(10)
+            thread.start()
+            conn, _ = listener.accept()
+            conn.settimeout(10)
+            assert holder.receive_line_with_fds(conn) == ({"handback": None}, [])
+            _send_layout(conn, [region], 1, [data, meta], meta_layout)
+            assert _read_report(conn)["touched_bytes"] == PAGE
+            # Threads share a process fd table, but SCM_RIGHTS duplicates fds.
+            # Close every supervisor reference before receiving any handback.
+            with mmap.mmap(data, PAGE) as view:
+                view[PAGE // 2 : PAGE // 2 + 2] = b"H1"
+            os.close(data)
+            os.close(meta)
+            data = meta = -1
             conn.close()
-    stop.set()
-    thread.join(10)
+            listener.close()
+            os.unlink(path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as second:
+                second.bind(path)
+                second.listen(1)
+                second.settimeout(10)
+                conn, _ = second.accept()
+                conn.settimeout(10)
+                hello, returned = holder.receive_line_with_fds(conn)
+                assert [os.fstat(fd)[:3] for fd in returned] == identities
+                assert os.pread(returned[0], 2, PAGE // 2) == b"H1"
+                populate_count()
+                _send_layout(conn, [region], 1, returned, meta_layout)
+                assert _read_report(conn) == {
+                    "touched_bytes": PAGE,
+                    "meta_bytes": 3 * PAGE,
+                    "layout_generation": 1,
+                }
+                assert populate_count() == 0
+                os.ftruncate(returned[0], 2 * PAGE)
+                grown = {"index": 1, "offset": PAGE, "size": PAGE, "fd_index": 0}
+                _send_layout(conn, [region, grown], 2, returned, meta_layout)
+                assert _read_report(conn)["touched_bytes"] == 2 * PAGE
+                assert populate_count() == 1
+                conn.close()
+                conn, _ = second.accept()
+                conn.settimeout(10)
+                _, duplicates = holder.receive_line_with_fds(conn)
+                for fd in duplicates:
+                    os.close(fd)
+                fresh = os.memfd_create("fresh")
+                try:
+                    os.ftruncate(fresh, 2 * PAGE)
+                    _send_layout(
+                        conn, [region, grown], 2, [fresh, returned[1]], meta_layout
+                    )
+                    assert _read_report(conn)["touched_bytes"] == 2 * PAGE
+                    assert populate_count() == 2
+                finally:
+                    os.close(fresh)
+    finally:
+        stop.set()
+        if conn is not None:
+            conn.close()
+        thread.join(10)
+        for fd in [data, meta, *returned]:
+            if fd >= 0:
+                os.close(fd)
+        for view, _ in mappings.values():
+            view.close()
     assert not thread.is_alive()
 
 
@@ -257,6 +308,7 @@ def test_slot_claim_feeds_toucher(tmp_path):
             time.sleep(0.01)
         args = api.creates[0]["spec"]["containers"][0]["args"]
         conn = holder.connect(args[1], 10)
+        holder.hello(conn, None)
         mappings = {}
         holder.handle_layout(conn, mappings)
         reports.append(sum(size for i, (_v, size) in mappings.items() if i >= 0))
@@ -298,6 +350,7 @@ def test_slow_holder_wait_is_size_aware(tmp_path, monkeypatch):
             time.sleep(0.01)
         args = api.creates[0]["spec"]["containers"][0]["args"]
         conn = holder.connect(args[1], 10)
+        holder.hello(conn, None)
         done.wait(10)  # takes the layout but never reports
         conn.close()
 
