@@ -130,7 +130,6 @@ class G2Index:
                 or pad
                 or pad2
                 or not 1 <= key_len <= 65529
-                or not label_len
                 or not n_parts
                 or part_idx >= n_parts
                 or end > self.arena_start + self.arena_bytes
@@ -165,7 +164,7 @@ class G2Index:
         for label, slot in parts:
             label = label.encode()
             self.validate_slots(slot + 1)
-            if not 1 <= len(label) <= 65535 or slot in staged:
+            if len(label) > 65535 or slot in staged:
                 return None
             data = bytes(key) + label
             size = (len(data) + 15) // 16 * 16
