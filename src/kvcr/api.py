@@ -149,10 +149,12 @@ class KVCR:
         request_id: str | None = None,
     ) -> None:
         """Submit a msgspec envelope conforming to the hint protocol."""
+        self._check_pool_lease()
         self._core.submit_hint(hints, request_id)
 
     def discard_hint(self, request_id: str) -> None:
         """Discard request-scoped router hints."""
+        self._check_pool_lease()
         self._core.discard_hint(request_id)
 
     def query(
@@ -161,12 +163,14 @@ class KVCR:
         request_id: str | None = None,
     ) -> list[tuple[QueryStatus, CacheTier | None]]:
         """Return the best currently known status and tier for each key."""
+        self._check_pool_lease()
         return self._core.query(keys, request_id)
 
     def align_sequence(
         self, ordered_keys: list[BlockKey], use_current_time: bool = False
     ) -> None:
         """Record sequence positions and align recency for ready managed keys."""
+        self._check_pool_lease()
         self._core.align_sequence(ordered_keys, use_current_time)
 
     def deliver(
@@ -175,6 +179,7 @@ class KVCR:
         request_id: str | None = None,
     ) -> OpHandle:
         """Asynchronously deliver whole blocks or named parts to caller destinations."""
+        self._check_pool_lease()
         return self._core.deliver(blocks, request_id)
 
     def deposit(
@@ -186,6 +191,7 @@ class KVCR:
         expected_layout: list[str] | None = None,
     ) -> OpHandle:
         """Asynchronously copy blocks into KVCR-managed storage."""
+        self._check_pool_lease()
         return self._core.deposit(
             blocks, no_evict, hints, expected_layout=expected_layout
         )
@@ -198,6 +204,7 @@ class KVCR:
         hints: object | None = None,
     ) -> OpHandle:
         """Asynchronously fetch blocks into KVCR-managed storage."""
+        self._check_pool_lease()
         return self._core.fetch(keys, request_id, expected_layout, hints)
 
     def release(
@@ -205,10 +212,12 @@ class KVCR:
         handles: Collection[ReleaseHandle],
     ) -> list[ReleaseResult]:
         """Release block residency claims."""
+        self._check_pool_lease()
         return self._core.release(handles)
 
     def poll_completed(self) -> Iterable[OpResult]:
         """Drain completed operation results."""
+        self._check_pool_lease()
         return self._core.poll_completed()
 
     def abort(
@@ -217,10 +226,12 @@ class KVCR:
         keys: Collection[BlockKey] | None = None,
     ) -> bool:
         """Best-effort abort an operation or selected entries."""
+        self._check_pool_lease()
         return self._core.abort(op_handle, keys)
 
     def get_stats(self) -> TelemetryStats | None:
         """Return telemetry state when telemetry is enabled."""
+        self._check_pool_lease()
         return self._core.get_stats()
 
     def observe_metadata(
@@ -270,6 +281,10 @@ class KVCR:
                 logger.exception("Failed to release the KVCR pool after close")
             raise
         self._release_pool_hold()
+
+    def _check_pool_lease(self) -> None:
+        if self._pool_hold is not None:
+            self._pool_hold.check_lease()
 
     def _release_pool_hold(self) -> None:
         pool_hold = self._pool_hold

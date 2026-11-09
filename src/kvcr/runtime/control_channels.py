@@ -226,6 +226,12 @@ class ZmqPeerControlChannel:
     def control_bind_address(self) -> tuple[str, int]:
         return self._bind_host, self._bind_port
 
+    def duplicate_listener(self) -> int:
+        """Duplicate the retained listener for supervisor reconnection."""
+        if self._listener is None:
+            raise RuntimeError("KVCR control listener is unavailable")
+        return os.dup(self._listener.fileno())
+
     def adopt_listener(self, listener_fd: int) -> None:
         """Take over a listener bound elsewhere instead of binding one.
 

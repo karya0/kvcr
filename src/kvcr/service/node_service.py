@@ -915,6 +915,8 @@ class NodeBroker:
 
 def same_peer(a: Any, b: Any) -> bool:
     """Same pod when both know their pod UID, else the same (pid, uid)."""
+    if a is None or b is None:
+        return False
     if len(a) > 2 and len(b) > 2 and a[2] and b[2]:
         return a[2] == b[2]
     return tuple(a[:2]) == tuple(b[:2])
@@ -977,6 +979,10 @@ class _Slot:
     peer: Any = None
     owner_alive: Callable[[], bool] | None = None
     claim_id: str | None = None
+    peer_uid: str | None = None
+    quarantined: bool = False
+    generation_ready: bool = False
+    reconnecting: bool = False
     restored_pool: bool = False
     holder_conn: socket.socket | None = None
     touched_bytes: int = 0
@@ -992,7 +998,7 @@ class _Slot:
 
     @property
     def held(self) -> bool:
-        return self.owner_alive is not None and self.owner_alive()
+        return self.quarantined or (self.owner_alive is not None and self.owner_alive())
 
 
 class SlotTable:
@@ -1023,6 +1029,7 @@ class SlotTable:
         state_path: Path | None = None,
         meta_bytes: int | None = None,
         journal_bytes: int = _JOURNAL_BYTES,
+        lease_ttl_ms: int = 10000,
     ):
         # None: sized from the service's configured journal (bind_journal_bytes).
         self._meta_explicit = meta_bytes is not None
@@ -1035,6 +1042,11 @@ class SlotTable:
         self.local_requests, self.headroom_bytes = local_requests, headroom_bytes
         self.ensure_timeout_s = ensure_timeout_s
         self.require_pod_identity = require_pod_identity
+        if lease_ttl_ms < 1000:
+            raise ValueError("worker lease TTL must be at least 1000 ms")
+        self.lease_ttl_ms = lease_ttl_ms
+        self._quarantine_start: float | None = None
+        self.dead_incarnations: set[str] = set()
         self._clock = clock
         self._slots: dict[str, _Slot] = {}
         self._waiters: dict[str, list[_Waiter]] = {}
@@ -1091,6 +1103,7 @@ class SlotTable:
         _atomic_json(
             Path(self._state_path),
             {
+                "lease_ttl_ms": self.lease_ttl_ms,
                 "epochs": self._epochs,
                 "generations": self._generations,
                 "slots": {
@@ -1100,6 +1113,8 @@ class SlotTable:
                         "holder": slot.holder,
                         "incarnation": slot.incarnation,
                         "claim_generation": slot.claim_generation,
+                        "claim_id": self._persistent_claim_id(slot.claim_id),
+                        "peer_uid": slot.peer_uid,
                         "next_index": layout[1],
                         "layout_generation": layout[2],
                         "regions": [
@@ -1128,6 +1143,7 @@ class SlotTable:
         if not self._state_path or not Path(self._state_path).exists():
             return
         data = _read_json(Path(self._state_path))
+        self.lease_ttl_ms = max(self.lease_ttl_ms, data.get("lease_ttl_ms", 0))
         self._epochs = {k: int(v) for k, v in data.get("epochs", {}).items()}
         self._generations = {k: int(v) for k, v in data.get("generations", {}).items()}
         for name, rec in data.get("slots", {}).items():
@@ -1155,8 +1171,54 @@ class SlotTable:
                 restored_pool=True,
                 incarnation=rec["incarnation"],
                 claim_generation=rec["claim_generation"],
+                claim_id=self._persistent_claim_id(rec.get("claim_id")),
+                peer_uid=rec.get("peer_uid"),
+                quarantined=self._persistent_claim_id(rec.get("claim_id")) is not None,
             )
             self._slots[name].committed = self._layout(self._slots[name])
+
+    @staticmethod
+    def _persistent_claim_id(claim_id: str | None) -> str | None:
+        if claim_id is not None:
+            try:
+                uuid.UUID(claim_id)
+            except (ValueError, AttributeError):
+                pass
+            else:
+                return claim_id
+        return None
+
+    def start_quarantine(self) -> None:
+        """Start G at first accept, after startup allocation and bind."""
+        with self._lock:
+            if self._quarantine_start is None:
+                self._quarantine_start = self._clock()
+
+    def _expire_quarantine(self, slot: _Slot) -> None:
+        if not slot.quarantined:
+            return
+        expired = (
+            self._quarantine_start is not None
+            and self._clock() - self._quarantine_start >= self.lease_ttl_ms / 1000
+        )
+        gone = False
+        if not expired and slot.peer_uid:
+            try:
+                gone = self.broker.api.get_by_uid(slot.peer_uid) is None
+            except PodAPIError as error:
+                from .protocol import INTERNAL
+
+                raise SlotError(INTERNAL, f"pod lookup failed: {error}") from error
+        if expired or gone:
+            if slot.claim_id:
+                self.dead_incarnations.add(slot.claim_id)
+            slot.claim_generation += 1
+            self._generations[slot.name] = slot.claim_generation
+            slot.claim_id = slot.peer_uid = None
+            slot.peer = slot.owner_alive = None
+            slot.quarantined = False
+            slot.generation_ready = True
+            self._persist()
 
     # -- admission ---------------------------------------------------------
 
@@ -1252,6 +1314,7 @@ class SlotTable:
         namespace: str | None = None,
         waiter_fd: Callable[[], int | None] | None = None,
         waiter_alive: Callable[[], bool] | None = None,
+        claim_generation: int | None = None,
     ) -> _Slot:
         """Claim a slot; returns it. See ``claim_with_generation``."""
         return self.claim_with_generation(
@@ -1268,6 +1331,7 @@ class SlotTable:
             namespace=namespace,
             waiter_fd=waiter_fd,
             waiter_alive=waiter_alive,
+            claim_generation=claim_generation,
         )[0]
 
     def claim_with_generation(
@@ -1286,6 +1350,7 @@ class SlotTable:
         namespace: str | None = None,
         waiter_fd: Callable[[], int | None] | None = None,
         waiter_alive: Callable[[], bool] | None = None,
+        claim_generation: int | None = None,
     ) -> tuple[_Slot, int]:
         """Claim a slot; returns it and the generation this claim was assigned.
 
@@ -1297,6 +1362,7 @@ class SlotTable:
             INCOMPATIBLE_LINEAGE,
             INTERNAL,
             SLOT_HELD,
+            SLOT_STALE,
         )
         from .regions import CapacityError, RegionPool
 
@@ -1307,9 +1373,32 @@ class SlotTable:
         with self._lock:
             self._expire_waiters(name)
             slot = self._slots.get(name)
+            if slot is not None:
+                self._expire_quarantine(slot)
+            reconnect = False
+            if claim_generation is not None:
+                if (
+                    slot is None
+                    or claim_generation != slot.claim_generation
+                    or claim_id in self.dead_incarnations
+                ):
+                    raise SlotError(SLOT_STALE, f"stale claim for {name}")
+                peer_uid = peer[2] if peer is not None and len(peer) > 2 else None
+                reconnect = (
+                    slot.claim_id == claim_id
+                    and slot.peer_uid == peer_uid
+                    and (slot.quarantined or same_peer(slot.peer, peer))
+                )
+                if not reconnect and not slot.held:
+                    raise SlotError(SLOT_STALE, f"stale claim for {name}")
+                if reconnect and slot.digest != digest:
+                    raise SlotError(
+                        INCOMPATIBLE_LINEAGE, f"slot {name} lineage differs"
+                    )
             queue = self._waiters.setdefault(name, [])
-            if (slot is not None and slot.held) or (
-                queue and queue[0].claim_id != claim_id
+            if not reconnect and (
+                (slot is not None and slot.held)
+                or (queue and queue[0].claim_id != claim_id)
             ):
                 now = self._clock()
                 for waiter in queue:
@@ -1320,7 +1409,7 @@ class SlotTable:
                     fd = waiter_fd() if waiter_fd else _open_peer_pidfd(peer)
                     queue.append(_Waiter(claim_id, now, fd, waiter_alive))
                 raise SlotError(SLOT_HELD, f"slot {name} is held")
-            if queue:
+            if queue and not reconnect:
                 queue.pop(0).close()
             if slot is not None:
                 if slot.digest != digest:
@@ -1358,9 +1447,18 @@ class SlotTable:
                 slot.committed = self._layout(slot)
                 self._slots[name] = slot
                 created = True
-            generation = self._generations[name] = self._generations.get(name, 0) + 1
+            if reconnect or slot.generation_ready:
+                generation = slot.claim_generation
+            else:
+                generation = self._generations[name] = (
+                    self._generations.get(name, 0) + 1
+                )
             slot.claim_generation = generation
+            slot.generation_ready = False
+            slot.reconnecting = reconnect
+            slot.quarantined = False
             slot.peer, slot.owner_alive, slot.claim_id = peer, owner_alive, claim_id
+            slot.peer_uid = peer[2] if peer is not None and len(peer) > 2 else None
             self._persist()
         try:
             with slot.lock:
@@ -1369,6 +1467,8 @@ class SlotTable:
                     if self.broker.toucher:
                         self._feed_holder(slot)
                 else:
+                    if reconnect and self._holder_dead(slot):
+                        raise SlotError(SLOT_STALE, "reconnect holder is gone")
                     self._check_holder(slot)
         except BaseException as error:
             self._abort_claim(slot, created, generation)
@@ -1387,6 +1487,10 @@ class SlotTable:
             if not created:
                 if slot.claim_generation == generation:
                     slot.owner_alive = None
+                    if slot.reconnecting:
+                        slot.quarantined = True
+                        slot.peer = None
+                    self._persist()
                 return
             if self._slots.get(slot.name) is slot:
                 del self._slots[slot.name]
@@ -1421,8 +1525,15 @@ class SlotTable:
                     slot.claim_generation,
                 )
                 return
+            if slot.peer is None:
+                from .protocol import IDENTITY_MISMATCH
+
+                raise SlotError(IDENTITY_MISMATCH, f"slot {name} has no observed owner")
             if same_peer(slot.peer, peer):
-                slot.owner_alive = None
+                slot.owner_alive = slot.claim_id = slot.peer_uid = None
+                slot.reconnecting = False
+                slot.quarantined = False
+                self._persist()
 
     # -- holder upkeep (caller holds slot.lock) -----------------------------
 
