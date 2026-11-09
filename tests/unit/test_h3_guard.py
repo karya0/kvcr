@@ -4,6 +4,7 @@
 
 import os
 import socket
+import tempfile
 from unittest.mock import Mock
 
 import pytest
@@ -79,7 +80,13 @@ def test_q10_q14_reattach_seats_lease_prepares_core_and_promotes(monkeypatch, in
     monkeypatch.setattr(guard_module, "_KVCRCore", Mock(return_value=core))
     monkeypatch.setattr(guard_module, "_attach_g2_index", Mock())
     lease = Mock(incarnation="worker-1")
-    with socket.create_server(("127.0.0.1", 0)) as listener:
+    with (
+        tempfile.TemporaryFile() as meta,
+        socket.create_server(("127.0.0.1", 0)) as listener,
+    ):
+        meta.truncate(8192)
+        recovery.attachment._file_descriptor = meta.fileno()
+        recovery.attachment.snapshot_budget_bytes = 128
         bind = listener.getsockname()
         _, _, returned_fd, returned_lease = guard._reattach(
             lease,

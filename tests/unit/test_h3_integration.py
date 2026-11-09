@@ -91,7 +91,7 @@ fd, meta, listener, base, size, page = map(int, sys.argv[1:])
 os.pwrite(fd, b"R" * page, 0)
 region = mmap.mmap(meta, size, offset=base)
 index = G2Index(region)
-parts = [("", 0)]
+parts = [("pool", 0)]
 assert index.reserve(b"pre-restart", parts)
 list(index.store_steps(b"pre-restart", parts, 1))
 print("ready", flush=True)
@@ -116,12 +116,15 @@ time.sleep(120)
     returned_fd = None
     lease = None
     try:
-        assert child.stdout.readline().strip() == "ready"
+        marker = child.stdout.readline().strip()
+        assert marker == "ready", (
+            child.stderr.read() if child.poll() is not None else marker
+        )
         lease = PidfdLiveness(os.pidfd_open(child.pid))
         lease.incarnation = "a" * 32
         _, _, returned_fd, returned_lease = guard.reattach(
             lease,
-            _TierConfig([("", page)], None),
+            _TierConfig([("pool", page)], None),
             listener.getsockname(),
             (pool.address(pool.regions[0]), page, digest, slot_name, 1, pool.meta_fd),
             listener.fileno(),
@@ -141,7 +144,7 @@ time.sleep(120)
         target = KVCR(
             KVCRConfig(
                 nixl_agent_name="h3-target",
-                pool_layouts=[("", page)],
+                pool_layouts=[("pool", page)],
                 nixl_listen_port=0,
                 operation_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 1000,
                 abandon_timeout_ms=_REAL_NIXL_TIMEOUT_SECONDS * 2000,
@@ -156,7 +159,7 @@ time.sleep(120)
             ),
             KVCRBackendConfigs(
                 framework_regions=_real_nixl_regions(
-                    ctypes.addressof(destination), [("", page)]
+                    ctypes.addressof(destination), [("pool", page)]
                 ),
                 remote_fw_dram=RemoteFWDramOptions(eager_ctrl_connect=False),
             ),
@@ -164,7 +167,7 @@ time.sleep(120)
         key = BlockKey(b"pre-restart")
         target.submit_hint(_router_hint(endpoint), request_id="h3-restarted-guard")
         operation = target.deliver(
-            {key: _real_nixl_refs("h3-target", [("", page)])},
+            {key: _real_nixl_refs("h3-target", [("pool", page)])},
             request_id="h3-restarted-guard",
         )
         results = {}

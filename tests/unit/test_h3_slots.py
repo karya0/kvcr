@@ -175,7 +175,7 @@ def test_q11_quarantine_uses_ttl_only_without_pidfd(tmp_path, pools, monkeypatch
     assert slot.claim_generation == generation + 1
     # A separate restart exercises pod-gone while G still runs.
     other = tmp_path / "other"
-    other.mkdir()
+    other.mkdir(mode=0o700)
     table2, slot2, old, gen2, clock2, api2 = _restart(
         other, pools, monkeypatch, peer=peer
     )
