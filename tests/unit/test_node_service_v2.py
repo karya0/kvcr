@@ -1334,6 +1334,22 @@ def test_supervisor_agent_restarts_once(monkeypatch):
     agents.close()
 
 
+def test_supervisor_refuses_second_lineage_agent(monkeypatch, caplog):
+    spawned = []
+    monkeypatch.setattr(
+        node_service.subprocess,
+        "Popen",
+        lambda command, *, env: spawned.append(_AgentProcess()) or spawned[-1],
+    )
+    agents = node_service.LineageAgents(2)
+    agents.ensure("t/a", "ns1")
+    with caplog.at_level("ERROR"), pytest.raises(ValueError, match="t/a"):
+        agents.ensure("t/b", "ns2")
+    assert len(spawned) == 1 and list(agents.children) == ["t/a"]
+    assert "lineage agent refused lineage=t/b" in caplog.text
+    agents.close()
+
+
 def test_default_agent_mode_does_not_spawn(tmp_path, pools):
     table, _ = _table(tmp_path)
     assert table.agents is None

@@ -1043,6 +1043,16 @@ class LineageAgents:
     def ensure(self, lineage: str, namespace: str | None) -> None:
         if not namespace:
             raise ValueError("supervisor state agent requires a namespace")
+        # A second agent shares POD_NAME/CONTAINER_NAME and would delete the
+        # first one's DynamoWorkerMetadata CR: one lineage per node.
+        other = next((key for key in self.children if key != lineage), None)
+        if other is not None:
+            logger.error(
+                "lineage agent refused lineage=%s running=%s reason=one-per-node",
+                lineage,
+                other,
+            )
+            raise ValueError(f"node already runs a state agent for {other}")
         current = self.children.get(lineage)
         if current is not None:
             if current[0] != namespace:
