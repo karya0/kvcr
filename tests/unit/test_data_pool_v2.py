@@ -198,6 +198,11 @@ def test_guard_logs_the_data_pool_at_promotion_not_at_claim(short_dir, caplog):
                 slot_pool = table.get("t/l/0").pool
                 base = slot_pool.address(slot_pool.regions[0])
                 guard._core = MagicMock()
+                name, slot_bytes = guard._configured.pool_layouts[0]
+                address, size, *_ = guard._data_pool
+                guard._core._local_dram._pools._regions = {
+                    name: (address, size, slot_bytes)
+                }
                 with patch.object(guard._recovery, "prepare_to_serve", lambda r: r):
                     with patch.object(guard._recovery, "release_snapshot_region"):
                         guard._serve({}, time.monotonic(), time.monotonic())
@@ -437,14 +442,20 @@ def test_journal_lives_in_the_slot_meta_memfd_not_pool_rank(short_dir, caplog):
             assert len(hold.region_fds) == 1  # the meta fd is not a region fd
             with caplog.at_level(logging.INFO, logger=guard_module.logger.name):
                 guard._core = MagicMock()
+                name, slot_bytes = guard._configured.pool_layouts[0]
+                address, size, *_ = guard._data_pool
+                guard._core._local_dram._pools._regions = {
+                    name: (address, size, slot_bytes)
+                }
                 with patch.object(guard._recovery, "prepare_to_serve", lambda r: r):
                     with patch.object(guard._recovery, "release_snapshot_region"):
                         guard._serve({}, time.monotonic(), time.monotonic())
             size = os.fstat(meta_fd).st_size
             offset = memmap.region_offset(meta_fd, spec.mapping_bytes)
+            end = min(size, memory_module.meta_region_bytes(spec.journal_bytes))
             assert (
                 f"KVCR_EVENT gaas_meta_region guard=0 slot=t/l/0 bytes={size} "
-                f"journal_bytes={spec.journal_bytes} snapshot_budget={size - offset}"
+                f"journal_bytes={spec.journal_bytes} snapshot_budget={end - offset}"
             ) in caplog.messages
         finally:
             guard._serving = False
