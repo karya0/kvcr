@@ -295,16 +295,27 @@ class RegionPool:
         self._next_index, self._generation = next_index, generation
 
     def adopt(self, fds: list[int]) -> None:
-        """Replace an eager restored pool's memfds, preserving its layout."""
-        regions = list(self._regions)
-        next_index, generation = self._next_index, self._generation
-        self._unmap(regions)
+        """Replace restored backing, taking fd ownership only on success.
+
+        A failed mapping leaves the pool quarantined by the caller. Retain its
+        original fds and layout so a retry can remap every region, including any
+        already replaced before the failure, without retaining borrowed fds.
+        """
+        for region in self._regions:
+            addr = self._libc.mmap(
+                self._base + region.offset,
+                region.size,
+                mmap.PROT_READ | mmap.PROT_WRITE,
+                mmap.MAP_SHARED | _MAP_FIXED,
+                fds[0],
+                region.offset,
+            )
+            _check(addr, "region mmap")
         os.close(self._fd)
         if self._meta_fd >= 0:
             os.close(self._meta_fd)
         self._fd = fds[0]
         self._meta_fd = fds[1] if len(fds) > 1 else -1
-        self.restore(regions, next_index, generation)
 
     @property
     def next_index(self) -> int:
