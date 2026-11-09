@@ -419,14 +419,26 @@ class _RecoveryMirror:
         return records
 
 
+def _attach_g2_index(local_dram: _LocalDramPools, backing) -> None:
+    index = backing.g2_index() if isinstance(backing, KVCRPoolAttachment) else None
+    if index is not None:
+        if len(local_dram._regions) != 1:
+            raise ValueError("a v2 index requires one data pool")
+        name, (_, length, slot_size) = next(iter(local_dram._regions.items()))
+        index.validate_slots(length // slot_size)
+        local_dram._recovery_indexes = {name: index}
+
+
 def _attach_journal(
     local_dram: _LocalDramPools, journal: RecoveryJournal, g3: _G3 | None = None
 ) -> None:
     """Attach stable G2/G3 residency publication to one journal."""
+    _attach_g2_index(local_dram, getattr(journal, "_pool", None))
     enabled = True
 
     def publish(key: BlockKey, record: _BlockRecord) -> None:
         nonlocal enabled
+        local_dram.publish_recovery(key, record)
         if not enabled:
             return
         payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
@@ -775,6 +787,22 @@ def read_handback(
         )
         pool.release_snapshot_region()
         return _RecoveryMirror(pool_names)
+    index = pool.g2_index()
+    if index is not None:
+        from .g2_index import rebuild
+
+        if len(pool_names) != 1:
+            raise ValueError("a v2 index requires one data pool")
+        records = mirror.take_records()
+        for record in records.values():
+            record.local_dram = None
+        for key, (slots, position) in rebuild(
+            {pool_names[0]: index}, promotion=True
+        ).items():
+            record = records.setdefault(BlockKey(key), _BlockRecord())
+            record.local_dram = _LocalDramResidency(slots, _LocalDramState.READY)
+            record.position = position
+        mirror.adopt(records)
     return mirror
 
 

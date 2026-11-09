@@ -38,9 +38,8 @@ from kvcr.backends.local_disk import _G3Residency
 from kvcr.config import GaaSSettings
 from kvcr.runtime.core import _BlockRecord
 from kvcr.service import guard as guard_module
-from kvcr.service import memmap
+from kvcr.service import memmap, node_service
 from kvcr.service import memory as memory_module
-from kvcr.service import node_service
 from kvcr.service.node_service import SlotTable
 from kvcr.service.protocol import (
     DATA_POOL_LAYOUT,
@@ -465,7 +464,7 @@ def test_snapshot_round_trips_through_the_meta_memfd_and_reaches_a_replacement_c
         _released_with_a_record(harness, guard)
         meta_fd = table.get("t/l/0").pool.meta_fd
         size = os.fstat(meta_fd).st_size  # the handback kept the memfd's size
-        assert size == table.meta_bytes
+        assert size == table._slot_meta_bytes(table.get("t/l/0"))
         assert os.stat(guard._spec.path).st_size == (
             guard._recovery._pool_spec.mapping_bytes
         )
@@ -544,7 +543,7 @@ def test_configured_journal_survives_a_restart_with_a_persisted_slot(short_dir):
         _attach(harness, reborn)
         assert reborn.meta_bytes == node_service.meta_region_bytes(journal)
         meta_fd = reborn._slots["t/l/0"].pool.meta_fd
-        assert os.fstat(meta_fd).st_size == reborn.meta_bytes
+        assert os.fstat(meta_fd).st_size == reborn._slot_meta_bytes(reborn.get("t/l/0"))
         hold = _claim(harness)
         try:
             assert hold._attachment._spec.journal_bytes == journal

@@ -48,6 +48,7 @@ from .recovery_journal import (
     RecoveryJournal,
     RecoveryJournalError,
     RecoveryMirrorError,
+    _attach_g2_index,
     _recovery_frames,
     _RecoveryMirror,
     canonical_pool_terms,
@@ -275,6 +276,8 @@ class _RecoveryState:
         )
         self.attachment.close()
         self.attachment, self._journal = meta, RecoveryJournal(meta)
+        if meta.g2_index() is not None:
+            self.mirror = read_handback(meta, self._compatibility_digest, self.pools)
 
     def start_primary(self) -> None:
         """Arm recovery for the accepted primary and reset its journal."""
@@ -1195,6 +1198,10 @@ class _Guard:
         agent_name = core.nixl_agent_name
         # Shared, not copied: a later confirmed death must reach a serving core.
         core._remote_fw_dram._dangling_ops.dead_incarnations = self._dead_incarnations
+        if self._recovery.attachment.g2_index() is not None:
+            pools = core._local_dram._pools
+            _attach_g2_index(pools, self._recovery.attachment)
+            pools.observe_residency(pools.publish_recovery)
         core.adopt_recovery_records(records)
         # A previous handover describes slots this Guard is about to move, and it is
         # already in the mirror. Leaving it would map keys to overwritten bytes.

@@ -6,6 +6,7 @@ import contextlib
 import ctypes
 import errno
 import fcntl
+import mmap
 import os
 import stat
 import uuid
@@ -34,6 +35,26 @@ _OPEN_FLAGS = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
 _POOL_ID_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
 )
+
+
+INDEX_MIN_BLOCK_BYTES = 256 << 10
+INDEX_MIN_SLOTS = 1024
+SOFT_KEY_MAX = 64
+
+
+def meta_region_bytes(journal_bytes: int) -> int:
+    stub = journal_bytes + _JOURNAL_HEADER_BYTES
+    offset = -(-stub // mmap.ALLOCATIONGRANULARITY) * mmap.ALLOCATIONGRANULARITY
+    return offset + stub
+
+
+def index_slots(effective: int) -> int:
+    return max(INDEX_MIN_SLOTS, effective // INDEX_MIN_BLOCK_BYTES)
+
+
+def index_region_bytes(effective: int) -> int:
+    size = 64 + (64 + SOFT_KEY_MAX) * index_slots(effective)
+    return -(-size // mmap.PAGESIZE) * mmap.PAGESIZE
 
 
 def _validate_positive_int(name: str, value: object) -> None:
@@ -104,6 +125,8 @@ class KVCRPoolAttachment:
         # A v2 meta memfd keeps its size: the holder charged its pages, and a
         # truncate would hand them back. Its snapshot region is cleared in place.
         self._fixed_size = False
+        self._index_mapping = None
+        self._index = None
 
     @classmethod
     def attach(
@@ -185,11 +208,37 @@ class KVCRPoolAttachment:
         attachment._fixed_size = True
         return attachment
 
+    def g2_index(self):
+        """Map the optional index without changing its durable header."""
+        if not self._fixed_size:
+            return None
+        if self._index is not None:
+            return self._index
+        from .g2_index import G2Index
+        from .recovery_journal import _AtomicU64
+
+        base = meta_region_bytes(self._spec.journal_bytes)
+        size = os.fstat(self._file_descriptor).st_size - base
+        if size < 64 or os.pread(self._file_descriptor, 4, base) == bytes(4):
+            return None
+        region = mmap.mmap(self._file_descriptor, size, offset=base)
+        try:
+            address = ctypes.addressof(ctypes.c_char.from_buffer(region))
+            index = G2Index(region, lambda offset: _AtomicU64(address + offset))
+        except BaseException:
+            region.close()
+            raise
+        self._index_mapping, self._index = region, index
+        return index
+
     @property
     def snapshot_budget_bytes(self) -> int:
         """How much a snapshot region may hold in the backing as it stands."""
         offset = memmap.region_offset(self._file_descriptor, self._spec.mapping_bytes)
-        return os.fstat(self._file_descriptor).st_size - offset
+        end = os.fstat(self._file_descriptor).st_size
+        if self._fixed_size:
+            end = min(end, meta_region_bytes(self._spec.journal_bytes))
+        return end - offset
 
     @property
     def data_address(self) -> int:
@@ -247,7 +296,7 @@ class KVCRPoolAttachment:
     def mapped_snapshot(self) -> Iterator[memmap.Region | None]:
         """Whatever a previous Guard left past the pool, if anything is there."""
         offset = memmap.region_offset(self._file_descriptor, self._spec.mapping_bytes)
-        size = os.fstat(self._file_descriptor).st_size - offset
+        size = self.snapshot_budget_bytes
         if size <= 0:
             yield None
             return
@@ -273,6 +322,10 @@ class KVCRPoolAttachment:
 
     def close(self) -> None:
         """Unmap the pool without unlinking the server-owned file."""
+        if self._index_mapping is not None:
+            self._index = None
+            self._index_mapping.close()
+            self._index_mapping = None
         mapping = self._mapping
         if mapping is not None:
             mapping.close()

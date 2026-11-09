@@ -43,26 +43,12 @@ from typing import Any, Protocol
 READINESS_WAIT_S = 180.0
 _GIB = 1 << 30
 _JOURNAL_BYTES = 100 << 20  # the service's default journal (server re-exports it)
-_JOURNAL_HEADER_BYTES = (
-    4096  # memory._JOURNAL_HEADER_BYTES; this module loads standalone
-)
 
 
 def meta_region_bytes(journal_bytes: int) -> int:
-    """Size of a v2 slot's meta memfd, from the pool spec's journal size.
+    from .memory import meta_region_bytes as base_size
 
-    Layout (memory.meta_spec): the journal, a header-sized stub where a pool's
-    data would start, then the snapshot region at the next mapping granularity.
-    The snapshot budget is journal_bytes plus one header page. That is an
-    explicit cap, NOT a bound by construction: the journal is a ring of
-    unconsumed deltas (padded to 8 B), the snapshot is one unpadded frame per
-    live recoverable record, so it scales with the record count. A snapshot over
-    the budget gets ENOSPC, which the Guard treats as recovery disabled
-    (guard._RECOVERY_CAPACITY_ERRORS): the pool stays claimable but cold.
-    """
-    stub = journal_bytes + _JOURNAL_HEADER_BYTES
-    offset = -(-stub // mmap.ALLOCATIONGRANULARITY) * mmap.ALLOCATIONGRANULARITY
-    return offset + journal_bytes + _JOURNAL_HEADER_BYTES
+    return base_size(journal_bytes)
 
 
 _HEADROOM_BYTES = 2 * _GIB
@@ -457,7 +443,7 @@ class NodeBroker:
         charged for; sized any lower, populating a full pool is OOM-killed.
         """
         # The holder maps and populates the whole meta memfd as well as the data.
-        charged = claim.data_bytes + self.meta_bytes
+        charged = claim.data_bytes + state.get("meta_bytes", self.meta_bytes)
         total = charged + _toucher_overhead_bytes(charged)
         memory = f"{-(-total // (1 << 20))}Mi"
         spec = pod["spec"]
@@ -690,7 +676,13 @@ class NodeBroker:
         ):
             raise ValueError("H7 holder count or capacity budget exceeded")
 
-    def ensure(self, value: dict[str, Any], timeout_s: float = 180) -> dict[str, Any]:
+    def ensure(
+        self,
+        value: dict[str, Any],
+        timeout_s: float = 180,
+        *,
+        meta_bytes: int | None = None,
+    ) -> dict[str, Any]:
         claim = PoolClaim.parse(value)
         # Population time ~ data_bytes / (per-core populate rate x holder cpu);
         # 256 GiB at 1 CPU may need a size-aware wait (follow-up).
@@ -715,6 +707,7 @@ class NodeBroker:
                     "holder_uid": None,
                     "socket_path": socket_path,
                     "phase": "creating",
+                    "meta_bytes": self.meta_bytes if meta_bytes is None else meta_bytes,
                 }
                 self._save(claim, state)  # creation identity survives an uncertain POST
             if state["phase"] != "creating" and state["phase"] != "ready":
@@ -973,6 +966,7 @@ class _Slot:
     pool: Any  # RegionPool
     effective_maximum_bytes: int
     holder: dict[str, Any]
+    index_region_bytes: int = 0
     incarnation: int = 0
     peer: Any = None
     owner_alive: Callable[[], bool] | None = None
@@ -1046,6 +1040,21 @@ class SlotTable:
         self._state_path = state_path or (root and Path(root) / "slot-table.json")
         self._restore()
 
+    def _slot_meta_bytes(self, slot: _Slot) -> int:
+        return self.meta_bytes + slot.index_region_bytes
+
+    def _initialize_index(self, pool, effective, irb, *, base=None) -> None:
+        if not irb:
+            return
+        from .g2_index import G2Index
+        from .memory import index_slots
+
+        base = self.meta_bytes if base is None else base
+        if base % mmap.ALLOCATIONGRANULARITY:
+            raise ValueError("G2 index base is not mapping-aligned")
+        with mmap.mmap(pool.meta_fd, irb, offset=base) as region:
+            G2Index.initialize(region, index_slots(effective))
+
     def bind_journal_bytes(self, journal_bytes: int) -> None:
         """Size the meta memfd from the service's journal, unless a size was given.
 
@@ -1065,7 +1074,15 @@ class SlotTable:
             if meta_bytes != self.meta_bytes:
                 for slot in self._slots.values():
                     if slot.pool.meta_fd >= 0:
-                        os.ftruncate(slot.pool.meta_fd, meta_bytes)
+                        os.ftruncate(
+                            slot.pool.meta_fd, meta_bytes + slot.index_region_bytes
+                        )
+                        self._initialize_index(
+                            slot.pool,
+                            slot.effective_maximum_bytes,
+                            slot.index_region_bytes,
+                            base=meta_bytes,
+                        )
                 self.meta_bytes = self.broker.meta_bytes = meta_bytes
             self._bound_journal = journal_bytes
 
@@ -1097,6 +1114,7 @@ class SlotTable:
                     name: {
                         "digest": slot.digest,
                         "effective_maximum_bytes": slot.effective_maximum_bytes,
+                        "index_region_bytes": slot.index_region_bytes,
                         "holder": slot.holder,
                         "incarnation": slot.incarnation,
                         "claim_generation": slot.claim_generation,
@@ -1131,9 +1149,11 @@ class SlotTable:
         self._epochs = {k: int(v) for k, v in data.get("epochs", {}).items()}
         self._generations = {k: int(v) for k, v in data.get("generations", {}).items()}
         for name, rec in data.get("slots", {}).items():
+            irb = rec.get("index_region_bytes", 0)
             pool = RegionPool.create(
-                rec["effective_maximum_bytes"], meta_bytes=self.meta_bytes
+                rec["effective_maximum_bytes"], meta_bytes=self.meta_bytes + irb
             )
+            self._initialize_index(pool, rec["effective_maximum_bytes"], irb)
             try:
                 pool.restore(
                     [
@@ -1152,6 +1172,7 @@ class SlotTable:
                 pool,
                 rec["effective_maximum_bytes"],
                 rec["holder"],
+                index_region_bytes=irb,
                 restored_pool=True,
                 incarnation=rec["incarnation"],
                 claim_generation=rec["claim_generation"],
@@ -1338,7 +1359,11 @@ class SlotTable:
                     raise SlotError(
                         CAPACITY_BELOW_MINIMUM, f"capacity below minimum for {name}"
                     )
-                pool = RegionPool.create(effective, meta_bytes=self.meta_bytes)
+                from .memory import index_region_bytes
+
+                irb = 0 if self._meta_explicit else index_region_bytes(effective)
+                pool = RegionPool.create(effective, meta_bytes=self.meta_bytes + irb)
+                self._initialize_index(pool, effective, irb)
                 try:
                     pool.grow(min(size, effective))
                 except BaseException as error:
@@ -1352,6 +1377,7 @@ class SlotTable:
                     pool,
                     effective,
                     self._new_holder(name, effective, digest),
+                    index_region_bytes=irb,
                 )
                 # Reserved now: capacity is counted and the slot reads as held
                 # while the holder comes up outside this lock.
@@ -1365,7 +1391,11 @@ class SlotTable:
         try:
             with slot.lock:
                 if created:
-                    self.broker.ensure(slot.holder, self.ensure_timeout_s)
+                    self.broker.ensure(
+                        slot.holder,
+                        self.ensure_timeout_s,
+                        meta_bytes=self._slot_meta_bytes(slot),
+                    )
                     if self.broker.toucher:
                         self._feed_holder(slot)
                 else:
@@ -1468,7 +1498,7 @@ class SlotTable:
                 "incarnation": slot.incarnation,
             }
             if slot.pool.meta_fd >= 0:
-                expected["meta"] = {"fd_index": 1, "size": self.meta_bytes}
+                expected["meta"] = {"fd_index": 1, "size": self._slot_meta_bytes(slot)}
             current = slot.pool.pass_fd_list()
             if handback != expected or len(fds) != len(current):
                 raise ValueError(
@@ -1620,7 +1650,11 @@ class SlotTable:
         with self._lock:
             self._persist()
         try:
-            self.broker.ensure(slot.holder, self.ensure_timeout_s)
+            self.broker.ensure(
+                slot.holder,
+                self.ensure_timeout_s,
+                meta_bytes=self._slot_meta_bytes(slot),
+            )
             if self.broker.toucher:
                 self._feed_holder(slot)
         except (OSError, RuntimeError, ValueError, TimeoutError) as error:

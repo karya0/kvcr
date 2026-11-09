@@ -869,8 +869,8 @@ def test_holder_pod_limit_covers_data_meta_and_overhead(tmp_path):
 def test_meta_region_is_derived_from_the_journal_size():
     journal = 100 << 20
     size = node_service.meta_region_bytes(journal)
-    offset = size - journal - node_service._JOURNAL_HEADER_BYTES
-    assert offset >= journal + node_service._JOURNAL_HEADER_BYTES
+    offset = size - journal - PAGE
+    assert offset >= journal + PAGE
     assert not hasattr(node_service, "_META_BYTES")  # the journal, not a constant
 
 
@@ -915,7 +915,7 @@ def test_restored_slot_adopts_the_holders_handback(tmp_path, pools, monkeypatch)
             ],
             "layout_generation": slot.pool.layout_generation,
             "incarnation": slot.incarnation,
-            "meta": {"fd_index": 1, "size": table.meta_bytes},
+            "meta": {"fd_index": 1, "size": table._slot_meta_bytes(slot)},
         },
         "fds": slot.pool.pass_fd_list(),
     }
@@ -989,7 +989,7 @@ def _handback(slot, table):
             ],
             "layout_generation": slot.pool.layout_generation,
             "incarnation": slot.incarnation,
-            "meta": {"fd_index": 1, "size": table.meta_bytes},
+            "meta": {"fd_index": 1, "size": table._slot_meta_bytes(slot)},
         },
         "fds": slot.pool.pass_fd_list(),
     }
@@ -1077,3 +1077,165 @@ def test_failed_feed_drops_connection(tmp_path, pools, monkeypatch):
     finally:
         thread.join(10)
         assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_restored_different_effective_slot_adopts(tmp_path, pools, legacy):
+    table, _ = _table(tmp_path)
+    slot = _claim(table, maximum=8)
+    # A differently sized neighbour has its own index reservation.
+    neighbour = table.claim(
+        "t",
+        "other",
+        0,
+        total=4 * PAGE,
+        minimum=4 * PAGE,
+        maximum=16 * PAGE,
+        digest=DIGEST,
+        claim_id="other",
+        peer=ME,
+        owner_alive=lambda: True,
+    )
+    assert slot.effective_maximum_bytes != neighbour.effective_maximum_bytes
+    if legacy:
+        slot.index_region_bytes = 0
+        os.ftruncate(slot.pool.meta_fd, table.meta_bytes)
+        table._persist()
+        state = json.loads(table._state_path.read_text())
+        del state["slots"][slot.name]["index_region_bytes"]
+        table._state_path.write_text(json.dumps(state))
+    restarted = SlotTable(table.broker, table.cap_bytes, require_pod_identity=False)
+    again = restarted.get(slot.name)
+    assert again.index_region_bytes == slot.index_region_bytes
+    sup, peer = socket.socketpair()
+    again.holder_conn = sup
+    try:
+        holder.hello(peer, _handback(slot, table))
+        restarted._adopt_handback(again)
+        assert os.fstat(again.pool.meta_fd).st_ino == os.fstat(slot.pool.meta_fd).st_ino
+    finally:
+        sup.close()
+        peer.close()
+
+
+def test_index_adopt_single_pool_three_parts_published_implies_indexed(tmp_path, pools):
+    from kvcr.service.g2_index import G2Index, rebuild
+
+    table, _ = _table(tmp_path)
+    slot = _claim(table)
+    base = table.meta_bytes
+    parts = [("pool:a", 0), ("pool:b", 1), ("pool:c", 2)]
+    with mmap.mmap(slot.pool.meta_fd, slot.index_region_bytes, offset=base) as region:
+        index = G2Index(region)
+        assert index.reserve(b"K1", parts)
+        for cut, _ in enumerate(index.store_steps(b"K1", parts, 7), 1):
+            truth = {b"K1": (parts, 7)} if cut == 174 else {}
+            assert rebuild({"pool": index}) == truth
+        for cut, _ in enumerate(index.position_steps(parts, 11), 1):
+            truth = {b"K1": (parts, 11)} if cut == 30 else {}
+            assert rebuild({"pool": index}) == truth
+        removed = [("pool:d", 3)]
+        assert index.reserve(b"K2", removed)
+        list(index.store_steps(b"K2", removed, 3))
+        list(index.remove_steps(removed))
+    restarted = SlotTable(table.broker, table.cap_bytes, require_pod_identity=False)
+    again = restarted.get(slot.name)
+    sup, peer = socket.socketpair()
+    again.holder_conn = sup
+    try:
+        holder.hello(peer, _handback(slot, table))
+        restarted._adopt_handback(again)
+        with mmap.mmap(
+            again.pool.meta_fd, again.index_region_bytes, offset=base
+        ) as region:
+            assert rebuild({"pool": G2Index(region)}) == {b"K1": (parts, 11)}
+    finally:
+        sup.close()
+        peer.close()
+
+
+def test_local_dram_writes_index_surviving_adopt(tmp_path, pools):
+    import ctypes
+    from types import SimpleNamespace
+
+    from _kvcr_test_utils import (
+        FakeNixlAgent,
+        FakePrimaryPinning,
+        _buffer_region,
+        _mem_descriptor,
+        _new_kvcr,
+        _poll_until,
+    )
+
+    from kvcr.config import KVCRConfig, LocalDramOptions
+    from kvcr.service.g2_index import G2Index, rebuild
+    from kvcr.service.memory import KVCRPoolAttachment, KVCRPoolSpec
+    from kvcr.service.recovery_journal import _attach_journal
+    from kvcr.types import BlockKey
+
+    table, _ = _table(tmp_path)
+    slot = _claim(table)
+    # Attach the actual meta memfd under the same spec a v2 client uses.
+    stat = os.fstat(slot.pool.fd)
+    spec = KVCRPoolSpec(
+        pool_id="test",
+        path="/tmp/kvcr-test-" + "0" * 32,
+        generation="0" * 32,
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mapping_bytes=(100 << 20) + PAGE,
+        journal_bytes=100 << 20,
+    )
+    os.fchmod(slot.pool.meta_fd, 0o600)
+    attachment = KVCRPoolAttachment.attach_meta_fd(os.dup(slot.pool.meta_fd), spec)
+    local = (ctypes.c_char * (4 * PAGE)).from_address(
+        slot.pool.address(slot.pool.regions[0])
+    )
+    source = ctypes.create_string_buffer(4 * 16)
+    agent = FakeNixlAgent()
+    runner = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        None,
+        config=KVCRConfig("target", [("pool", 16)]),
+        local_dram=LocalDramOptions([("pool", ctypes.addressof(local), len(local))]),
+        framework_regions=[_buffer_region(source, 16, "pool:*")],
+    )
+    dram = runner._core._local_dram._pools
+    journal = SimpleNamespace(_pool=attachment, publish=lambda *args: True)
+    _attach_journal(dram, journal)
+    labels = ["pool:a", "pool:b", "pool:c"]
+    try:
+        for key, descriptors in (
+            (
+                BlockKey(b"K1"),
+                [_mem_descriptor(i, label) for i, label in enumerate(labels)],
+            ),
+            (BlockKey(b"K2"), [_mem_descriptor(3, "pool:d")]),
+        ):
+            runner.deposit({key: descriptors})
+            agent.state = "DONE"
+            assert _poll_until(runner, bool)
+        live = runner._core._block_record_map[BlockKey(b"K1")]
+        expected = (list(live.local_dram.slots), live.position)
+        removed = runner._core._block_record_map[BlockKey(b"K2")].local_dram
+        removed.retire_on_release = True
+        dram._after_last_claim(BlockKey(b"K2"), removed)
+        runner.close()
+        restarted = SlotTable(table.broker, table.cap_bytes, require_pod_identity=False)
+        again = restarted.get(slot.name)
+        sup, peer = socket.socketpair()
+        again.holder_conn = sup
+        try:
+            holder.hello(peer, _handback(slot, table))
+            restarted._adopt_handback(again)
+            with mmap.mmap(
+                again.pool.meta_fd, again.index_region_bytes, offset=table.meta_bytes
+            ) as region:
+                assert rebuild({"pool": G2Index(region)}) == {b"K1": expected}
+        finally:
+            sup.close()
+            peer.close()
+    finally:
+        runner.close()
+        attachment.close()

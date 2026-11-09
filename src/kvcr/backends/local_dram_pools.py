@@ -239,6 +239,7 @@ class _LocalDramPools:
         self._next_release_handle = 1
         # A no-op until something attaches: the tiers publish residency
         # changes unconditionally, and only recovery cares to hear them.
+        self._recovery_indexes = {}
         self._residency_observer: Callable[[BlockKey, "_BlockRecord"], None] = (
             lambda key, record: None
         )
@@ -404,6 +405,55 @@ class _LocalDramPools:
                     for pool, count in residency.pool_counts:
                         slots[pool] -= count
         return slots
+
+    def reserve_recovery(self, key, locations) -> bool:
+        if not self._recovery_indexes:
+            return True
+        from ..service.g2_index import reserve
+
+        return reserve(self._recovery_indexes, bytes(key), locations)
+
+    def clear_recovery(self, locations) -> None:
+        for pool, index in self._recovery_indexes.items():
+            local = [
+                (label, slot)
+                for label, slot in locations
+                if label.partition(":")[0] == pool
+            ]
+            for _ in index.remove_steps(local):
+                pass
+
+    def publish_recovery(self, key, record) -> None:
+        residency = record.local_dram
+        if (
+            residency is None
+            or residency.state is not _LocalDramState.READY
+            or residency.pending_labels
+        ):
+            return
+        for pool, index in self._recovery_indexes.items():
+            local = [
+                (label, slot)
+                for label, slot in residency.slots
+                if label.partition(":")[0] == pool
+            ]
+            indices = [
+                i
+                for i, (label, _) in enumerate(residency.slots)
+                if label.partition(":")[0] == pool
+            ]
+            if all(index.buffer[64 + slot * 64 + 12] == 1 for _, slot in local):
+                steps = index.position_steps(local, record.position)
+            else:
+                steps = index.store_steps(
+                    bytes(key),
+                    local,
+                    record.position,
+                    n_parts=len(residency.slots),
+                    part_indices=indices,
+                )
+            for _ in steps:
+                pass
 
     def observe_residency(
         self, observer: Callable[[BlockKey, "_BlockRecord"], None]
@@ -641,6 +691,7 @@ class _LocalDramPools:
                 self._kvcr._log_key_history(
                     "remove", (key,), CacheTier.LOCAL_G2, "retire_on_release"
                 )
+            self.clear_recovery(residency.slots)
             self._residency_observer(key, record)
             self._free(residency.slots)
             self.abandon_capacity_eviction(key)
@@ -738,6 +789,7 @@ class _LocalDramPools:
                     "remove", (key,), CacheTier.LOCAL_G2, "capacity_eviction"
                 )
             record.local_dram = None
+            self.clear_recovery(residency.slots)
             self._residency_observer(key, record)
             self._kvcr._on_remove(self._kvcr._block_meta(key, record, size_bytes))
             self._kvcr._prune_block_record(key)
@@ -804,7 +856,11 @@ class _LocalDramPools:
 
     def _free(self, locations: Collection[tuple[str, int]]) -> None:
         for label, slot in locations:
-            self._free_slots[label.partition(":")[0]].append(slot)
+            pool = label.partition(":")[0]
+            index = self._recovery_indexes.get(pool)
+            if index is not None:
+                index.reservations.pop(slot, None)
+            self._free_slots[pool].append(slot)
 
     def _size_bytes(self, residency: _LocalDramResidency) -> int:
         if residency._cached_size is None:

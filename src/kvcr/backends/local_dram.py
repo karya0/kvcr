@@ -307,6 +307,10 @@ class _LocalDram:
                     else:
                         op.results[key] = _FAILED_RESULT
                     continue
+                if not self._pools.reserve_recovery(key, locations):
+                    self._pools._free(locations)
+                    op.results[key] = _FAILED_RESULT
+                    continue
                 full_deposit = layout == local_layout
                 residency = _LocalDramResidency(
                     locations,
@@ -808,6 +812,9 @@ class _LocalDram:
         locations, evicted, waiting = self._pools._allocate_slots(
             layout, op.keys, op.deadline
         )
+        if locations is not None and not self._pools.reserve_recovery(key, locations):
+            self._pools._free(locations)
+            locations = None
         if locations is not None:
             residency = _LocalDramResidency(
                 locations, _LocalDramState.FILLING, key_layout=op.key_layout

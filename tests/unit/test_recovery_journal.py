@@ -51,6 +51,7 @@ _TEST_DIGEST = "Opaque-Digest"
 def _attachment(mapping: mmap.mmap, journal_bytes: int) -> KVCRPoolAttachment:
     attachment = object.__new__(KVCRPoolAttachment)
     attachment._mapping = mapping
+    attachment._fixed_size = False
     attachment._spec = KVCRPoolSpec(
         pool_id="pool_0",
         path=f"/tmp/kvcr-pool_0-{_GENERATION}",
