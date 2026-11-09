@@ -762,6 +762,9 @@ class _ThreadingUnixServer(
 
     def service_actions(self) -> None:
         self._last_progress = time.monotonic()
+        if self.slots is not None and self.slots.agents is not None:
+            with self.slots._lock:
+                self.slots.agents.upkeep()
 
     def dispatch(
         self,
@@ -1037,6 +1040,9 @@ class _KVCRService:
         except BaseException as error:
             if first_error is None:
                 first_error = error
+        if self._server.slots is not None and self._server.slots.agents is not None:
+            with self._server.slots._lock:
+                self._server.slots.agents.close()
         try:
             _unlink_if_identity(self.socket_path, self._socket_identity)
         except OSError as error:
@@ -1167,6 +1173,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--manager-id", default="gaas")
     parser.add_argument(
+        "--state-agent-mode", choices=("dgd", "supervisor"), default="dgd"
+    )
+    parser.add_argument(
         "--slot-root",
         help="private holder socket/state dir (default: the socket's directory)",
     )
@@ -1264,6 +1273,8 @@ def _build_slots(args: argparse.Namespace) -> SlotTable | None:
         require_pod_identity=args.require_pod_identity,
         journal_bytes=_DEFAULT_JOURNAL_BYTES,
         lease_ttl_ms=args.worker_lease_ttl_ms,
+        state_agent_mode=args.state_agent_mode,
+        state_agent_max_slots=args.guard_count,
     )
 
 

@@ -1248,3 +1248,93 @@ def test_local_dram_writes_index_surviving_adopt(tmp_path, pools):
     finally:
         runner.close()
         attachment.close()
+
+
+class _AgentProcess:
+    def __init__(self):
+        self.returncode = None
+        self.terminated = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def test_supervisor_agent_kept_until_last_slot(tmp_path, pools, monkeypatch):
+    spawned = []
+
+    def spawn(command, *, env):
+        child = _AgentProcess()
+        spawned.append((command, env, child))
+        return child
+
+    monkeypatch.setattr(node_service.subprocess, "Popen", spawn)
+    monkeypatch.setenv("DYN_DISCOVERY_BACKEND", "kubernetes")
+    monkeypatch.setenv("DYN_KUBE_DISCOVERY_MODE", "container")
+    monkeypatch.setenv("POD_NAME", "gaas-node")
+    table, api = _table(tmp_path)
+    table.agents = node_service.LineageAgents(2)
+    slots = [
+        table.claim(
+            "t",
+            "l",
+            index,
+            total=4 * PAGE,
+            minimum=2 * PAGE,
+            maximum=None,
+            digest=DIGEST,
+            claim_id=f"worker-{index}",
+            peer=ME,
+            owner_alive=lambda: False,
+            namespace="ns1",
+        )
+        for index in range(2)
+    ]
+    assert len(spawned) == 1
+    command, env, child = spawned[0]
+    assert command[1:] == ["-m", "dynamo.kv_state_agent", "--max-slots", "2"]
+    assert env["DYN_NAMESPACE"] == "ns1"
+    assert env["DYN_DISCOVERY_BACKEND"] == "kubernetes"
+    assert env["DYN_KUBE_DISCOVERY_MODE"] == "container"
+    assert env["POD_NAME"] == "gaas-node"
+    # Worker death does not release a retained lineage's child or its pools.
+    table.agents.upkeep()
+    assert child.poll() is None
+    table.release(slots[0].name)
+    assert child.poll() is None
+    table.release(slots[1].name)
+    assert child.terminated and not table.agents.children
+
+
+def test_supervisor_agent_restarts_once(monkeypatch):
+    spawned = []
+
+    def spawn(command, *, env):
+        child = _AgentProcess()
+        spawned.append(child)
+        return child
+
+    monkeypatch.setattr(node_service.subprocess, "Popen", spawn)
+    agents = node_service.LineageAgents(2)
+    agents.ensure("t/l", "ns1")
+    spawned[0].returncode = 1
+    agents.upkeep()
+    assert len(spawned) == 2
+    spawned[1].returncode = 1
+    agents.upkeep()
+    assert len(spawned) == 2
+    with pytest.raises(ValueError, match="namespace differs"):
+        agents.ensure("t/l", "ns2")
+    agents.close()
+
+
+def test_default_agent_mode_does_not_spawn(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    assert table.agents is None
+    _claim(table)
