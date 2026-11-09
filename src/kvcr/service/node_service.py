@@ -1436,6 +1436,34 @@ class SlotTable:
             total += os.fstat(slot.pool.meta_fd).st_size
         return populate_wait_s(total, self.ensure_timeout_s)
 
+    def _adopt_handback(self, slot: _Slot) -> None:
+        """Read the holder's unconditional hello before sending any layout."""
+        from .holder import receive_line_with_fds
+
+        slot.holder_conn.settimeout(self.ensure_timeout_s)
+        received = receive_line_with_fds(slot.holder_conn)
+        if received is None:
+            raise RuntimeError("holder closed before hello")
+        hello, fds = received
+        handback = hello.get("handback")
+        regions, _next_index, generation = slot.committed
+        expected = {
+            "regions": [
+                {"index": r.index, "offset": r.offset, "size": r.size, "fd_index": 0}
+                for r in regions
+            ],
+            "layout_generation": generation,
+        }
+        if slot.pool.meta_fd >= 0:
+            expected["meta"] = {"fd_index": 1, "size": self.meta_bytes}
+        if handback == expected and len(fds) == len(slot.pool.pass_fd_list()):
+            slot.pool.adopt(fds)  # ownership transfers; never resize adopted meta
+            return
+        for fd in fds:
+            os.close(fd)
+        if handback is not None or fds:
+            logger.warning("holder_handback_rejected: layout or fd count mismatch")
+
     def _send_layout(self, slot: _Slot) -> None:
         """Send the whole layout plus the pool fds; store the holder's report."""
         conn = slot.holder_conn
@@ -1519,6 +1547,7 @@ class SlotTable:
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(path)
+        self._adopt_handback(slot)
         self._send_layout(slot)
 
     @staticmethod

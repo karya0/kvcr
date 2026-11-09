@@ -294,6 +294,18 @@ class RegionPool:
             self._regions.append(region)
         self._next_index, self._generation = next_index, generation
 
+    def adopt(self, fds: list[int]) -> None:
+        """Replace an eager restored pool's memfds, preserving its layout."""
+        regions = list(self._regions)
+        next_index, generation = self._next_index, self._generation
+        self._unmap(regions)
+        os.close(self._fd)
+        if self._meta_fd >= 0:
+            os.close(self._meta_fd)
+        self._fd = fds[0]
+        self._meta_fd = fds[1] if len(fds) > 1 else -1
+        self.restore(regions, next_index, generation)
+
     @property
     def next_index(self) -> int:
         return self._next_index
