@@ -519,8 +519,10 @@ def test_silent_queue_head_is_dropped_after_twice_the_ensure_timeout(tmp_path, p
 
 
 def test_slot_state_persists_across_supervisor_restart(tmp_path, pools):
+    import uuid
+
     table, api = _table(tmp_path)
-    slot = _claim(table, total=2, minimum=2, maximum=8)
+    slot = _claim(table, uuid.uuid4().hex, total=2, minimum=2, maximum=8)
     table.grow("t/l/0", ME, 2 * PAGE, None)
     restarted = SlotTable(
         table.broker, HEADROOM + 64 * PAGE, require_pod_identity=False
@@ -530,10 +532,17 @@ def test_slot_state_persists_across_supervisor_restart(tmp_path, pools):
     assert again.pool.regions == slot.pool.regions
     assert again.pool.layout_generation == slot.pool.layout_generation
     assert (again.holder, again.digest) == (slot.holder, slot.digest)
-    assert again.claim_generation == slot.claim_generation and not again.held
+    assert again.claim_generation == slot.claim_generation and again.held
     assert restarted._epochs == table._epochs == {"t/l/0": 0}
     # The live holder is kept and re-claimed, not deleted and recreated.
     creates = len(api.creates)
+    now = [0.0]
+    restarted._clock = lambda: now[0]
+    restarted.start_quarantine()
+    with pytest.raises(SlotError) as held:
+        _claim(restarted, "b", total=2, minimum=2, maximum=8)
+    assert held.value.reason == SLOT_HELD
+    now[0] = restarted.lease_ttl_ms / 1000
     reclaimed = _claim(restarted, "b", total=2, minimum=2, maximum=8)
     assert (
         reclaimed is again and reclaimed.claim_generation == slot.claim_generation + 1

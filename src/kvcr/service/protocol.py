@@ -8,6 +8,7 @@ import hashlib
 import logging
 import mmap
 import os
+import select
 import socket
 import struct
 import threading
@@ -158,6 +159,7 @@ def region_table_digest(
 # Reason codes carried by _Error; a client branches on these, not on message.
 CAPACITY_BELOW_MINIMUM = "capacity_below_minimum"
 SLOT_HELD = "slot_held"
+SLOT_STALE = "slot_stale"
 IDENTITY_MISMATCH = "identity_mismatch"
 INCOMPATIBLE_LINEAGE = "incompatible_lineage"
 UNKNOWN_SLOT = "unknown_slot"
@@ -169,6 +171,7 @@ ERROR_REASONS = frozenset(
     {
         CAPACITY_BELOW_MINIMUM,
         SLOT_HELD,
+        SLOT_STALE,
         IDENTITY_MISMATCH,
         INCOMPATIBLE_LINEAGE,
         UNKNOWN_SLOT,
@@ -215,6 +218,7 @@ class _ClaimV2(msgspec.Struct, frozen=True, tag="claim2"):
     tenant: Annotated[str, msgspec.Meta(min_length=1)]
     lineage: Annotated[str, msgspec.Meta(min_length=1)]
     incarnation: Annotated[str, msgspec.Meta(min_length=1)] | None = None
+    claim_generation: int | None = None
     total_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
     minimum_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
     maximum_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
@@ -261,6 +265,8 @@ class _GrantedV2(msgspec.Struct, frozen=True, tag="granted2"):
     guard_endpoint: str
     dead_incarnations: tuple[str, ...] = ()
     heartbeat_enabled: bool = False
+    reattached: bool = False
+    lease_ttl_ms: int = 10000
 
 
 class _Grow(msgspec.Struct, frozen=True, tag="grow"):
@@ -348,6 +354,8 @@ class _ServiceState(msgspec.Struct, frozen=True, tag="service_state"):
 def _claim_fd_counts(
     request: "_Claim | _ClaimV2 | _ServiceInfo | _Drain | _Grow | _Shrink",
 ) -> tuple[int, ...]:
+    if isinstance(request, _ClaimV2) and request.claim_generation is not None:
+        return (2,)  # verified worker pidfd, retained TCP listener
     return (0, 1) if isinstance(request, (_Claim, _ClaimV2)) else (0,)
 
 
@@ -503,6 +511,11 @@ class KVCRPoolHold:
     regions: tuple[PoolRegion, ...] = ()
     region_fds: list[int] = field(default_factory=list, repr=False)
     guard_endpoint: str | None = None
+    _reconnect_request: _ClaimV2 | None = field(default=None, repr=False)
+    _socket_path: str | None = None
+    _lease_ttl_ms: int = 10000
+    _duplicate_listener: Callable[[], int] | None = field(default=None, repr=False)
+    _lease_error: BaseException | None = field(default=None, init=False, repr=False)
     _release_attempted: bool = field(default=False, init=False, repr=False)
     _heartbeat_stop: threading.Event = field(
         default_factory=threading.Event, init=False
@@ -510,16 +523,19 @@ class KVCRPoolHold:
     _send_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def __post_init__(self) -> None:
+        if self._reconnect_request is not None:
+            threading.Thread(target=self._watch_connection, daemon=True).start()
         if self._heartbeat_enabled:
             threading.Thread(target=self._heartbeat, daemon=True).start()
 
     def _heartbeat(self) -> None:
+        connection = self._connection
         while not self._heartbeat_stop.wait(_HEARTBEAT_SECONDS):
             with self._send_lock:
-                if self._heartbeat_stop.is_set():
+                if self._heartbeat_stop.is_set() or connection is not self._connection:
                     return
                 try:
-                    self._connection.send(_Heartbeat(_PROTOCOL_VERSION))
+                    connection.send(_Heartbeat(_PROTOCOL_VERSION))
                 except OSError:
                     return
 
@@ -530,6 +546,98 @@ class KVCRPoolHold:
             return
         adopt(self._control_listener_fd)
         self._control_listener_fd = None
+        owner = getattr(adopt, "__self__", None)
+        self._duplicate_listener = getattr(owner, "duplicate_listener", None)
+
+    def check_lease(self) -> None:
+        """Surface a terminal reconnect refusal to the owner of this hold."""
+        if self._lease_error is not None:
+            raise self._lease_error
+
+    def _watch_connection(self) -> None:
+        while not self._heartbeat_stop.wait(_HEARTBEAT_SECONDS):
+            try:
+                sock = self._connection._connection
+                if not select.select([sock], [], [], 0)[0]:
+                    continue
+                if sock.recv(1, socket.MSG_PEEK):
+                    continue
+            except (OSError, ValueError):
+                pass
+            while not self._heartbeat_stop.wait(min(1.0, self._lease_ttl_ms / 10000)):
+                try:
+                    self.reconnect()
+                    break
+                except (OSError, EOFError, KVCRSocketError):
+                    continue
+                except BaseException as error:
+                    self._lease_error = error
+                    if not self._heartbeat_stop.is_set():
+                        self._stop_local_access()
+                    return
+
+    def reconnect(self) -> None:
+        """Re-establish the same lease while retaining every mapped region."""
+        request = msgspec.structs.replace(
+            self._reconnect_request, claim_generation=self.claim_generation
+        )
+        listener = (
+            self._duplicate_listener()
+            if self._duplicate_listener is not None
+            else os.dup(self._control_listener_fd)
+        )
+        connection = None
+        received = []
+        try:
+            connection = FramedConnection.connect(self._socket_path)
+            pidfd = os.pidfd_open(os.getpid())
+            try:
+                connection.send_with_fd(request, pidfd, listener)
+            finally:
+                os.close(pidfd)
+            response, received = connection.receive_with_fd(
+                _CLAIM_RESPONSE_DECODER, _response_fd_counts
+            )
+            if isinstance(response, _ERRORS):
+                error = _service_error(response)
+                if getattr(response, "reason", None) == SLOT_STALE:
+                    self._lease_error = error
+                    self._stop_local_access()
+                raise error
+            if not isinstance(response, _GrantedV2) or not response.reattached:
+                raise KVCRServiceReasonError(
+                    "reconnect was not a reattachment", SLOT_STALE
+                )
+
+            def identity(fd):
+                st = os.fstat(fd)
+                return st.st_dev, st.st_ino, st.st_size
+
+            old = [*self.region_fds, self._attachment._file_descriptor]
+            if (
+                response.slot_name != self.slot_name
+                or response.claim_generation != self.claim_generation
+                or [identity(fd) for fd in received[2:]] != [identity(fd) for fd in old]
+            ):
+                raise KVCRServiceReasonError("reconnect backing changed", SLOT_STALE)
+            connection._connection.settimeout(None)
+            with self._send_lock:
+                previous, self._connection = self._connection, connection
+                connection = None
+                previous.close()
+            if self._heartbeat_enabled:
+                threading.Thread(target=self._heartbeat, daemon=True).start()
+        except KVCRServiceReasonError as error:
+            if error.reason == SLOT_STALE and self._lease_error is None:
+                self._lease_error = error
+                self._stop_local_access()
+            raise
+        finally:
+            os.close(listener)
+            for fd in received:
+                os.close(fd)
+            if connection is not None:
+                connection.close()
 
     def _stop_local_access(self) -> None:
         if self._data_map is not None:
@@ -724,6 +832,9 @@ class KVCRClient:
                 _incarnation=request.incarnation,
                 _dead_incarnations=response.dead_incarnations,
                 _heartbeat_enabled=response.heartbeat_enabled,
+                _reconnect_request=request if v2 else None,
+                _socket_path=self._socket_path if v2 else None,
+                _lease_ttl_ms=response.lease_ttl_ms if v2 else 10000,
                 **(_slot_fields(response, region_fds) if v2 else {}),
             )
         except BaseException as error:

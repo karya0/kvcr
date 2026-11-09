@@ -268,6 +268,15 @@ class _PoolRegistry:
             liveness, tier_config, control_bind, data_pool
         )
 
+    def reattach(
+        self, guard_index, tier_config, liveness, control_bind, data_pool, listener_fd
+    ):
+        if self._refusing.is_set():
+            raise KVCRServiceError("KVCR pool registry is closed")
+        return self._guard(guard_index).reattach(
+            liveness, tier_config, control_bind, data_pool, listener_fd
+        )
+
     def release(self, guard_index: int, lease: "_Lease") -> None:
         self._guard(guard_index).release(lease)
 
@@ -550,6 +559,7 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 _CLAIM_DECODER, _claim_fd_counts
             )
             worker_pidfd = worker_fds[0] if worker_fds else None
+            listener_fd = worker_fds[1] if len(worker_fds) > 1 else None
         except (EOFError, OSError):
             return
         except (KVCRGuardProtocolError, KVCRMsgFramingError) as error:
@@ -577,7 +587,9 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             liveness = PidfdLiveness.from_peer_socket(self.request, worker_pidfd)
             if isinstance(request, _ClaimV2):  # v2 claim: slot + peer identity
                 self._peer = _peer_identity(self.request)
-                response, grant = self.server.dispatch(request, liveness, self._peer)
+                response, grant = self.server.dispatch(
+                    request, liveness, self._peer, listener_fd=listener_fd
+                )
             else:  # v1 claim: untouched path
                 response, grant = self.server.dispatch(request, liveness)
         except SlotError as error:
@@ -590,6 +602,8 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             logger.exception("Unexpected failure while handling KVCR claim")
             response = _Error("internal KVCR service error", _PROTOCOL_VERSION)
 
+        if listener_fd is not None:
+            os.close(listener_fd)
         if grant is None:
             if liveness is not None:
                 liveness.close()
@@ -732,6 +746,8 @@ class _ThreadingUnixServer(
         connection, address = super().get_request()
         connection.settimeout(_CLIENT_IDLE_TIMEOUT_SECONDS)
         self.add_connection(connection)
+        if self.slots is not None:
+            self.slots.start_quarantine()
         return connection, address
 
     def service_actions(self) -> None:
@@ -742,6 +758,8 @@ class _ThreadingUnixServer(
         request: "_Claim | _ClaimV2",
         liveness: PidfdLiveness,
         peer: tuple[int, int, str | None] | None = None,
+        *,
+        listener_fd: int | None = None,
     ) -> "tuple[_Granted | _GrantedV2, tuple[int, int, _Lease]]":
         if request.compatibility_digest != self.compatibility_digest:
             raise KVCRServiceError(
@@ -766,6 +784,7 @@ class _ThreadingUnixServer(
                 or f"{request.control_host}:{request.control_port}",
                 peer=peer,
                 owner_alive=lambda: _pidfd_alive(liveness),
+                claim_generation=request.claim_generation,
                 waiter_fd=lambda: _dup_liveness_fd(liveness),
                 namespace=request.state_agent.namespace
                 if request.state_agent
@@ -776,7 +795,15 @@ class _ThreadingUnixServer(
         try:
             # Retain the Guard across a concurrent close; claim validates the request.
             guard = self.registry._guards.get(request.guard_index)
-            spec, pools, listener_fd, lease = self.registry.claim(
+            if slot is not None and slots.dead_incarnations:
+                guard.fence_incarnations(slots.dead_incarnations)
+            reattached = slot is not None and slot.reconnecting
+            incoming_listener = listener_fd
+            if reattached and incoming_listener is None:
+                raise KVCRServiceError("reconnect requires the retained listener")
+            grant_method = self.registry.reattach if reattached else self.registry.claim
+            extra = {"listener_fd": incoming_listener} if reattached else {}
+            spec, pools, listener_fd, lease = grant_method(
                 request.guard_index,
                 request.tier_config,
                 liveness,
@@ -794,12 +821,16 @@ class _ThreadingUnixServer(
                     len(slot.pool.regions),
                     slot.pool.meta_fd,
                 ),
+                **extra,
             )
             if guard is None:
                 raise KVCRServiceError("KVCR claim succeeded without a Guard")
         except BaseException:
             if slot is not None:
-                slots.vacate(slot.name, peer, generation)
+                if slot.reconnecting:
+                    slots._abort_claim(slot, False, generation)
+                else:
+                    slots.vacate(slot.name, peer, generation)
             raise
         common = (
             request.guard_index,
@@ -820,6 +851,8 @@ class _ThreadingUnixServer(
                 host = self.advertise_host
             granted = _GrantedV2(
                 *common,
+                reattached=reattached,
+                lease_ttl_ms=slots.lease_ttl_ms,
                 slot_name=slot.name,
                 effective_maximum_bytes=slot.effective_maximum_bytes,
                 regions=slot.pool.regions,
@@ -1092,6 +1125,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--health-dependency-url",
         help="optional HTTP readiness dependency; /ready requires it to return 200",
     )
+    parser.add_argument("--worker-lease-ttl-ms", type=int, default=10000)
     parser.add_argument(
         "--heartbeat-timeout-ms",
         type=float,
@@ -1169,6 +1203,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(
                 "--health-dependency-url requires --health-port and a valid HTTP(S) URL"
             )
+    if args.worker_lease_ttl_ms < 1000:
+        parser.error("--worker-lease-ttl-ms must be at least 1000")
     if args.heartbeat_timeout_ms is not None and not (
         _MIN_HEARTBEAT_TIMEOUT_SECONDS * 1000
         <= args.heartbeat_timeout_ms
@@ -1217,6 +1253,7 @@ def _build_slots(args: argparse.Namespace) -> SlotTable | None:
         args.slot_cap_bytes,
         require_pod_identity=args.require_pod_identity,
         journal_bytes=_DEFAULT_JOURNAL_BYTES,
+        lease_ttl_ms=args.worker_lease_ttl_ms,
     )
 
 

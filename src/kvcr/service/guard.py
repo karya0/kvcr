@@ -221,7 +221,9 @@ class _RecoveryState:
         self.attachment = KVCRPoolAttachment.attach(self._pool_spec, collapse=True)
         self._journal = RecoveryJournal(self.attachment)
 
-    def configure(self, pool_layouts: PoolBlockLayouts) -> None:
+    def configure(
+        self, pool_layouts: PoolBlockLayouts, *, recover: bool = True
+    ) -> None:
         """Take up an ordered layout and its prior recovery atomically."""
         if len(pool_layouts) != len(self._pool_sizes_bytes):
             raise ValueError("pool layout must match the number of pools in the Guard")
@@ -239,7 +241,7 @@ class _RecoveryState:
         on_stub = self._pool_spec != self._spec and (
             self.attachment._spec == self._pool_spec
         )
-        if mirror is None and not on_stub:
+        if recover and mirror is None and not on_stub:
             mirror = read_handback(self.attachment, self._compatibility_digest, pools)
         # Before _attach_meta, self.attachment is pool_{rank} on a first claim. A v2
         # stub holds no handback and its mapping does not reach these offsets, so
@@ -260,7 +262,7 @@ class _RecoveryState:
             self.meta_fd = os.dup(fd)
             self.meta_identity = (file_stat.st_dev, file_stat.st_ino)
 
-    def _attach_meta(self) -> None:
+    def _attach_meta(self, *, recover: bool = True) -> None:
         """Move journal and snapshot region from pool_{rank} to the slot's meta memfd.
 
         After any hand-back, which went to the attachment the last primary used.
@@ -276,8 +278,29 @@ class _RecoveryState:
         )
         self.attachment.close()
         self.attachment, self._journal = meta, RecoveryJournal(meta)
-        if meta.g2_index() is not None:
+        if recover and meta.g2_index() is not None:
             self.mirror = read_handback(meta, self._compatibility_digest, self.pools)
+
+    def reattach(self, pool_layouts: PoolBlockLayouts) -> None:
+        """Resume observation of a live producer without resetting its cursors."""
+        self.configure(pool_layouts, recover=False)
+        self._attach_meta(recover=False)
+        journal = self._journal
+        if journal.is_invalid():
+            self._drop_recovery(RecoveryJournalError("reattached journal is invalid"))
+            return
+        if self.attachment.layout_digest() != self.layout_digest():
+            raise RecoveryMirrorError("reattached data pool layout differs")
+        # P0 precedes the index scan: publications after this point are replayed
+        # over the scan, including writes completed while it was in progress.
+        published = journal._published.load_acquire()
+        journal._consumed.store_release(published)
+        journal._consumed_local = published
+        self.mirror = read_handback(
+            self.attachment, self._compatibility_digest, self.pools
+        )
+        self.mirror.adopt(_without_g3(self.mirror.take_records()))
+        self._backing = self.layout_digest(backing_only=True)
 
     def start_primary(self) -> None:
         """Arm recovery for the accepted primary and reset its journal."""
@@ -511,6 +534,7 @@ class _Guard:
         self._commands: queue.Queue[_Command] = queue.Queue()
         self._ops = {
             "claim": self._claim,
+            "reattach": self._reattach,
             "release": self._stand_down,
             "abort": self._abort,
             "close": self._close,
@@ -575,6 +599,37 @@ class _Guard:
         """
         self._reserve_claim()
         return self._submit(_Command("claim", (liveness, tier_config, bind, data_pool)))
+
+    def fence_incarnations(self, incarnations) -> None:
+        """Carry supervisor-confirmed lease expiry into Guard operation fencing."""
+        with self._phase_lock:
+            self._dead_incarnations.update(incarnations)
+
+    def reattach(
+        self,
+        liveness: PidfdLiveness,
+        tier_config: _TierConfig,
+        bind: tuple[str, int],
+        data_pool: tuple[int, int, Callable[..., bytes], str, int, int],
+        listener_fd: int,
+    ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
+        """Re-seat an admitted reconnect; the caller owns ``listener_fd``."""
+        with self._phase_lock:
+            live_reconnect = self._phase is _Phase.PRIMARY
+            if live_reconnect:
+                if (
+                    self._closing
+                    or self._failure is not None
+                    or self._reserved is not None
+                    or self._pool_lease.current.incarnation != liveness.incarnation
+                ):
+                    raise KVCRServiceError("KVCR Guard reconnect is not current")
+                self._reserved = _Phase.CLAIMING
+        if not live_reconnect:
+            self._reserve_claim()
+        return self._submit(
+            _Command("reattach", (liveness, tier_config, bind, data_pool, listener_fd))
+        )
 
     def release(self, lease: "_Lease") -> None:
         """End a lease. The pool keeps its Guard, and the Guard its records."""
@@ -991,6 +1046,68 @@ class _Guard:
                     self._escalate(unbind_error)
             if isinstance(error, (ValueError, RecoveryMirrorError)):
                 raise KVCRServiceError(str(error)) from error
+            raise
+
+    def _reattach(
+        self,
+        liveness: PidfdLiveness,
+        tier_config: _TierConfig,
+        bind: tuple[str, int],
+        data_pool: tuple[int, int, Callable[..., bytes], str, int, int],
+        listener_fd: int,
+    ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
+        """Restore the Guard around the worker's existing listener and pages."""
+        listener = socket.socket(fileno=os.dup(listener_fd))
+        control = None
+        granted_fd = -1
+        try:
+            if (
+                listener.family != socket.AF_INET
+                or listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+                != socket.SOCK_STREAM
+                or not listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+                or listener.getsockname()[:2] != bind
+            ):
+                raise KVCRServiceError("KVCR reconnect listener differs from claim")
+            self._refuse_incompatible(tier_config)
+            if len(tier_config.pool_layouts) != 1:
+                raise KVCRServiceReasonError(
+                    "a v2 data pool is one pool", DATA_POOL_LAYOUT
+                )
+            meta_spec(self._spec, data_pool[5])
+            granted_fd = os.dup(listener.fileno())
+            if self._phase is not _Phase.PRIMARY:
+                self._data_pool = data_pool
+                self._recovery.layout_digest = data_pool[2]
+                self._recovery.set_meta_fd(data_pool[5])
+                self._recovery.reattach(tier_config.pool_layouts)
+                control = ZmqPeerControlChannel.from_shared_listener(
+                    socket.socket(fileno=os.dup(listener.fileno()))
+                )
+                self._configured = tier_config
+                self._control = control
+                self._prepare_core()
+            with self._phase_lock:
+                if self._closing or self._refusing():
+                    raise KVCRServiceError("KVCR pool registry is closed")
+                old_lease = self._pool_lease.current
+                old_listener = self._pool_lease.listener
+                self._pool_lease.listener = listener
+                self._pool_lease.bind_address = bind
+                self._pool_lease.current = liveness
+                self._last_heartbeat = None
+                self._phase = _Phase.PRIMARY
+            if old_lease is not None and old_lease is not liveness:
+                old_lease.close()
+            if old_listener is not None:
+                old_listener.close()
+            return self._spec, self._recovery.pools, granted_fd, liveness
+        except BaseException:
+            if granted_fd >= 0:
+                os.close(granted_fd)
+            listener.close()
+            if control is not None:
+                control.close()
             raise
 
     def _stand_down(self, lease: "_Lease") -> None:
