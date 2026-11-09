@@ -1172,6 +1172,27 @@ def test_supervisor_agent_restarts_once(monkeypatch):
     agents.close()
 
 
+def test_supervisor_refuses_claim_when_agent_dead_after_restart(
+    monkeypatch, caplog
+):
+    spawned = []
+    monkeypatch.setattr(
+        node_service.subprocess,
+        "Popen",
+        lambda command, *, env: spawned.append(_AgentProcess()) or spawned[-1],
+    )
+    agents = node_service.LineageAgents(2)
+    agents.ensure("t/l", "ns1")
+    spawned[0].returncode = 1
+    agents.ensure("t/l", "ns1")  # dead first child: the one restart
+    assert len(spawned) == 2
+    spawned[1].returncode = 1
+    with caplog.at_level("ERROR"), pytest.raises(ValueError, match="dead"):
+        agents.ensure("t/l", "ns1")
+    assert len(spawned) == 2 and "lineage agent dead lineage=t/l" in caplog.text
+    agents.close()
+
+
 def test_supervisor_refuses_second_lineage_agent(monkeypatch, caplog):
     spawned = []
     monkeypatch.setattr(
