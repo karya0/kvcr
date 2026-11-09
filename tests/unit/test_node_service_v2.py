@@ -1508,6 +1508,36 @@ def test_dgd_api_error_does_not_fail_claim_with_free_capacity(tmp_path, pools):
     assert _lineage_claim(table, "new").name == "t/new/0"
 
 
+def test_slow_dgd_poll_blocks_neither_accept_loop_nor_slot_lock(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path)
+    dgd.put("l", "X")
+    _lineage_claim(table)
+    del dgd.crs["l"]
+    entered, release = threading.Event(), threading.Event()
+    original = dgd.get
+
+    def slow_get(name):
+        if name == "l":
+            entered.set()
+            release.wait(10)
+        return original(name)
+
+    dgd.get = slow_get
+    srv = object.__new__(server._ThreadingUnixServer)
+    srv.slots, srv._next_dgd_poll, srv._dgd_poller = table, 0.0, None
+    started = time.monotonic()
+    srv.service_actions()
+    assert entered.wait(2) and time.monotonic() - started < 1
+    srv.service_actions()  # in flight: no second poller
+    assert table._lock.acquire(timeout=1)
+    table._lock.release()
+    dgd.put("new", "N")
+    assert _lineage_claim(table, "new").name == "t/new/0"
+    release.set()
+    srv._dgd_poller.join(5)
+    assert table._lineages["t/l"]["retained_at"] is not None
+
+
 def test_dgd_registry_persists(tmp_path, pools):
     table, dgd = _retention_table(tmp_path)
     dgd.put("l", "X")
