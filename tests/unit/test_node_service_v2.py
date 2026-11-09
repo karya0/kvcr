@@ -1334,9 +1334,7 @@ def test_supervisor_agent_restarts_once(monkeypatch):
     agents.close()
 
 
-def test_supervisor_refuses_claim_when_agent_dead_after_restart(
-    monkeypatch, caplog
-):
+def test_supervisor_refuses_claim_when_agent_dead_after_restart(monkeypatch, caplog):
     spawned = []
     monkeypatch.setattr(
         node_service.subprocess,
