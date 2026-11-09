@@ -1446,7 +1446,8 @@ class SlotTable:
             self._persist()
 
     def _reclaim_for(self, tenant: str, name: str, minimum: int) -> None:
-        if self.dgd_api is None:
+        # Free capacity needs no DGD reads, so an API outage cannot fail it.
+        if self.dgd_api is None or self._available(tenant, name) >= minimum:
             return
         from .protocol import SLOT_HELD
 

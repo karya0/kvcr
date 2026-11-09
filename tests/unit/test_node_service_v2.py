@@ -1328,6 +1328,24 @@ def test_dgd_never_reclaims_live_or_unreadable(tmp_path, pools, protected):
     assert table.get(slot.name) is slot
 
 
+def test_dgd_api_error_does_not_fail_claim_with_free_capacity(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path, pages=8)
+    dgd.put("l", "X")
+    _lineage_claim(table)
+    del dgd.crs["l"]
+    table.poll_dgds()
+    dgd.put("new", "N")
+    original = dgd.get
+
+    def get(name):
+        if name == "l":
+            raise node_service.PodAPIError(503, "GET")
+        return original(name)
+
+    dgd.get = get
+    assert _lineage_claim(table, "new").name == "t/new/0"
+
+
 def test_dgd_registry_persists(tmp_path, pools):
     table, dgd = _retention_table(tmp_path)
     dgd.put("l", "X")
