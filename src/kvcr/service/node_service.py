@@ -1420,13 +1420,20 @@ class SlotTable:
     def poll_dgds(self) -> None:
         if self.dgd_api is None:
             return
+        # API reads happen outside _lock so an outage cannot stall slot RPCs.
         with self._lock:
-            for key, rec in self._lineages.items():
-                try:
-                    cr = self._dgd(key.split("/", 1)[1])
-                except SlotError:
-                    logger.warning("DGD poll failed lineage=%s", key)
-                    continue
+            bound = [(key, rec["dgd_uid"]) for key, rec in self._lineages.items()]
+        results = []
+        for key, uid in bound:
+            try:
+                results.append((key, uid, self._dgd(key.split("/", 1)[1])))
+            except SlotError:
+                logger.warning("DGD poll failed lineage=%s", key)
+        with self._lock:
+            for key, uid, cr in results:
+                rec = self._lineages.get(key)
+                if rec is None or rec["dgd_uid"] != uid:
+                    continue  # rebound while the read was in flight
                 deletion = cr and cr["metadata"].get("deletionTimestamp")
                 if (cr is None or deletion) and rec["retained_at"] is None:
                     rec["retained_at"] = (

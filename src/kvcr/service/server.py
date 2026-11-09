@@ -791,6 +791,7 @@ class _ThreadingUnixServer(
         if slots is not None:
             slots.stand_down = registry.reclaim_slot
         self._next_dgd_poll = 0.0
+        self._dgd_poller: threading.Thread | None = None
         self.advertise_host = advertise_host
         registry.on_uncontained_failure = self.fail
         self.compatibility_digest = compatibility_digest
@@ -815,8 +816,17 @@ class _ThreadingUnixServer(
 
     def service_actions(self) -> None:
         self._last_progress = time.monotonic()
-        if self.slots is not None and time.monotonic() >= self._next_dgd_poll:
-            self.slots.poll_dgds()
+        # DGD reads run off the accept thread: an API outage must not stall it.
+        if (
+            self.slots is not None
+            and self.slots.dgd_api is not None
+            and time.monotonic() >= self._next_dgd_poll
+            and not (self._dgd_poller and self._dgd_poller.is_alive())
+        ):
+            self._dgd_poller = threading.Thread(
+                target=self.slots.poll_dgds, name="kvcr-dgd-poll", daemon=True
+            )
+            self._dgd_poller.start()
             self._next_dgd_poll = time.monotonic() + self.slots.dgd_poll_seconds
         if self.slots is not None and self.slots.agents is not None:
             with self.slots._lock:
