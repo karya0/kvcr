@@ -47,7 +47,13 @@ from .memory import (
     _unlink_if_identity,
 )
 from .node_service import _JOURNAL_BYTES as _NODE_JOURNAL_BYTES
-from .node_service import InClusterPodAPI, NodeBroker, SlotError, SlotTable
+from .node_service import (
+    InClusterDGDAPI,
+    InClusterPodAPI,
+    NodeBroker,
+    SlotError,
+    SlotTable,
+)
 from .protocol import (
     _CLAIM_DECODER,
     _HOLD_DECODER,
@@ -126,62 +132,92 @@ class _PoolRegistry:
             logger.critical, "Uncontained KVCR pool failure: %s"
         )
         self._purge_orphaned_pools()
-        mapping_bytes = journal_bytes + sum(pool_sizes_bytes)
+        self._guard_options = (
+            pool_sizes_bytes,
+            journal_bytes,
+            compatibility_digest,
+            heartbeat_timeout_seconds,
+            startup_timeout_seconds,
+            v2_slots,
+        )
         for rank in range(guard_count):
             try:
                 # v2 journals and snapshots in the slot's holder-charged meta memfd
                 # and serves the slot's regions, so pool_{rank} is a sparse stub the
                 # supervisor is not charged for. The grant still describes the full
                 # layout (journal_bytes sizes the meta journal); only the file is small.
-                owner = _KVCRPoolOwner.allocate(
-                    pool_id=f"pool_{rank}",
-                    pool_size_bytes=(
-                        _V2_STUB_JOURNAL_BYTES + mmap.PAGESIZE
-                        if v2_slots
-                        else mapping_bytes
-                    ),
-                    journal_bytes=(
-                        _V2_STUB_JOURNAL_BYTES if v2_slots else journal_bytes
-                    ),
-                    pool_dir=self._pool_dir,
-                    populate=not v2_slots,
-                )
-                grant_spec = (
-                    msgspec.structs.replace(
-                        owner.spec,
-                        mapping_bytes=mapping_bytes,
-                        journal_bytes=journal_bytes,
-                    )
-                    if v2_slots
-                    else owner.spec
-                )
-                # Built with the group, not a claim: a Guard that cannot attach its
-                # allocation is better discovered at startup than when a worker dies.
-                try:
-                    guard = _Guard(
-                        grant_spec,
-                        functools.partial(self._guard_failed, rank),
-                        pool_spec=owner.spec,
-                        compatibility_digest=compatibility_digest,
-                        guard_index=rank,
-                        pool_sizes_bytes=pool_sizes_bytes,
-                        owner=owner,
-                        refusing=self._refusing.is_set,
-                        heartbeat_timeout_seconds=heartbeat_timeout_seconds,
-                        startup_timeout_seconds=startup_timeout_seconds,
-                    )
-                except BaseException:
-                    # Nothing has recorded this pool group yet, so the sweep
-                    # below cannot reach it and its file would outlive the process.
-                    owner.close()
-                    raise
-                # Recorded before it starts, so a failed preparation is rolled back by
-                # the sweep below.
+                guard = self._new_guard(rank)
                 self._guards[rank] = guard
                 guard.start()
             except BaseException:
                 self._release_pools()
                 raise
+
+    def _new_guard(self, rank):
+        (
+            pool_sizes_bytes,
+            journal_bytes,
+            compatibility_digest,
+            heartbeat_timeout_seconds,
+            startup_timeout_seconds,
+            v2_slots,
+        ) = self._guard_options
+        mapping_bytes = journal_bytes + sum(pool_sizes_bytes)
+        owner = _KVCRPoolOwner.allocate(
+            pool_id=f"pool_{rank}",
+            pool_size_bytes=(
+                _V2_STUB_JOURNAL_BYTES + mmap.PAGESIZE if v2_slots else mapping_bytes
+            ),
+            journal_bytes=(_V2_STUB_JOURNAL_BYTES if v2_slots else journal_bytes),
+            pool_dir=self._pool_dir,
+            populate=not v2_slots,
+        )
+        grant_spec = (
+            msgspec.structs.replace(
+                owner.spec,
+                mapping_bytes=mapping_bytes,
+                journal_bytes=journal_bytes,
+            )
+            if v2_slots
+            else owner.spec
+        )
+        # Built with the group, not a claim: a Guard that cannot attach its
+        # allocation is better discovered at startup than when a worker dies.
+        try:
+            guard = _Guard(
+                grant_spec,
+                functools.partial(self._guard_failed, rank),
+                pool_spec=owner.spec,
+                compatibility_digest=compatibility_digest,
+                guard_index=rank,
+                pool_sizes_bytes=pool_sizes_bytes,
+                owner=owner,
+                refusing=self._refusing.is_set,
+                heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+                startup_timeout_seconds=startup_timeout_seconds,
+            )
+        except BaseException:
+            # Nothing has recorded this pool group yet, so the sweep
+            # below cannot reach it and its file would outlive the process.
+            owner.close()
+            raise
+        return guard
+
+    def reclaim_slot(self, name: str) -> None:
+        from .protocol import SLOT_HELD
+
+        rank = int(name.rsplit("/", 1)[1])
+        guard = self._guard(rank)
+        if guard._data_pool is None or guard._data_pool[3] != name:
+            return  # This Guard no longer maps the victim.
+        if not guard.begin_drain():
+            raise SlotError(SLOT_HELD, "Guard still has a live peer; retry")
+        if guard.finish_close(time.monotonic() + _REGISTRY_TRANSITION_TIMEOUT_SECONDS):
+            raise SlotError(SLOT_HELD, "Guard has not quiesced; retry")
+        guard.reclaim_pool()
+        replacement = self._new_guard(rank)
+        self._guards[rank] = replacement
+        replacement.start()
 
     def _release_pools(self) -> None:
         """Give back every pool group built so far after a failed startup."""
@@ -738,6 +774,9 @@ class _ThreadingUnixServer(
     ) -> None:
         self.registry = registry
         self.slots = slots
+        if slots is not None:
+            slots.stand_down = registry.reclaim_slot
+        self._next_dgd_poll = 0.0
         self.advertise_host = advertise_host
         registry.on_uncontained_failure = self.fail
         self.compatibility_digest = compatibility_digest
@@ -762,6 +801,9 @@ class _ThreadingUnixServer(
 
     def service_actions(self) -> None:
         self._last_progress = time.monotonic()
+        if self.slots is not None and time.monotonic() >= self._next_dgd_poll:
+            self.slots.poll_dgds()
+            self._next_dgd_poll = time.monotonic() + self.slots.dgd_poll_seconds
         if self.slots is not None and self.slots.agents is not None:
             with self.slots._lock:
                 self.slots.agents.upkeep()
@@ -1172,6 +1214,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="host in v2 grants' guard_endpoint (default: the claim's control host)",
     )
     parser.add_argument("--manager-id", default="gaas")
+    parser.add_argument("--retention-seconds", type=float, default=600)
+    parser.add_argument("--dgd-poll-seconds", type=float, default=5)
     parser.add_argument(
         "--state-agent-mode", choices=("dgd", "supervisor"), default="dgd"
     )
@@ -1232,6 +1276,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--heartbeat-timeout-ms must be at least 1000 and finite")
     if args.startup_timeout_seconds is not None and args.startup_timeout_seconds <= 0:
         parser.error("--startup-timeout-seconds must be positive")
+    if not (0 <= args.retention_seconds < float("inf")) or not (
+        0 < args.dgd_poll_seconds < float("inf")
+    ):
+        parser.error(
+            "retention must be nonnegative and poll interval positive, both finite"
+        )
     if args.slot_cap_bytes is not None:
         if args.slot_cap_bytes <= 0:
             parser.error("--slot-cap-bytes must be positive")
@@ -1275,6 +1325,11 @@ def _build_slots(args: argparse.Namespace) -> SlotTable | None:
         lease_ttl_ms=args.worker_lease_ttl_ms,
         state_agent_mode=args.state_agent_mode,
         state_agent_max_slots=args.guard_count,
+        dgd_api=InClusterDGDAPI(args.namespace)
+        if args.state_agent_mode == "supervisor"
+        else None,
+        retention_seconds=args.retention_seconds,
+        dgd_poll_seconds=args.dgd_poll_seconds,
     )
 
 
