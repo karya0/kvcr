@@ -389,7 +389,10 @@ class _RecoveryState:
                     for frame in self._journal.drain():
                         mirror.apply(*frame)
                 rebuild_g2_mirror(
-                    self.attachment, tuple(pool.name for pool in self.pools), mirror
+                    self.attachment,
+                    tuple(pool.name for pool in self.pools),
+                    mirror,
+                    promotion=True,
                 )
                 records = mirror.take_records()
             except (RecoveryJournalError, RecoveryMirrorError) as error:

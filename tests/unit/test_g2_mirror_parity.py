@@ -77,6 +77,48 @@ def test_promotion_rescans_index_without_consulting_g2_journal():
     state._journal.drain.assert_not_called()
 
 
+def test_live_reattach_preserves_in_flight_store_for_later_promotion(monkeypatch):
+    index = _index()
+    parts = [("pool:a", 1)]
+    assert index.reserve(b"key", parts)
+    writer = index.store_steps(b"key", parts, 7)
+    for _ in range(30):
+        next(writer)
+    # Attach to the same bytes while the primary is midway through publication.
+    attached = G2Index(index.buffer)
+    pool = Mock(g2_index=Mock(return_value=attached))
+    pool._spec = SimpleNamespace()
+    pools = (_PoolDescriptor("pool", 8192, 1024),)
+    monkeypatch.setattr(
+        recovery, "read_recovery_snapshot", Mock(side_effect=AssertionError)
+    )
+    before = bytes(index.buffer)
+    mirror = recovery.read_handback(pool, "digest", pools, has_g3=False)
+    assert _projection(mirror.take_records()) == {}
+    assert bytes(index.buffer) == before
+    # The primary can finish without having had its partially written payload cleared.
+    list(writer)
+    recovery.rebuild_g2_mirror(pool, ("pool",), mirror, promotion=True)
+    assert _projection(mirror.take_records()) == {b"key": (parts, 7)}
+
+
+def test_only_promotion_reclaims_an_abandoned_in_flight_slot():
+    index = _index()
+    parts = [("pool:a", 1)]
+    assert index.reserve(b"key", parts)
+    writer = index.store_steps(b"key", parts, 7)
+    for _ in range(30):
+        next(writer)
+    pool = Mock(g2_index=Mock(return_value=G2Index(index.buffer)))
+    mirror = recovery._RecoveryMirror(("pool",))
+    before = bytes(index.buffer)
+    recovery.rebuild_g2_mirror(pool, ("pool",), mirror)
+    assert bytes(index.buffer) == before
+    recovery.rebuild_g2_mirror(pool, ("pool",), mirror, promotion=True)
+    assert index.buffer[64 + 64 : 64 + 2 * 64] == bytes(64)
+    assert _projection(mirror.take_records()) == {}
+
+
 @pytest.mark.parametrize("indexed", [False, True])
 def test_g2_journal_depends_on_index_presence(monkeypatch, indexed):
     source = Mock()

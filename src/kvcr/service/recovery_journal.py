@@ -812,8 +812,12 @@ def read_handback(
     return mirror
 
 
-def rebuild_g2_mirror(pool, pool_names, mirror) -> None:
-    """Replace the G2 projection with committed index entries, never old frames."""
+def rebuild_g2_mirror(pool, pool_names, mirror, *, promotion=False) -> None:
+    """Scan committed entries; only a fenced promotion may reclaim slots.
+
+    Reattachment can race a primary's store, so the default scan must leave
+    in-flight entries and their payload intact for that writer to finish.
+    """
     index = pool.g2_index()
     if index is None:
         return
@@ -824,7 +828,7 @@ def rebuild_g2_mirror(pool, pool_names, mirror) -> None:
     records = mirror.take_records()
     for record in records.values():
         record.local_dram = None
-    rebuilt = rebuild({pool_names[0]: index}, promotion=True)
+    rebuilt = rebuild({pool_names[0]: index}, promotion=promotion)
     for key, (slots, position) in rebuilt.items():
         record = records.setdefault(BlockKey(key), _BlockRecord())
         record.local_dram = _LocalDramResidency(slots, _LocalDramState.READY)
