@@ -36,9 +36,11 @@ from kvcr.service.protocol import (
     _RELEASE_RESPONSE_DECODER,
     PidfdLiveness,
     _Claim,
+    _ClaimV2,
     _Error,
     _G3Config,
     _Granted,
+    _GrantedV2,
     _PoolDescriptor,
     _Release,
     _Released,
@@ -1593,6 +1595,68 @@ def _manual_pool_spec(directory: Path, size: int = 12288, journal: int = 8192):
         inode=file_stat.st_ino,
         mapping_bytes=size,
         journal_bytes=journal,
+    )
+
+
+@pytest.mark.parametrize(
+    "reattached,delivery_fails", [(True, False), (False, False), (True, True)]
+)
+def test_worker_reattached_log_requires_delivered_reconnect_grant(
+    tmp_path, monkeypatch, caplog, reattached, delivery_fails
+):
+    spec = _manual_pool_spec(tmp_path)
+    request = _ClaimV2(
+        0,
+        _TEST_DIGEST,
+        _TEST_TIER_CONFIG,
+        "127.0.0.1",
+        5555,
+        1,
+        "tenant",
+        "lineage",
+        incarnation="worker-a",
+    )
+    response = _GrantedV2(
+        0,
+        spec,
+        _TEST_TIER_CONFIG,
+        (),
+        1,
+        "tenant/lineage/0",
+        4096,
+        (),
+        1,
+        7,
+        "127.0.0.1:5555",
+        reattached=reattached,
+    )
+    handler = object.__new__(_RequestHandler)
+    handler.request = Mock()
+    handler.server = Mock()
+    handler.server.dispatch.return_value = (
+        response,
+        (0, os.open(os.devnull, os.O_RDONLY), object()),
+    )
+    handler.server.slots.pool_fds.return_value = []
+    handler.channel = Mock()
+    handler.channel.receive_with_fd.return_value = (request, [])
+    if delivery_fails:
+        handler.channel.send_with_fd.side_effect = OSError("delivery failed")
+    handler._await_release = Mock()
+    monkeypatch.setattr("kvcr.service.server._peer_identity", Mock())
+    monkeypatch.setattr(PidfdLiveness, "from_peer_socket", Mock())
+    caplog.set_level(logging.INFO, logger="kvcr.service.server")
+
+    handler.handle()
+
+    events = [m for m in caplog.messages if "event=worker_reattached" in m]
+    assert events == (
+        [
+            "event=worker_reattached worker_id=0 incarnation=worker-a "
+            "claim_generation=7 pool=engine slot=tenant/lineage/0 reattached=true"
+        ]
+        if reattached and not delivery_fails
+        else []
     )
 
 

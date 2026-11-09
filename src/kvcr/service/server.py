@@ -648,6 +648,16 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                 else self.server.slots.pool_fds(self._slot_name)
             )
             self.channel.send_with_fd(response, pool_fd, listener_fd, *region_fds)
+            if isinstance(response, _GrantedV2) and response.reattached:
+                logger.info(
+                    "event=worker_reattached worker_id=%s incarnation=%s "
+                    "claim_generation=%s pool=%s slot=%s reattached=true",
+                    response.guard_index,
+                    request.incarnation,
+                    response.claim_generation,
+                    response.spec.pool_id,
+                    response.slot_name,
+                )
         # The lease is already granted and the send may have partially
         # crossed: releasing could double-grant a pool a claimant just mapped.
         # Hold it instead, under the same fencing as any lease: the claimant's
