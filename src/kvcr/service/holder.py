@@ -80,6 +80,8 @@ def receive_line_with_fds(
             for level, kind, payload in ancillary:
                 if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
                     fds.frombytes(payload[: len(payload) - len(payload) % fds.itemsize])
+            if _flags & socket.MSG_CTRUNC:
+                raise ValueError("truncated holder ancillary data")
             if not chunk:
                 for fd in fds:
                     os.close(fd)

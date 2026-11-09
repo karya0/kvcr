@@ -914,6 +914,7 @@ def test_restored_slot_adopts_the_holders_handback(tmp_path, pools, monkeypatch)
                 for r in slot.pool.regions
             ],
             "layout_generation": slot.pool.layout_generation,
+            "incarnation": slot.incarnation,
             "meta": {"fd_index": 1, "size": table.meta_bytes},
         },
         "fds": slot.pool.pass_fd_list(),
@@ -967,7 +968,8 @@ def test_restored_slot_adopts_the_holders_handback(tmp_path, pools, monkeypatch)
 
         monkeypatch.setattr(os, "close", close)
         holder.hello(peer, bad)
-        restarted._adopt_handback(again)
+        with pytest.raises(ValueError, match="handback"):
+            restarted._adopt_handback(again)
         assert len(closed) == 2
         for fd in closed:
             with pytest.raises(OSError):
@@ -976,3 +978,102 @@ def test_restored_slot_adopts_the_holders_handback(tmp_path, pools, monkeypatch)
     finally:
         sup.close()
         peer.close()
+
+
+def _handback(slot, table):
+    return {
+        "layout": {
+            "regions": [
+                {"index": r.index, "offset": r.offset, "size": r.size, "fd_index": 0}
+                for r in slot.pool.regions
+            ],
+            "layout_generation": slot.pool.layout_generation,
+            "incarnation": slot.incarnation,
+            "meta": {"fd_index": 1, "size": table.meta_bytes},
+        },
+        "fds": slot.pool.pass_fd_list(),
+    }
+
+
+def test_live_handback_does_not_remap(tmp_path, pools, monkeypatch):
+    table, _ = _table(tmp_path)
+    slot = _claim(table)
+    sup, peer = socket.socketpair()
+    slot.holder_conn = sup
+
+    def unexpected_adopt(*args):
+        pytest.fail("a live pool must not be remapped")
+
+    monkeypatch.setattr(RegionPool, "adopt", unexpected_adopt)
+    try:
+        holder.hello(peer, _handback(slot, table))
+        table._adopt_handback(slot)
+    finally:
+        sup.close()
+        peer.close()
+
+
+@pytest.mark.parametrize("bad", ["envelope", "incarnation", "missing", "size"])
+def test_bad_restored_handback_is_quarantined(tmp_path, pools, monkeypatch, bad):
+    table, _ = _table(tmp_path)
+    slot = _claim(table)
+    restarted = SlotTable(
+        table.broker, HEADROOM + 64 * PAGE, require_pod_identity=False
+    )
+    again = restarted.get("t/l/0")
+    sup, peer = socket.socketpair()
+    again.holder_conn = sup
+    held = _handback(slot, table)
+    closed = []
+    real_close = os.close
+
+    def close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    try:
+        if bad == "envelope":
+            socket.send_fds(peer, [b"[]\n"], held["fds"])
+        elif bad == "missing":
+            holder.hello(peer, None)
+        else:
+            if bad == "incarnation":
+                held["layout"]["incarnation"] += 1
+            else:
+                os.ftruncate(held["fds"][0], 1)
+            holder.hello(peer, held)
+        monkeypatch.setattr(os, "close", close)
+        with pytest.raises(ValueError, match="holder"):
+            restarted._adopt_handback(again)
+        assert again.restored_pool
+        assert len(closed) == (0 if bad == "missing" else 2)
+        for fd in closed:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+    finally:
+        sup.close()
+        peer.close()
+
+
+def test_failed_feed_drops_connection(tmp_path, pools, monkeypatch):
+    table, _ = _table(tmp_path)
+    slot = _claim(table)
+    table.broker.toucher = True
+    path = table.broker.holder_socket_path(
+        table.broker._load(node_service.PoolClaim.parse(slot.holder))
+    )
+
+    def bad_holder():
+        with holder.connect(path, 10) as conn:
+            conn.sendall(b"[]\n")
+            assert conn.recv(1) == b""  # no fresh layout follows a rejected hello
+
+    thread = threading.Thread(target=bad_holder)
+    thread.start()
+    try:
+        with pytest.raises(ValueError, match="hello"):
+            table._feed_holder(slot)
+        assert slot.holder_conn is None
+    finally:
+        thread.join(10)
+        assert not thread.is_alive()
