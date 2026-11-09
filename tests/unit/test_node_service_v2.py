@@ -1176,3 +1176,306 @@ def test_default_agent_mode_does_not_spawn(tmp_path, pools):
     table, _ = _table(tmp_path)
     assert table.agents is None
     _claim(table)
+
+
+class FakeDGDAPI:
+    def __init__(self):
+        self.crs = {}
+        self.error = None
+
+    def get(self, name):
+        if self.error:
+            raise self.error
+        return self.crs.get(name)
+
+    def put(self, name, uid, **metadata):
+        self.crs[name] = {"metadata": {"uid": uid, **metadata}}
+
+
+def _retention_table(tmp_path, pages=8, **kwargs):
+    dgd = FakeDGDAPI()
+    broker = make_broker(tmp_path, FakeAPI())
+    table = SlotTable(
+        broker,
+        HEADROOM + pages * PAGE,
+        require_pod_identity=False,
+        dgd_api=dgd,
+        **kwargs,
+    )
+    return table, dgd
+
+
+def _lineage_claim(table, lineage="l", claim_id="a", alive=lambda: False):
+    return table.claim(
+        "t",
+        lineage,
+        0,
+        total=4 * PAGE,
+        minimum=4 * PAGE,
+        maximum=None,
+        digest=DIGEST,
+        claim_id=claim_id,
+        peer=ME,
+        owner_alive=alive,
+    )
+
+
+@pytest.mark.parametrize("deleting", [False, True])
+def test_dgd_retained_rebind_fail_closed(tmp_path, pools, caplog, deleting):
+    from kvcr.service.protocol import SLOT_STALE
+
+    table, dgd = _retention_table(tmp_path, wall_clock=lambda: 1000)
+    dgd.put("l", "X")
+    slot = _lineage_claim(table)
+    holder_before = copy.deepcopy(slot.holder)
+    pool_before = slot.pool
+    if deleting:
+        dgd.put("l", "X", deletionTimestamp="1970-01-01T00:15:00Z")
+    else:
+        del dgd.crs["l"]
+    with caplog.at_level("INFO"):
+        table.poll_dgds()
+    assert table._lineages["t/l"]["retained_at"] == (900 if deleting else 1000)
+    assert slot.pool is pool_before and slot.holder == holder_before
+    assert "lineage retained" in caplog.text
+    dgd.put("l", "X")
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table, claim_id="old")
+    assert raised.value.reason == INTERNAL
+    dgd.error = node_service.PodAPIError(503, "GET")
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table)
+    assert raised.value.reason == INTERNAL
+    dgd.error = None
+    dgd.put("l", "Y")
+    with caplog.at_level("INFO"):
+        assert _lineage_claim(table, claim_id="new") is slot
+    assert table._lineages["t/l"]["dgd_uid"] == "Y"
+    assert caplog.text.count("lineage rebind") == 1
+    dgd.put("l", "Z")
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table, claim_id="third")
+    assert raised.value.reason == SLOT_STALE
+
+
+def test_dgd_pressure_reclaims_expired_first_and_stands_down(
+    tmp_path, pools, monkeypatch
+):
+    now = [1000]
+    table, dgd = _retention_table(tmp_path, wall_clock=lambda: now[0])
+    dgd.put("fresh", "F", annotations={"gaas.nvidia.com/retention": "1000"})
+    dgd.put("expired", "E", annotations={"gaas.nvidia.com/retention": "1"})
+    fresh = _lineage_claim(table, "fresh")
+    expired = _lineage_claim(table, "expired")
+    dgd.crs.clear()
+    table.poll_dgds()
+    now[0] += 10
+    order = []
+    table.stand_down = lambda name: order.append((name, "stand-down"))
+    real_close = type(expired.pool).close
+
+    def close(pool):
+        name = "t/expired/0" if pool is expired.pool else "t/fresh/0"
+        order.append((name, "close"))
+        return real_close(pool)
+
+    monkeypatch.setattr(type(expired.pool), "close", close)
+    dgd.put("new", "N")
+    _lineage_claim(table, "new")
+    assert table.get(expired.name) is None and table.get(fresh.name) is fresh
+    assert order[:2] == [(expired.name, "stand-down"), (expired.name, "close")]
+    dgd.put("next", "Q")
+    _lineage_claim(table, "next")
+    assert table.get(fresh.name) is None
+
+
+@pytest.mark.parametrize("protected", ["peer", "cr", "error"])
+def test_dgd_never_reclaims_live_or_unreadable(tmp_path, pools, protected):
+    table, dgd = _retention_table(tmp_path, pages=4)
+    dgd.put("l", "X")
+    live = [False]
+    slot = _lineage_claim(table, alive=lambda: live[0])
+    del dgd.crs["l"]
+    table.poll_dgds()
+    dgd.put("new", "N")
+    if protected == "peer":
+        live[0] = True
+    elif protected == "cr":
+        dgd.put("l", "Y")
+    else:
+        original = dgd.get
+        dgd.get = lambda name: (
+            (_ for _ in ()).throw(node_service.PodAPIError(503, "GET"))
+            if name == "l"
+            else original(name)
+        )
+    table.stand_down = lambda name: pytest.fail("live lineage stood down")
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table, "new")
+    assert raised.value.reason in (SLOT_HELD, INTERNAL)
+    assert table.get(slot.name) is slot
+
+
+def test_dgd_registry_persists(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path)
+    dgd.put("l", "X")
+    _lineage_claim(table)
+    del dgd.crs["l"]
+    table.poll_dgds()
+    restored = SlotTable(
+        table.broker, table.cap_bytes, require_pod_identity=False, dgd_api=dgd
+    )
+    assert restored._lineages == table._lineages
+    assert "agent_pid" not in json.dumps(restored._lineages)
+
+
+def test_dgd_retained_agent_lives_until_last_reclaim(
+    tmp_path, pools, monkeypatch, caplog
+):
+    spawned = []
+
+    def spawn(command, *, env):
+        child = _AgentProcess()
+        spawned.append((command, env, child))
+        return child
+
+    monkeypatch.setattr(node_service.subprocess, "Popen", spawn)
+    table, dgd = _retention_table(tmp_path, pages=4, state_agent_mode="supervisor")
+    dgd.put("l", "X")
+    slot = table.claim(
+        "t",
+        "l",
+        0,
+        total=4 * PAGE,
+        minimum=4 * PAGE,
+        maximum=None,
+        digest=DIGEST,
+        claim_id="old",
+        peer=ME,
+        owner_alive=lambda: False,
+        namespace="ns1",
+    )
+    command, env, child = spawned[0]
+    assert "dynamo.kv_state_agent" in command and env["DYN_NAMESPACE"] == "ns1"
+    del dgd.crs["l"]
+    with caplog.at_level("INFO"):
+        table.poll_dgds()
+    assert child.poll() is None and "lineage retained" in caplog.text
+    table.stand_down = lambda name: None
+    dgd.put("new", "Y")
+    table.claim(
+        "t",
+        "new",
+        0,
+        total=4 * PAGE,
+        minimum=4 * PAGE,
+        maximum=None,
+        digest=DIGEST,
+        claim_id="new",
+        peer=ME,
+        owner_alive=lambda: False,
+        namespace="ns2",
+    )
+    assert table.get(slot.name) is None and child.terminated
+    table.agents.close()
+
+
+def test_dgd_served_version_discovery(monkeypatch):
+    api = object.__new__(node_service.InClusterDGDAPI)
+    api._base, api._namespace, api._version = "https://kube", "ns", None
+    calls = []
+
+    def request(method, suffix="", body=None):
+        calls.append(api._url + suffix)
+        if api._url == "https://kube/apis/nvidia.com":
+            return {"preferredVersion": {"version": "v1beta1"}}
+        return {"metadata": {"uid": "X"}}
+
+    monkeypatch.setattr(api, "_request", request)
+    assert api.get("lineage")["metadata"]["uid"] == "X"
+    assert calls == [
+        "https://kube/apis/nvidia.com",
+        "https://kube/apis/nvidia.com/v1beta1/namespaces/ns/dynamographdeployments/lineage",
+    ]
+
+
+def test_guard_reclaim_finishes_before_replacement():
+    from types import SimpleNamespace
+
+    order = []
+    guard = SimpleNamespace(
+        _data_pool=(0, 0, None, "t/l/0"),
+        begin_drain=lambda: order.append("stand-down") or True,
+        finish_close=lambda deadline: order.append("quiesced") or False,
+        reclaim_pool=lambda: order.append("reclaim"),
+    )
+    replacement = SimpleNamespace(start=lambda: order.append("start"))
+    registry = object.__new__(server._PoolRegistry)
+    registry._guards = {0: guard}
+    registry._guard_count = 1
+    registry._new_guard = lambda rank: replacement
+    registry.reclaim_slot("t/l/0")
+    assert order == ["stand-down", "quiesced", "reclaim", "start"]
+    assert registry._guards[0] is replacement
+
+
+@pytest.mark.skipif(
+    not os.environ.get("WARM_REAL_AGENT"), reason="r12 image integration only"
+)
+def test_real_agent_survives_dgd_404_and_reclaim(tmp_path, pools, monkeypatch, caplog):
+    import urllib.request
+
+    monkeypatch.setenv("DYN_DISCOVERY_BACKEND", "file")
+    monkeypatch.setenv("DYN_REQUEST_PLANE", "tcp")
+    monkeypatch.setenv("DYN_SYSTEM_PORT", "18081")
+    table, dgd = _retention_table(tmp_path, pages=4, state_agent_mode="supervisor")
+    table.stand_down = lambda name: None  # No Guard was started by FakeAPI.
+    dgd.put("l", "X")
+    try:
+        table.claim(
+            "t",
+            "l",
+            0,
+            total=4 * PAGE,
+            minimum=4 * PAGE,
+            maximum=None,
+            digest=DIGEST,
+            claim_id="old",
+            peer=ME,
+            owner_alive=lambda: False,
+            namespace="ns1",
+        )
+        namespace, child, _ = table.agents.children["t/l"]
+        assert namespace == "ns1"
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                with urllib.request.urlopen(
+                    "http://127.0.0.1:18081/health", timeout=1
+                ) as response:
+                    assert response.status == 200
+                break
+            except OSError:
+                assert time.monotonic() < deadline and child.poll() is None
+                time.sleep(0.1)
+        del dgd.crs["l"]
+        with caplog.at_level("INFO"):
+            table.poll_dgds()
+        assert child.poll() is None and "lineage retained" in caplog.text
+        dgd.put("new", "Y")
+        table.claim(
+            "t",
+            "new",
+            0,
+            total=4 * PAGE,
+            minimum=4 * PAGE,
+            maximum=None,
+            digest=DIGEST,
+            claim_id="new",
+            peer=ME,
+            owner_alive=lambda: False,
+            namespace="ns2",
+        )
+        assert child.poll() is not None and "t/l" not in table.agents.children
+    finally:
+        table.agents.close()

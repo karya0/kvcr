@@ -324,6 +324,26 @@ def _contains(actual: Any, expected: Any) -> bool:
     return actual == expected
 
 
+class InClusterDGDAPI(InClusterPodAPI):
+    """Namespace CR reads, using the API group's advertised preferred version."""
+
+    def __init__(self, namespace: str):
+        super().__init__(namespace)
+        self._base = self._url.split("/api/v1/")[0]
+        self._namespace = namespace
+        self._version = None
+
+    def get(self, name: str) -> dict[str, Any] | None:
+        if self._version is None:
+            self._url = self._base + "/apis/nvidia.com"
+            self._version = self._request("GET")["preferredVersion"]["version"]
+        self._url = (
+            f"{self._base}/apis/nvidia.com/{self._version}/namespaces/"
+            f"{self._namespace}/dynamographdeployments"
+        )
+        return super().get(name)
+
+
 class NodeBroker:
     def __init__(
         self,
@@ -1093,6 +1113,10 @@ class SlotTable:
         lease_ttl_ms: int = 10000,
         state_agent_mode: str = "dgd",
         state_agent_max_slots: int = 8,
+        dgd_api=None,
+        retention_seconds: float = 600,
+        dgd_poll_seconds: float = 5,
+        wall_clock: Callable[[], float] = time.time,
     ):
         # None: sized from the service's configured journal (bind_journal_bytes).
         self._meta_explicit = meta_bytes is not None
@@ -1119,6 +1143,12 @@ class SlotTable:
         self._lock = threading.RLock()
         root = getattr(broker, "root", None)
         self._state_path = state_path or (root and Path(root) / "slot-table.json")
+        self.dgd_api = dgd_api
+        self.retention_seconds = retention_seconds
+        self.dgd_poll_seconds = dgd_poll_seconds
+        self._wall_clock = wall_clock
+        self._lineages: dict[str, dict] = {}
+        self.stand_down: Callable[[str], None] | None = None
         self._restore()
         self.agents = (
             LineageAgents(state_agent_max_slots)
@@ -1171,6 +1201,7 @@ class SlotTable:
         _atomic_json(
             Path(self._state_path),
             {
+                "lineages": self._lineages,
                 "lease_ttl_ms": self.lease_ttl_ms,
                 "epochs": self._epochs,
                 "generations": self._generations,
@@ -1211,6 +1242,7 @@ class SlotTable:
         if not self._state_path or not Path(self._state_path).exists():
             return
         data = _read_json(Path(self._state_path))
+        self._lineages = data.get("lineages", {})
         self.lease_ttl_ms = max(self.lease_ttl_ms, data.get("lease_ttl_ms", 0))
         self._epochs = {k: int(v) for k, v in data.get("epochs", {}).items()}
         self._generations = {k: int(v) for k, v in data.get("generations", {}).items()}
@@ -1338,6 +1370,111 @@ class SlotTable:
                 INCOMPATIBLE_LINEAGE, f"claimant pod is not in namespace {namespace}"
             )
 
+    def _dgd(self, lineage: str):
+        from .protocol import INTERNAL
+
+        try:
+            cr = self.dgd_api.get(lineage)
+            if cr is not None and not cr.get("metadata", {}).get("uid"):
+                raise ValueError("DGD has no UID")
+            return cr
+        except (PodAPIError, OSError, ValueError, KeyError) as error:
+            raise SlotError(INTERNAL, f"DGD lookup failed: {error}") from error
+
+    def _admit_dgd(self, key: str) -> None:
+        from .protocol import INTERNAL, SLOT_STALE
+
+        if self.dgd_api is None:
+            return
+        cr = self._dgd(key.split("/", 1)[1])
+        if cr is None or cr["metadata"].get("deletionTimestamp"):
+            raise SlotError(INTERNAL, "DGD is absent or deleting; retry")
+        meta = cr["metadata"]
+        uid = meta["uid"]
+        rec = self._lineages.get(key)
+        if rec is None:
+            retention = float(
+                (meta.get("annotations") or {}).get(
+                    "gaas.nvidia.com/retention", self.retention_seconds
+                )
+            )
+            if not 0 <= retention < float("inf"):
+                raise SlotError(INTERNAL, "invalid DGD retention")
+            self._lineages[key] = dict(
+                dgd_uid=uid,
+                dgd_created=meta.get("creationTimestamp"),
+                retained_at=None,
+                retention_s=retention,
+                rebound=False,
+            )
+        elif uid != rec["dgd_uid"]:
+            if rec["rebound"]:
+                raise SlotError(SLOT_STALE, "lineage already rebound")
+            logger.info(
+                "lineage rebind lineage=%s old=%s new=%s", key, rec["dgd_uid"], uid
+            )
+            rec.update(dgd_uid=uid, rebound=True, retained_at=None)
+        elif rec["retained_at"] is not None:
+            raise SlotError(INTERNAL, "predecessor DGD still visible; retry")
+
+    def poll_dgds(self) -> None:
+        if self.dgd_api is None:
+            return
+        with self._lock:
+            for key, rec in self._lineages.items():
+                try:
+                    cr = self._dgd(key.split("/", 1)[1])
+                except SlotError:
+                    logger.warning("DGD poll failed lineage=%s", key)
+                    continue
+                deletion = cr and cr["metadata"].get("deletionTimestamp")
+                if (cr is None or deletion) and rec["retained_at"] is None:
+                    rec["retained_at"] = (
+                        datetime.fromisoformat(
+                            deletion.replace("Z", "+00:00")
+                        ).timestamp()
+                        if deletion
+                        else self._wall_clock()
+                    )
+                    logger.info(
+                        "lineage retained lineage=%s slots=%s",
+                        key,
+                        sum(n.rsplit("/", 1)[0] == key for n in self._slots),
+                    )
+            self._persist()
+
+    def _reclaim_for(self, tenant: str, name: str, minimum: int) -> None:
+        if self.dgd_api is None:
+            return
+        from .protocol import SLOT_HELD
+
+        victims = []
+        now = self._wall_clock()
+        for slot in self._slots.values():
+            key = slot.name.rsplit("/", 1)[0]
+            rec = self._lineages.get(key)
+            if rec is None or rec["retained_at"] is None or slot.held:
+                continue
+            cr = self._dgd(key.split("/", 1)[1])
+            if cr is not None:
+                continue
+            expired = now - rec["retained_at"] > rec["retention_s"]
+            victims.append((not expired, rec["retained_at"], slot.name))
+        for pressure, _, victim in sorted(victims):
+            if self._available(tenant, name) >= minimum:
+                break
+            if self.stand_down is None:
+                raise SlotError(SLOT_HELD, "Guard stand-down unavailable; retry")
+            self.stand_down(victim)
+            self.release(victim)
+            logger.info(
+                "slot reclaimed slot=%s reason=%s",
+                victim,
+                "pressure" if pressure else "expired",
+            )
+        if self._available(tenant, name) < minimum:
+            raise SlotError(SLOT_HELD, "capacity retained by live lineage; retry")
+
     def _expire_waiters(self, name: str) -> None:
         """Caller holds ``_lock``. Drop waiters that died or stopped re-claiming."""
         queue = self._waiters.get(name)
@@ -1446,6 +1583,7 @@ class SlotTable:
         self._check_lineage(lineage, namespace, peer)
         created = False
         with self._lock:
+            self._admit_dgd(f"{tenant}/{lineage}")
             self._expire_waiters(name)
             slot = self._slots.get(name)
             if slot is not None:
@@ -1495,6 +1633,7 @@ class SlotTable:
                 size = total or maximum or minimum
                 if not size:
                     raise SlotError(INTERNAL, "claim carries no size")
+                self._reclaim_for(tenant, name, minimum or size)
                 effective = effective_grant(
                     size, minimum or size, maximum, self._available(tenant, name)
                 )
