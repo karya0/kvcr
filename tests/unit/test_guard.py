@@ -573,6 +573,10 @@ def test_guard_lives_out_adopt_promote_and_readopt_in_ownership_order(
         write_handback = Mock()
         guard._recovery._write_handback = write_handback
         guard._adopt(new_channel(), tier)
+        assert any(
+            m.startswith("KVCR_EVENT guard_hand_back ") and m.endswith(" blocks=2")
+            for m in caplog.messages
+        )
         assert write_handback.call_args.args[0] is records
         assert guard._recovery.mirror._records is records
         assert guard._recovery.mirror._records[first].g3 is retained_g3

@@ -1444,6 +1444,12 @@ class _Guard:
         core = self._core
         if core is None or self._recovery.mirror is None:
             raise RecoveryMirrorError("a serving Guard has no state to hand back")
+        logger.info(
+            "KVCR_EVENT guard_hand_back guard=%d pool=%s blocks=%d",
+            self._guard_index,
+            self._spec.pool_id,
+            len(core._block_record_map),
+        )
         self._log_promotion_stage("handback_start")
         core.close()
         self._log_promotion_stage("core_closed")
