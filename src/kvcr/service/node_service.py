@@ -25,6 +25,8 @@ import socket
 import socketserver
 import ssl
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1001,6 +1003,65 @@ class _Slot:
         return self.quarantined or (self.owner_alive is not None and self.owner_alive())
 
 
+class LineageAgents:
+    """In-memory children of the supervisor; pool retention keeps them alive."""
+
+    def __init__(self, max_slots: int):
+        self.max_slots = max_slots
+        self.children: dict[str, tuple[str, subprocess.Popen, int]] = {}
+
+    def _spawn(self, namespace: str) -> subprocess.Popen:
+        env = dict(os.environ, DYN_NAMESPACE=namespace)
+        # Inherit Kubernetes discovery and pod identity from the supervisor.
+        # The agent has no generate endpoint; health reports runtime liveness.
+        env["DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS"] = ""
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "dynamo.kv_state_agent",
+                "--max-slots",
+                str(self.max_slots),
+            ],
+            env=env,
+        )
+
+    def ensure(self, lineage: str, namespace: str | None) -> None:
+        if not namespace:
+            raise ValueError("supervisor state agent requires a namespace")
+        current = self.children.get(lineage)
+        if current is not None:
+            if current[0] != namespace:
+                raise ValueError("state-agent namespace differs for retained lineage")
+            return
+        self.children[lineage] = (namespace, self._spawn(namespace), 0)
+        logger.info("lineage agent started lineage=%s namespace=%s", lineage, namespace)
+
+    def upkeep(self) -> None:
+        for lineage, (namespace, child, restarts) in list(self.children.items()):
+            if child.poll() is not None and restarts == 0:
+                self.children[lineage] = (namespace, self._spawn(namespace), 1)
+                logger.warning("lineage agent restarted lineage=%s", lineage)
+
+    def stop(self, lineage: str) -> None:
+        entry = self.children.pop(lineage, None)
+        if entry is None:
+            return
+        child = entry[1]
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        logger.info("lineage agent stopped lineage=%s", lineage)
+
+    def close(self) -> None:
+        for lineage in list(self.children):
+            self.stop(lineage)
+
+
 class SlotTable:
     """v2 slots keyed ``tenant/lineage/guard_index``: capacity, queueing, holder upkeep.
 
@@ -1030,6 +1091,8 @@ class SlotTable:
         meta_bytes: int | None = None,
         journal_bytes: int = _JOURNAL_BYTES,
         lease_ttl_ms: int = 10000,
+        state_agent_mode: str = "dgd",
+        state_agent_max_slots: int = 8,
     ):
         # None: sized from the service's configured journal (bind_journal_bytes).
         self._meta_explicit = meta_bytes is not None
@@ -1057,6 +1120,11 @@ class SlotTable:
         root = getattr(broker, "root", None)
         self._state_path = state_path or (root and Path(root) / "slot-table.json")
         self._restore()
+        self.agents = (
+            LineageAgents(state_agent_max_slots)
+            if state_agent_mode == "supervisor"
+            else None
+        )
 
     def bind_journal_bytes(self, journal_bytes: int) -> None:
         """Size the meta memfd from the service's journal, unless a size was given.
@@ -1486,6 +1554,15 @@ class SlotTable:
             if isinstance(error, (OSError, RuntimeError, ValueError, TimeoutError)):
                 raise SlotError(INTERNAL, f"holder for {name}: {error}") from error
             raise
+        if self.agents is not None:
+            try:
+                with self._lock:
+                    self.agents.ensure(f"{tenant}/{lineage}", namespace)
+            except (OSError, ValueError) as error:
+                self._abort_claim(slot, created, generation)
+                raise SlotError(
+                    INTERNAL, f"state agent for {lineage}: {error}"
+                ) from error
         return slot, generation
 
     def _abort_claim(self, slot: _Slot, created: bool, generation: int) -> None:
@@ -1888,6 +1965,11 @@ class SlotTable:
                 self.broker.abandon(slot.holder)
             else:
                 self.broker.release(slot.holder)
+        if self.agents is not None:
+            with self._lock:
+                lineage = name.rsplit("/", 1)[0]
+                if not any(n.rsplit("/", 1)[0] == lineage for n in self._slots):
+                    self.agents.stop(lineage)
         return waiters
 
 
