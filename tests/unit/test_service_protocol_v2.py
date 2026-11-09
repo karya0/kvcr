@@ -226,6 +226,7 @@ def test_error_reason_default_and_codes():
     codes = {
         CAPACITY_BELOW_MINIMUM,
         SLOT_HELD,
+        protocol.SLOT_STALE,
         IDENTITY_MISMATCH,
         INCOMPATIBLE_LINEAGE,
         UNKNOWN_SLOT,
@@ -234,7 +235,7 @@ def test_error_reason_default_and_codes():
         INTERNAL,
         DATA_POOL_LAYOUT,
     }
-    assert codes == ERROR_REASONS and len(codes) == 9
+    assert codes == ERROR_REASONS and len(codes) == 10
     for code in codes:
         error = _reason_error(code, "why")
         assert _roundtrip(error, _RESIZE_RESPONSE_DECODER) == error
