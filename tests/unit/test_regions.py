@@ -157,6 +157,53 @@ def test_restore_remaps_a_persisted_layout(pool):
         assert other.grow(PAGE)[0].offset == 2 * PAGE
 
 
+@pytest.mark.parametrize("fail_at", [1, 2])
+def test_failed_adoption_keeps_fd_ownership_until_retry(monkeypatch, fail_at):
+    with (
+        RegionPool.create(8 * PAGE, meta_bytes=PAGE) as pool,
+        RegionPool.create(8 * PAGE, meta_bytes=PAGE) as held,
+    ):
+        pool.grow(2 * PAGE, split=2)
+        held.grow(2 * PAGE, split=2)
+        os.pwrite(held.fd, b"retained", PAGE)
+        original = pool.pass_fd_list()
+        layout = (pool.regions, pool.next_index, pool.layout_generation)
+        received = [os.dup(fd) for fd in held.pass_fd_list()]
+        real_mmap, calls = pool._libc.mmap, []
+
+        def fail_mapping(*args):
+            calls.append(args)
+            return (
+                ctypes.c_void_p(-1).value if len(calls) == fail_at else real_mmap(*args)
+            )
+
+        monkeypatch.setattr(pool._libc, "mmap", fail_mapping)
+        with pytest.raises(OSError, match="region mmap"):
+            pool.adopt(received)
+        assert pool.pass_fd_list() == original
+        assert (pool.regions, pool.next_index, pool.layout_generation) == layout
+        for fd in original:
+            os.fstat(fd)
+        # The handback caller still owns and closes the failed inputs. Another
+        # connection can immediately reuse those descriptor numbers.
+        for fd in received:
+            os.close(fd)
+        unrelated = os.open(os.devnull, os.O_RDONLY)
+        try:
+            for fd in received:
+                os.dup2(unrelated, fd)
+            monkeypatch.setattr(pool._libc, "mmap", real_mmap)
+            pool.adopt([os.dup(fd) for fd in held.pass_fd_list()])
+            assert os.pread(pool.fd, 8, PAGE) == b"retained"
+            assert (pool.regions, pool.next_index, pool.layout_generation) == layout
+            pool.close()
+            for fd in received:
+                assert os.fstat(fd) == os.fstat(unrelated)
+        finally:
+            for fd in set(received + [unrelated]):
+                os.close(fd)
+
+
 def test_failed_split_grow_leaves_the_layout_untouched(pool, monkeypatch):
     pool.grow(PAGE)
     layout = (pool.regions, pool.layout_generation, pool.next_index)
