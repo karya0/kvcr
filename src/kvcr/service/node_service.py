@@ -977,6 +977,7 @@ class _Slot:
     peer: Any = None
     owner_alive: Callable[[], bool] | None = None
     claim_id: str | None = None
+    restored_pool: bool = False
     holder_conn: socket.socket | None = None
     touched_bytes: int = 0
     layout_generation: int = -1
@@ -1151,6 +1152,7 @@ class SlotTable:
                 pool,
                 rec["effective_maximum_bytes"],
                 rec["holder"],
+                restored_pool=True,
                 incarnation=rec["incarnation"],
                 claim_generation=rec["claim_generation"],
             )
@@ -1445,24 +1447,51 @@ class SlotTable:
         if received is None:
             raise RuntimeError("holder closed before hello")
         hello, fds = received
-        handback = hello.get("handback")
-        regions, _next_index, generation = slot.committed
-        expected = {
-            "regions": [
-                {"index": r.index, "offset": r.offset, "size": r.size, "fd_index": 0}
-                for r in regions
-            ],
-            "layout_generation": generation,
-        }
-        if slot.pool.meta_fd >= 0:
-            expected["meta"] = {"fd_index": 1, "size": self.meta_bytes}
-        if handback == expected and len(fds) == len(slot.pool.pass_fd_list()):
-            slot.pool.adopt(fds)  # ownership transfers; never resize adopted meta
-            return
-        for fd in fds:
-            os.close(fd)
-        if handback is not None or fds:
-            logger.warning("holder_handback_rejected: layout or fd count mismatch")
+        try:
+            if not isinstance(hello, dict) or "handback" not in hello:
+                raise ValueError("invalid holder hello envelope")
+            handback = hello["handback"]
+            if handback is None and not fds and not slot.restored_pool:
+                return  # a new holder has no backing yet
+            regions, _next_index, generation = slot.committed
+            expected = {
+                "regions": [
+                    {
+                        "index": r.index,
+                        "offset": r.offset,
+                        "size": r.size,
+                        "fd_index": 0,
+                    }
+                    for r in regions
+                ],
+                "layout_generation": generation,
+                "incarnation": slot.incarnation,
+            }
+            if slot.pool.meta_fd >= 0:
+                expected["meta"] = {"fd_index": 1, "size": self.meta_bytes}
+            current = slot.pool.pass_fd_list()
+            if handback != expected or len(fds) != len(current):
+                raise ValueError(
+                    "holder handback layout, incarnation or fd count mismatch"
+                )
+            if any(
+                os.fstat(fd).st_size != os.fstat(old).st_size
+                for fd, old in zip(fds, current)
+            ):
+                raise ValueError("holder handback fd size mismatch")
+            if slot.restored_pool:
+                slot.pool.adopt(fds)
+                fds = []  # ownership transferred
+                slot.restored_pool = False
+            elif any(
+                (os.fstat(fd).st_dev, os.fstat(fd).st_ino)
+                != (os.fstat(old).st_dev, os.fstat(old).st_ino)
+                for fd, old in zip(fds, current)
+            ):
+                raise ValueError("holder handback differs from live pool")
+        finally:
+            for fd in fds:
+                os.close(fd)
 
     def _send_layout(self, slot: _Slot) -> None:
         """Send the whole layout plus the pool fds; store the holder's report."""
@@ -1473,6 +1502,7 @@ class SlotTable:
                 for r in slot.pool.regions
             ],
             "layout_generation": slot.pool.layout_generation,
+            "incarnation": slot.incarnation,
         }
         meta_size = -1
         if slot.pool.meta_fd >= 0:  # the fd follows the region memfd
@@ -1547,8 +1577,12 @@ class SlotTable:
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(path)
-        self._adopt_handback(slot)
-        self._send_layout(slot)
+        try:
+            self._adopt_handback(slot)
+            self._send_layout(slot)
+        except BaseException:
+            self._drop_holder_conn(slot)
+            raise
 
     @staticmethod
     def _drop_holder_conn(slot: _Slot) -> None:
@@ -1579,6 +1613,7 @@ class SlotTable:
         self.broker.abandon(slot.holder)
         self._drop_holder_conn(slot)
         slot.incarnation += 1
+        slot.restored_pool = False  # confirmed dead holder: fresh backing is allowed
         slot.holder = self._new_holder(
             slot.name, slot.effective_maximum_bytes, slot.digest
         )
