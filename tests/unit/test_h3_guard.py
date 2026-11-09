@@ -9,16 +9,24 @@ from unittest.mock import Mock
 
 import pytest
 from _kvcr_test_utils import _recovered_record
-from test_guard import _fake_attachment, _guard, _tier
+from test_guard import (
+    _PAGE_BLOCK_SIZE_BYTES,
+    _PAGE_SPEC,
+    _TEST_SPEC,
+    _fake_attachment,
+    _guard,
+    _tier,
+)
 
 from kvcr.service import guard as guard_module
 from kvcr.service.guard import _Phase
+from kvcr.service.protocol import _G3Config
 from kvcr.service.recovery_journal import _RecoveryMirror
 from kvcr.types import BlockKey
 
 
-def _recovery(monkeypatch, *, invalid=False):
-    guard = _guard()
+def _recovery(monkeypatch, *, invalid=False, spec=_TEST_SPEC):
+    guard = _guard(spec)
     recovery = guard._recovery
     recovery.attachment = attachment = _fake_attachment()
     digest = b"d" * 32
@@ -36,7 +44,8 @@ def _recovery(monkeypatch, *, invalid=False):
     mirror = _RecoveryMirror(("",))
     mirror.adopt({key: _recovered_record(g2=[("", 0)])})
 
-    def rebuild(*_args):
+    def rebuild(*_args, has_g3):
+        assert has_g3 is True
         consumed.store_release.assert_called_once_with(17)
         assert journal._consumed_local == 17
         return mirror
@@ -68,7 +77,14 @@ def test_q12_invalid_reattach_is_cold_without_rebuild(monkeypatch, caplog):
 
 @pytest.mark.parametrize("invalid", [False, True])
 def test_q10_q14_reattach_seats_lease_prepares_core_and_promotes(monkeypatch, invalid):
-    guard, recovery, journal, read, key = _recovery(monkeypatch, invalid=invalid)
+    guard, recovery, journal, read, key = _recovery(
+        monkeypatch, invalid=invalid, spec=_PAGE_SPEC
+    )
+    # These cases exercise journal validity, which applies only to G3 tiers.
+    tier = _tier(
+        _PAGE_BLOCK_SIZE_BYTES,
+        g3=_G3Config(("/g3",), _PAGE_BLOCK_SIZE_BYTES, "MOCK", {}),
+    )
     recovery.set_meta_fd = Mock()
     guard._refuse_incompatible = Mock()
     guard._pool_lease.bind = Mock(side_effect=AssertionError("second bind"))
@@ -90,7 +106,7 @@ def test_q10_q14_reattach_seats_lease_prepares_core_and_promotes(monkeypatch, in
         bind = listener.getsockname()
         _, _, returned_fd, returned_lease = guard._reattach(
             lease,
-            _tier(16),
+            tier,
             bind,
             (1234, 32, recovery.layout_digest, "t/l/0", 1, 42),
             listener.fileno(),
@@ -100,7 +116,7 @@ def test_q10_q14_reattach_seats_lease_prepares_core_and_promotes(monkeypatch, in
             assert guard._pool_lease.current is lease
             assert guard._phase is _Phase.PRIMARY
             assert guard._core is core
-            assert guard._configured == _tier(16)
+            assert guard._configured == tier
             assert guard._control is not None
             assert os.fstat(returned_fd).st_ino == os.fstat(listener.fileno()).st_ino
             guard._promote_for(lease)

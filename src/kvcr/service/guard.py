@@ -53,6 +53,7 @@ from .recovery_journal import (
     _RecoveryMirror,
     canonical_pool_terms,
     read_handback,
+    rebuild_g2_mirror,
     write_recovery_snapshot,
 )
 
@@ -215,6 +216,7 @@ class _RecoveryState:
         # The backing the mirror and the retained snapshot were recorded under;
         # None is unknown provenance, which a v2 pool never trusts.
         self._backing: bytes | None = None
+        self.has_g3 = True
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
@@ -242,7 +244,9 @@ class _RecoveryState:
             self.attachment._spec == self._pool_spec
         )
         if recover and mirror is None and not on_stub:
-            mirror = read_handback(self.attachment, self._compatibility_digest, pools)
+            mirror = read_handback(
+                self.attachment, self._compatibility_digest, pools, has_g3=self.has_g3
+            )
         # Before _attach_meta, self.attachment is pool_{rank} on a first claim. A v2
         # stub holds no handback and its mapping does not reach these offsets, so
         # nothing is read or written there (harmless: the meta is born with the slot
@@ -279,25 +283,32 @@ class _RecoveryState:
         self.attachment.close()
         self.attachment, self._journal = meta, RecoveryJournal(meta)
         if recover and meta.g2_index() is not None:
-            self.mirror = read_handback(meta, self._compatibility_digest, self.pools)
+            self.mirror = read_handback(
+                meta, self._compatibility_digest, self.pools, has_g3=self.has_g3
+            )
+
+    @property
+    def uses_journal(self) -> bool:
+        return self.has_g3 or self.attachment.g2_index() is None
 
     def reattach(self, pool_layouts: PoolBlockLayouts) -> None:
         """Resume observation of a live producer without resetting its cursors."""
         self.configure(pool_layouts, recover=False)
         self._attach_meta(recover=False)
         journal = self._journal
-        if journal.is_invalid():
+        if self.uses_journal and journal.is_invalid():
             self._drop_recovery(RecoveryJournalError("reattached journal is invalid"))
             return
         if self.attachment.layout_digest() != self.layout_digest():
             raise RecoveryMirrorError("reattached data pool layout differs")
         # P0 precedes the index scan: publications after this point are replayed
         # over the scan, including writes completed while it was in progress.
-        published = journal._published.load_acquire()
-        journal._consumed.store_release(published)
-        journal._consumed_local = published
+        if self.uses_journal:
+            published = journal._published.load_acquire()
+            journal._consumed.store_release(published)
+            journal._consumed_local = published
         self.mirror = read_handback(
-            self.attachment, self._compatibility_digest, self.pools
+            self.attachment, self._compatibility_digest, self.pools, has_g3=self.has_g3
         )
         self.mirror.adopt(_without_g3(self.mirror.take_records()))
         self._backing = self.layout_digest(backing_only=True)
@@ -328,7 +339,7 @@ class _RecoveryState:
     def poll(self) -> bool:
         """Mirror one bounded journal batch; True if more may remain."""
         mirror = self.mirror
-        if mirror is None:
+        if mirror is None or not self.uses_journal:
             return False
         try:
             for _ in range(_POLL_BATCH):
@@ -374,8 +385,12 @@ class _RecoveryState:
                         "refusing its records (stale_layout)"
                     )
                 # The primary is gone, so there is no more journal traffic coming.
-                for frame in self._journal.drain():
-                    mirror.apply(*frame)
+                if self.uses_journal:
+                    for frame in self._journal.drain():
+                        mirror.apply(*frame)
+                rebuild_g2_mirror(
+                    self.attachment, tuple(pool.name for pool in self.pools), mirror
+                )
                 records = mirror.take_records()
             except (RecoveryJournalError, RecoveryMirrorError) as error:
                 self._drop_recovery(error)
@@ -422,8 +437,9 @@ class _RecoveryState:
         """Write the current primary's journal tail, then drop its mirror."""
         mirror = self.mirror
         try:
-            while (frame := self._journal.read_next()) is not None:
-                mirror.apply(*frame)
+            if self.uses_journal:
+                while (frame := self._journal.read_next()) is not None:
+                    mirror.apply(*frame)
             self._write_handback(mirror.take_records())
         except (RecoveryJournalError, RecoveryMirrorError) as error:
             self._drop_recovery(error)
@@ -448,7 +464,7 @@ class _RecoveryState:
             canonical_pool_terms(
                 self._compatibility_digest, self.pools, self.attachment._spec
             ),
-            _recovery_frames(records),
+            _recovery_frames(records, g3_only=self.attachment.g2_index() is not None),
         )
 
     def close(self) -> None:
@@ -1080,6 +1096,7 @@ class _Guard:
                 self._data_pool = data_pool
                 self._recovery.layout_digest = data_pool[2]
                 self._recovery.set_meta_fd(data_pool[5])
+                self._recovery.has_g3 = tier_config.g3 is not None
                 self._recovery.reattach(tier_config.pool_layouts)
                 control = ZmqPeerControlChannel.from_shared_listener(
                     socket.socket(fileno=os.dup(listener.fileno()))
@@ -1180,6 +1197,7 @@ class _Guard:
             # The prior handback is this lease's baseline. Read now, under
             # the claim's layout: refusing at promotion stops the service,
             # and a claimant dying in between takes everything with it.
+            self._recovery.has_g3 = tier_config.g3 is not None
             self._recovery.configure(tier_config.pool_layouts)
             # Last, once nothing left can refuse this claim: a pool whose handback
             # would not replay has not chosen anything, and a corrected claim can

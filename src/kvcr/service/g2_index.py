@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Slot-addressed G2 recovery index and bounded, reconstructible key arena."""
 
+import enum
 import hashlib
 import logging
 import struct
@@ -11,6 +12,32 @@ HEADER = struct.Struct("<IHHIHHQH38x")
 ENTRY = struct.Struct("<QHBBB BHqII32s")
 MAGIC = 0x3249584B
 GRANULE = 16
+_REMOVED_FIELDS = (0, 0, 0, 0, 0, 0, 0, 0, 0, bytes(32))
+
+
+class EntryState(enum.Enum):
+    FREE = 0
+    IN_FLIGHT = 1
+    COMMITTED = 2
+    REMOVED = 3
+    TORN = 4
+
+
+def entry_state(seq, fields):
+    """The u64 head is free at zero, in flight when odd, settled when even.
+
+    COMMITTED still requires the payload geometry and digest checks below.
+    remove_steps leaves a settled head and an otherwise zero entry.
+    """
+    if seq == 0:
+        return EntryState.FREE
+    if seq & 1:
+        return EntryState.IN_FLIGHT
+    if fields[4] == 1:
+        return EntryState.COMMITTED
+    if fields[1:] == _REMOVED_FIELDS:
+        return EntryState.REMOVED
+    return EntryState.TORN
 
 
 class G2Index:
@@ -93,12 +120,13 @@ class G2Index:
                 pad2,
                 digest,
             ) = fields
-            if not flags:
+            state = entry_state(seq, fields)
+            if state is EntryState.REMOVED:
                 continue
             start = self.arena_start + off * GRANULE
             end = start + key_len + label_len
             if (
-                flags != 1
+                state is not EntryState.COMMITTED
                 or pad
                 or pad2
                 or not 1 <= key_len <= 65529
@@ -256,7 +284,9 @@ def rebuild(indexes, *, promotion=False):
                 if (pool, slot) not in retained:
                     start = 64 + slot * 64
                     index.buffer[start : start + 64] = bytes(64)
+            counts = index.torn, index.dropped, index.partial
             index.rebuild_allocator()
+            index.torn, index.dropped, index.partial = counts
     return records
 
 

@@ -125,7 +125,9 @@ def _is_recoverable(record: _BlockRecord) -> bool:
     )
 
 
-def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
+def _project_recovery_record(
+    record: _BlockRecord, *, g3_only: bool = False
+) -> _RecoveryBlock:
     disk = record.g3
     local_dram = record.local_dram
     complete = (
@@ -134,7 +136,7 @@ def _project_recovery_record(record: _BlockRecord) -> _RecoveryBlock:
         and not local_dram.pending_labels
     )
     return _RecoveryBlock(
-        g2=local_dram.slots if complete else None,
+        g2=local_dram.slots if complete and not g3_only else None,
         g3=(disk.layout, disk.slots) if disk is not None else None,
         position=record.position,
     )
@@ -419,7 +421,7 @@ class _RecoveryMirror:
         return records
 
 
-def _attach_g2_index(local_dram: _LocalDramPools, backing) -> None:
+def _attach_g2_index(local_dram: _LocalDramPools, backing) -> bool:
     index = backing.g2_index() if isinstance(backing, KVCRPoolAttachment) else None
     if index is not None:
         if len(local_dram._regions) != 1:
@@ -427,21 +429,23 @@ def _attach_g2_index(local_dram: _LocalDramPools, backing) -> None:
         name, (_, length, slot_size) = next(iter(local_dram._regions.items()))
         index.validate_slots(length // slot_size)
         local_dram._recovery_indexes = {name: index}
+    return index is not None
 
 
 def _attach_journal(
     local_dram: _LocalDramPools, journal: RecoveryJournal, g3: _G3 | None = None
 ) -> None:
-    """Attach stable G2/G3 residency publication to one journal."""
-    _attach_g2_index(local_dram, getattr(journal, "_pool", None))
+    """Publish G2 to its slot index and G3 to the journal."""
+    indexed = _attach_g2_index(local_dram, getattr(journal, "_pool", None))
     enabled = True
 
     def publish(key: BlockKey, record: _BlockRecord) -> None:
         nonlocal enabled
-        local_dram.publish_recovery(key, record)
         if not enabled:
             return
-        payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
+        payload = _RECOVERY_ENCODER.encode(
+            _project_recovery_record(record, g3_only=indexed)
+        )
         try:
             if not journal.publish(_RECORD_BLOCK, bytes(key), payload):
                 logger.warning(
@@ -458,7 +462,9 @@ def _attach_journal(
 
         def preflight(key: BlockKey, record: _BlockRecord, disk: _G3Residency) -> bool:
             candidate = msgspec.structs.replace(record, g3=disk)
-            payload = _RECOVERY_ENCODER.encode(_project_recovery_record(candidate))
+            payload = _RECOVERY_ENCODER.encode(
+                _project_recovery_record(candidate, g3_only=indexed)
+            )
             size = _FRAME_HEADER.size + len(key) + len(payload)
             return (
                 size <= _MAX_FRAME_SIZE
@@ -466,7 +472,13 @@ def _attach_journal(
             )
 
         g3.observe_residency(publish, recovery_preflight=preflight)
-    local_dram.observe_residency(publish)
+
+    def publish_g2(key: BlockKey, record: _BlockRecord) -> None:
+        local_dram.publish_recovery(key, record)
+        if not indexed or record.g3 is not None:
+            publish(key, record)
+
+    local_dram.observe_residency(publish_g2)
 
 
 def install_recovery_records(
@@ -548,6 +560,7 @@ def claim_guarded_pool(
             hold._attachment,
             guard_config.compatibility_digest,
             hold._pools,
+            has_g3=backend_configs.g3 is not None,
         )
     except BaseException:
         # A failing release must not mask the error that made the claim unusable.
@@ -626,12 +639,16 @@ def _pack_frame(record_type: int, key: bytes, payload: bytes, size: int) -> byte
 
 def _recovery_frames(
     records: Mapping[BlockKey, _BlockRecord],
+    *,
+    g3_only: bool = False,
 ) -> Iterator[tuple[int, bytes, bytes]]:
     """Every frame a returning primary needs to rebuild this state."""
     for key, record in records.items():
-        if not _is_recoverable(record):
+        if (g3_only and record.g3 is None) or not _is_recoverable(record):
             continue
-        payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
+        payload = _RECOVERY_ENCODER.encode(
+            _project_recovery_record(record, g3_only=g3_only)
+        )
         yield _RECORD_BLOCK, bytes(key), payload
 
 
@@ -766,6 +783,8 @@ def read_handback(
     pool: KVCRPoolAttachment,
     compatibility_digest: str,
     pools: tuple[_PoolDescriptor, ...],
+    *,
+    has_g3: bool = True,
 ) -> _RecoveryMirror:
     """Replay whatever the last Guard left for this pool, if anything.
 
@@ -777,33 +796,47 @@ def read_handback(
     """
     pool_names = tuple(pool.name for pool in pools)
     mirror = _RecoveryMirror(pool_names)
-    terms = canonical_pool_terms(compatibility_digest, pools, pool._spec)
-    try:
-        for frame in read_recovery_snapshot(pool, terms):
-            mirror.apply(*frame)
-    except RecoveryJournalTornError:
-        logger.warning(
-            "KVCR discarding a handback region that was never finished", exc_info=True
-        )
-        pool.release_snapshot_region()
-        return _RecoveryMirror(pool_names)
-    index = pool.g2_index()
-    if index is not None:
-        from .g2_index import rebuild
-
-        if len(pool_names) != 1:
-            raise ValueError("a v2 index requires one data pool")
-        records = mirror.take_records()
-        for record in records.values():
-            record.local_dram = None
-        for key, (slots, position) in rebuild(
-            {pool_names[0]: index}, promotion=True
-        ).items():
-            record = records.setdefault(BlockKey(key), _BlockRecord())
-            record.local_dram = _LocalDramResidency(slots, _LocalDramState.READY)
-            record.position = position
-        mirror.adopt(records)
+    if has_g3 or pool.g2_index() is None:
+        terms = canonical_pool_terms(compatibility_digest, pools, pool._spec)
+        try:
+            for frame in read_recovery_snapshot(pool, terms):
+                mirror.apply(*frame)
+        except RecoveryJournalTornError:
+            logger.warning(
+                "KVCR discarding a handback region that was never finished",
+                exc_info=True,
+            )
+            pool.release_snapshot_region()
+            return _RecoveryMirror(pool_names)
+    rebuild_g2_mirror(pool, pool_names, mirror)
     return mirror
+
+
+def rebuild_g2_mirror(pool, pool_names, mirror) -> None:
+    """Replace the G2 projection with committed index entries, never old frames."""
+    index = pool.g2_index()
+    if index is None:
+        return
+    from .g2_index import rebuild
+
+    if len(pool_names) != 1:
+        raise ValueError("a v2 index requires one data pool")
+    records = mirror.take_records()
+    for record in records.values():
+        record.local_dram = None
+    rebuilt = rebuild({pool_names[0]: index}, promotion=True)
+    for key, (slots, position) in rebuilt.items():
+        record = records.setdefault(BlockKey(key), _BlockRecord())
+        record.local_dram = _LocalDramResidency(slots, _LocalDramState.READY)
+        record.position = position
+    mirror.adopt(records)
+    logger.info(
+        "KVCR_EVENT g2_index_rebuilt blocks=%d dropped=%d torn=%d partial=%d",
+        len(rebuilt),
+        len(index.dropped),
+        index.torn,
+        index.partial,
+    )
 
 
 def clear_recovery_snapshot(pool: KVCRPoolAttachment) -> None:

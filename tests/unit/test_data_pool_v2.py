@@ -34,9 +34,7 @@ from test_kvcr_service import (  # noqa: F401 - _channels_are_taken is autouse
 )
 from test_node_service_v2 import pools  # noqa: F401 - used through pytestmark
 
-from kvcr.backends.local_disk import _G3Residency
 from kvcr.config import GaaSSettings
-from kvcr.runtime.core import _BlockRecord
 from kvcr.service import guard as guard_module
 from kvcr.service import memmap, node_service
 from kvcr.service import memory as memory_module
@@ -50,8 +48,6 @@ from kvcr.service.protocol import (
 )
 from kvcr.service.recovery_journal import (
     _RECORD_BLOCK,
-    _RECOVERY_ENCODER,
-    _project_recovery_record,
     read_handback,
     read_recovery_snapshot,
     write_recovery_snapshot,
@@ -328,10 +324,11 @@ _KEY = BlockKey(b"slot-a-record")
 
 
 def _seed(guard):
-    """One record in the Guard's mirror, as a primary's journal would publish it."""
-    record = _BlockRecord(g3=_G3Residency(("pool0",), (0,)))
-    payload = _RECOVERY_ENCODER.encode(_project_recovery_record(record))
-    guard._recovery.mirror.apply(_RECORD_BLOCK, bytes(_KEY), payload)
+    """Indexed G2 state survives without journal frames (orchestrator 12:00)."""
+    index = guard._recovery.attachment.g2_index()
+    parts = [("pool0", 0)]
+    assert index.reserve(bytes(_KEY), parts)
+    list(index.store_steps(bytes(_KEY), parts, 0))
 
 
 def _claim_layout(harness, layout):
