@@ -133,6 +133,9 @@ class _Source:
     def __init__(self) -> None:
         self._observer: Callable[[BlockKey, _BlockRecord], None] | None = None
 
+    def publish_recovery(self, key: BlockKey, record: _BlockRecord) -> None:
+        """This journal-only source has no G2 index to publish."""
+
     def observe_residency(
         self,
         observer: Callable[[BlockKey, _BlockRecord], None],

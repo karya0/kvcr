@@ -428,7 +428,10 @@ def test_two_guard_slots_within_a_sized_slot_cap_are_served(tmp_path, monkeypatc
             meta_inodes = {os.fstat(m[4]).st_ino for m in mapped}
             assert len(data_inodes) == len(meta_inodes) == 2
             assert not data_inodes & meta_inodes
-            assert all(os.fstat(m[4]).st_size == META for m in mapped)
+            assert all(
+                os.fstat(m[4]).st_size == table._slot_meta_bytes(slot)
+                for m, slot in zip(mapped, slots)
+            )
             (b0, s0, *_), (b1, s1, *_) = mapped
             assert b0 + s0 <= b1 or b1 + s1 <= b0
             # The slot cap holds both grants (meta is not charged against it).

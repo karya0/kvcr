@@ -163,6 +163,7 @@ _GUARD_CONFIG = KVCRGuardConfig(
 # No Guard has handed anything back, so nothing is at its handback path.
 _UNSERVED_POOL = SimpleNamespace(
     mapped_snapshot=lambda: nullcontext(None),
+    g2_index=lambda: None,
     release_snapshot_region=lambda: None,
     _spec=KVCRPoolSpec(
         pool_id="pool_3",

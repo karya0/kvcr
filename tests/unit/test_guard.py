@@ -107,6 +107,7 @@ def _fake_attachment() -> Mock:
         _spec=_TEST_SPEC,
     )
     attachment.mapped_snapshot.return_value = nullcontext(None)
+    attachment.g2_index.return_value = None
     return attachment
 
 

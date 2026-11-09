@@ -228,6 +228,7 @@ def _stand_in_pool(spec, **_) -> Mock:
     """The pool-tail surface a Guard reaches for, without a real mapping."""
     attachment = Mock(address=1234, _spec=spec)
     attachment.mapped_snapshot.return_value = nullcontext(None)
+    attachment.g2_index.return_value = None
     return attachment
 
 
