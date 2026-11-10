@@ -20,6 +20,7 @@ from kvcr.local_disk import _G3, _G3Residency
 from kvcr.memory import KVCRPoolAttachment, KVCRPoolSpec, _KVCRPoolOwner
 from kvcr.progress import _TransferRef
 from kvcr.recovery_journal import (
+    _FRAME_FORMAT,
     _FRAME_HEADER,
     _JOURNAL_HEADER_BYTES,
     _MAX_FRAME_SIZE,
@@ -92,13 +93,14 @@ def test_ring_round_trips_wraps_and_drains_streaming(
 
     assert struct.unpack_from("<Q", mapping, _INVALID_OFFSET) == (0,)
     assert struct.unpack_from("<Q", mapping, _PUBLISHED_OFFSET) == (
-        sum((6 + len(key) + len(payload) + 7) // 8 * 8 for key, payload in records),
+        sum((_FRAME_HEADER.size + len(key) + len(payload) + 7) // 8 * 8 for key, payload in records),
     )
     assert struct.unpack_from("<Q", mapping, _CONSUMED_OFFSET) == (0,)
-    assert struct.unpack_from("<HHH", mapping, _JOURNAL_HEADER_BYTES) == (
-        6 + len(records[0][0]) + len(records[0][1]),
+    assert struct.unpack_from("<HHHI", mapping, _JOURNAL_HEADER_BYTES) == (
+        _FRAME_FORMAT,
         _RECORD_BLOCK,
         len(records[0][0]),
+        _FRAME_HEADER.size + len(records[0][0]) + len(records[0][1]),
     )
     assert [journal.read_next() for _ in records] == [
         (_RECORD_BLOCK, key, payload) for key, payload in records
@@ -147,7 +149,10 @@ class _Source:
 
 @pytest.mark.parametrize(
     ("slot_count", "journal_and_mapping"),
-    [(16385, _JOURNAL_HEADER_BYTES + 128 * 1024), (1024, _TEST_JOURNAL_BYTES)],
+    [
+        (_MAX_FRAME_SIZE // 5 + 1, _JOURNAL_HEADER_BYTES + 2 * _MAX_FRAME_SIZE),
+        (1024, _TEST_JOURNAL_BYTES),
+    ],
     indirect=["journal_and_mapping"],
     ids=["frame-limit", "capacity-limit"],
 )
@@ -183,6 +188,72 @@ def test_g3_rejects_spill_that_would_exceed_recovery_frame(
     assert not journal.is_invalid()
     assert journal._published.load_acquire() == 0
     assert len(g3._free_slots) == len(slots) and not g3._pending_keys
+
+
+_MAMBA_SLOTS = 37_000
+
+
+def test_frames_past_sixteen_bits_round_trip_and_oversize_is_refused(
+    tmp_path: Path,
+) -> None:
+    """A ~37,000-slot G3 record passes preflight and survives ring and handback."""
+    journal_bytes = _JOURNAL_HEADER_BYTES + 2 * _MAX_FRAME_SIZE
+    mapping = mmap.mmap(-1, journal_bytes + mmap.PAGESIZE)
+    journal = RecoveryJournal(_attachment(mapping, journal_bytes))
+    journal.reset()
+    try:
+        key = BlockKey(b"mamba")
+        slots = tuple(range(65536, 65536 + _MAMBA_SLOTS))
+        record = _BlockRecord(g3=_G3Residency(("full", "tiny"), slots))
+        payload = msgspec.msgpack.encode(_project_recovery_record(record))
+        assert _FRAME_HEADER.size + len(key) + len(payload) > (1 << 16) - 1
+
+        # Through the publisher's preflight, as _start_store sees it.
+        g3 = object.__new__(_G3)
+        _attach_journal(_Source(), journal, g3)
+        assert g3._recovery_preflight(key, _BlockRecord(), record.g3)
+
+        # Ring.
+        assert journal.publish(_RECORD_BLOCK, bytes(key), payload)
+        assert journal.read_next() == (_RECORD_BLOCK, bytes(key), payload)
+
+        # Beyond the maximum, publish invalidates; preflight refuses beforehand.
+        too_big = bytes(_MAX_FRAME_SIZE)
+        assert not journal.publish(_RECORD_BLOCK, b"k", too_big)
+        assert journal.is_invalid()
+    finally:
+        mapping.close()
+
+    # Handback region.
+    with _attached(tmp_path, 8192 + 4096) as pool:
+        pools = (_PoolDescriptor("pool0", 2048, 1024, pool._spec.journal_bytes),)
+        terms = canonical_pool_terms(_TEST_DIGEST, pools, pool._spec)
+        write_recovery_snapshot(pool, terms, [(_RECORD_BLOCK, bytes(key), payload)])
+        assert list(read_recovery_snapshot(pool, terms)) == [
+            (_RECORD_BLOCK, bytes(key), payload)
+        ]
+        with pytest.raises(RecoveryJournalError, match="maximum"):
+            write_recovery_snapshot(pool, terms, [(_RECORD_BLOCK, b"k", too_big)])
+
+
+def test_a_sixteen_bit_frame_is_refused_not_misparsed(
+    journal_and_mapping: tuple[RecoveryJournal, mmap.mmap],
+) -> None:
+    """Old writers' frames are refused and invalidate; new frames fail old readers."""
+    journal, mapping = journal_and_mapping
+    old = struct.pack("<HHH", 6 + 1 + 2, _RECORD_BLOCK, 1) + b"kpp" + bytes(7)
+    mapping[_JOURNAL_HEADER_BYTES : _JOURNAL_HEADER_BYTES + len(old)] = old
+    journal._published.store_release(len(old))
+    with pytest.raises(RecoveryJournalError, match="unknown format"):
+        journal.read_next()
+    assert journal.is_invalid()
+
+    # What a 16-bit reader sees first: a size smaller than its own header.
+    assert journal.publish(_RECORD_BLOCK, b"k", b"p") is False  # invalid is sticky
+    journal.reset()
+    assert journal.publish(_RECORD_BLOCK, b"k", b"p")
+    (legacy_size,) = struct.unpack_from("<H", mapping, _JOURNAL_HEADER_BYTES)
+    assert legacy_size < 6
 
 
 def test_publisher_streams_mutations_until_the_journal_refuses_or_fails(
@@ -253,12 +324,15 @@ def test_invalidation_stops_every_role_until_an_owner_reset(
     assert consumer.read_next() is not None
     assert consumer.read_next() is None
 
-    # A frame past the uint16 size header is refused without publication.
+    # A frame past the maximum is refused without publication.
     before = journal._published.load_acquire()
-    assert not journal.publish(_RECORD_BLOCK, b"key", bytes(1 << 16))
+    assert not journal.publish(_RECORD_BLOCK, b"key", bytes(_MAX_FRAME_SIZE))
     assert journal._published.load_acquire() == before
     assert journal.is_invalid()
-    assert "frame is 65545 bytes; maximum is 65535 bytes" in caplog.text
+    assert (
+        f"frame is {_FRAME_HEADER.size + 3 + _MAX_FRAME_SIZE} bytes; "
+        f"maximum is {_MAX_FRAME_SIZE} bytes"
+    ) in caplog.text
 
     # Caught up and finished look identical unless the shared flag is re-read.
     with pytest.raises(RecoveryJournalError, match="invalid"):
@@ -289,7 +363,9 @@ def test_invalidation_stops_every_role_until_an_owner_reset(
     # A frame header declaring less than its own key is a corrupt ring.
     journal.reset()
     assert journal.publish(_RECORD_BLOCK, b"key", b"payload")
-    struct.pack_into("<HH", mapping, _JOURNAL_HEADER_BYTES, 2, 0)
+    struct.pack_into(
+        "<HHHI", mapping, _JOURNAL_HEADER_BYTES, _FRAME_FORMAT, _RECORD_BLOCK, 0, 2
+    )
     with pytest.raises(RecoveryJournalError, match="key size"):
         journal.read_next()
     assert journal.is_invalid()
@@ -297,7 +373,7 @@ def test_invalidation_stops_every_role_until_an_owner_reset(
     # Alignment padding the producer left as zeros must still be zeros.
     journal.reset()
     assert journal.publish(_RECORD_BLOCK, b"keys", b"x")
-    mapping[_JOURNAL_HEADER_BYTES + 12] = 1
+    mapping[_JOURNAL_HEADER_BYTES + 15] = 1
     with pytest.raises(RecoveryJournalError, match="padding"):
         journal.read_next()
     assert journal.is_invalid()

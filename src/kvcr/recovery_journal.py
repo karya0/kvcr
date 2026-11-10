@@ -64,10 +64,16 @@ class _AtomicU64:
 _INVALID_OFFSET, _PUBLISHED_OFFSET, _CONSUMED_OFFSET = 0, 128, 192
 _VALID, _INVALID = 0, 1
 _ALIGNMENT = 8
-_MAX_FRAME_SIZE = (1 << 16) - 1
-# Size, record type, key size. Per frame because BlockKey has no declared
-# width, so nothing would make a lease-wide key size true.
-_FRAME_HEADER = struct.Struct("<HHH")
+# 4 MiB: ~20x the largest measured Mamba G3 record (~185 KB at ~37,000 slots) and
+# 4% of the default 100 MiB ring, so one record cannot dominate the ring. The ring
+# and handback readers still bound any frame by the bytes actually published.
+_MAX_FRAME_SIZE = 1 << 22
+# Format, record type, key size, size. Per frame because BlockKey has no declared
+# width, so nothing would make a lease-wide key size true. The format leads so a
+# 16-bit-size reader sees a size below its own header and refuses the frame, and
+# this reader refuses a legacy frame whose leading size is at least 6.
+_FRAME_FORMAT = 2
+_FRAME_HEADER = struct.Struct("<HHHI")
 
 # A reader must never infer a record's kind from whether it happens to decode.
 _RECORD_BLOCK = 1
@@ -276,9 +282,11 @@ class RecoveryJournal:
             return None
 
         position = consumed % self._capacity
-        frame_size, record_type, key_size = _FRAME_HEADER.unpack(
+        frame_format, record_type, key_size, frame_size = _FRAME_HEADER.unpack(
             self._read_ring(mapping, position, _FRAME_HEADER.size)
         )
+        if frame_format != _FRAME_FORMAT:
+            raise self._fail(f"journal frame has an unknown format: {frame_format}")
         if frame_size < _FRAME_HEADER.size + key_size:
             raise self._fail("journal frame has an invalid key size")
         if record_type not in _RECORD_TYPES:
@@ -579,7 +587,7 @@ def _pack_frame(record_type: int, key: bytes, payload: bytes, size: int) -> byte
     """
     frame = bytearray(size)
     frame_size = _FRAME_HEADER.size + len(key) + len(payload)
-    _FRAME_HEADER.pack_into(frame, 0, frame_size, record_type, len(key))
+    _FRAME_HEADER.pack_into(frame, 0, _FRAME_FORMAT, record_type, len(key), frame_size)
     body_start = _FRAME_HEADER.size + len(key)
     frame[_FRAME_HEADER.size : body_start] = key
     frame[body_start:frame_size] = payload
@@ -601,7 +609,7 @@ def _recovery_frames(
 # bytes under the same file and layout. The generation stops a replay into a
 # different pool of the same shape; the digest separates finished from filling.
 _SNAPSHOT_HEADER = struct.Struct("<32sQ")
-_SNAPSHOT_DOMAIN = b"KVCR-HANDBACK\0"
+_SNAPSHOT_DOMAIN = b"KVCR-HANDBACK2\0"
 _SNAPSHOT_TERMS = struct.Struct("<QQQQ")
 
 
@@ -708,9 +716,13 @@ def read_recovery_snapshot(
         while offset < end:
             if end - offset < _FRAME_HEADER.size:
                 raise RecoveryJournalError("handback frame header is truncated")
-            frame_size, record_type, key_size = _FRAME_HEADER.unpack_from(
+            frame_format, record_type, key_size, frame_size = _FRAME_HEADER.unpack_from(
                 region, offset
             )
+            if frame_format != _FRAME_FORMAT:
+                raise RecoveryJournalError(
+                    f"handback frame has an unknown format: {frame_format}"
+                )
             if frame_size < _FRAME_HEADER.size + key_size or offset + frame_size > end:
                 raise RecoveryJournalError("handback frame is malformed")
             if record_type not in _RECORD_TYPES:
