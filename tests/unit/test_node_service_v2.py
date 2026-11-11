@@ -1475,8 +1475,14 @@ def test_dgd_retained_agent_lives_until_last_reclaim(
     table.agents.close()
 
 
-def _dgd_discovery_api(monkeypatch, preferred, versions, serving):
-    """Fake discovery: only versions in `serving` list the DGD resource."""
+def _dgd_discovery_api(
+    monkeypatch, preferred, versions, serving, status_only=(), failing=()
+):
+    """Fake discovery: only versions in `serving` list the DGD resource.
+
+    Versions in `status_only` list only names that extend it; URLs in
+    `failing` answer 500 while they are in it.
+    """
     api = object.__new__(node_service.InClusterDGDAPI)
     api._url, api._namespace, api._version = "https://kube", "ns", None
     group = "https://kube/apis/nvidia.com"
@@ -1485,6 +1491,8 @@ def _dgd_discovery_api(monkeypatch, preferred, versions, serving):
     def request(method, suffix="", body=None):
         url = api._url + suffix
         calls.append(url)
+        if url in failing:
+            raise node_service.PodAPIError(500, method)
         if url == group:
             return {
                 "preferredVersion": {"version": preferred},
@@ -1494,11 +1502,12 @@ def _dgd_discovery_api(monkeypatch, preferred, versions, serving):
             }
         version = url[len(group) + 1 :].split("/")[0]
         if url == f"{group}/{version}":
-            names = (
-                ["dynamographdeployments", "dynamographdeployments/status"]
-                if version in serving
-                else ["dynamocomponentdeployments"]
-            )
+            if version in serving:
+                names = ["dynamographdeployments", "dynamographdeployments/status"]
+            elif version in status_only:
+                names = ["dynamographdeployments/status", "dynamographdeploymentsets"]
+            else:
+                names = ["dynamocomponentdeployments"]
             return {"resources": [{"name": n} for n in names]}
         if version not in serving:
             raise node_service.PodAPIError(404, method)
@@ -1564,6 +1573,39 @@ def test_dgd_version_fails_closed_when_no_version_serves_the_kind(monkeypatch):
         api.get("lineage")
     assert api._version is None  # rediscovered on the next lookup
     assert _cr_url("v1") not in calls
+
+
+def test_dgd_version_needs_the_exact_resource_name(monkeypatch):
+    # v1 lists only the status subresource and a longer name with the prefix.
+    api, calls = _dgd_discovery_api(
+        monkeypatch, "v1", ["v1", "v1beta1"], {"v1beta1"}, status_only={"v1"}
+    )
+    assert api.get("lineage")["metadata"]["uid"] == "X"
+    assert api._version == "v1beta1"
+    assert _cr_url("v1") not in calls
+
+
+@pytest.mark.parametrize("failing", ["", "/v1"])
+def test_dgd_discovery_failure_fails_closed_and_rediscovers(monkeypatch, failing):
+    # A 500 on the group read or on a version read caches nothing.
+    failing = {"https://kube/apis/nvidia.com" + failing}
+    api, calls = _dgd_discovery_api(
+        monkeypatch, "v1", ["v1", "v1beta1"], {"v1beta1"}, failing=failing
+    )
+    with pytest.raises(node_service.PodAPIError) as error:
+        api.get("lineage")
+    assert error.value.status == 500
+    assert api._version is None
+    assert not any("/namespaces/" in url for url in calls)
+    failing.clear()
+    del calls[:]
+    assert api.get("lineage")["metadata"]["uid"] == "X"
+    assert calls == [
+        "https://kube/apis/nvidia.com",
+        "https://kube/apis/nvidia.com/v1",
+        "https://kube/apis/nvidia.com/v1beta1",
+        _cr_url("v1beta1"),
+    ]
 
 
 def test_dgd_get_during_another_threads_discovery():
