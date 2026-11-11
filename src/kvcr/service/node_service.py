@@ -315,31 +315,38 @@ class InClusterDGDAPI(InClusterPodAPI):
 
     def __init__(self, namespace: str):
         super().__init__(namespace)
-        self._base = self._url.split("/api/v1/")[0]
+        # _url stays the API server root; each request passes its full path
+        # as the suffix, so concurrent get() calls share no half-built URL.
+        self._url = self._url.split("/api/v1/")[0]
         self._namespace = namespace
         self._version = None
 
     def get(self, name: str) -> dict[str, Any] | None:
-        if self._version is None:
-            self._url = self._base + "/apis/nvidia.com"
-            group = self._request("GET")
+        version = self._version
+        if version is None:
+            group = self._request("GET", "/apis/nvidia.com")
             # The preferred version need not serve the kind (v1 may not);
             # try it first, then the server's priority order.
             versions = [group["preferredVersion"]["version"]]
             versions += [v["version"] for v in group["versions"]]
             for version in dict.fromkeys(versions):
-                self._url = f"{self._base}/apis/nvidia.com/{version}"
-                resources = self._request("GET")["resources"]
+                path = f"/apis/nvidia.com/{version}"
+                resources = self._request("GET", path)["resources"]
                 if any(r["name"] == "dynamographdeployments" for r in resources):
-                    self._version = version
                     break
             else:
                 raise ValueError("no nvidia.com version serves dynamographdeployments")
-        self._url = (
-            f"{self._base}/apis/nvidia.com/{self._version}/namespaces/"
-            f"{self._namespace}/dynamographdeployments"
+            self._version = version
+        path = (
+            f"/apis/nvidia.com/{version}/namespaces/{self._namespace}"
+            f"/dynamographdeployments/{urllib.parse.quote(name, safe='')}"
         )
-        return super().get(name)
+        try:
+            return self._request("GET", path)
+        except PodAPIError as error:
+            if error.status == 404:
+                return None
+            raise
 
 
 class NodeBroker:
