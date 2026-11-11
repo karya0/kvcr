@@ -1478,7 +1478,7 @@ def test_dgd_retained_agent_lives_until_last_reclaim(
 def _dgd_discovery_api(monkeypatch, preferred, versions, serving):
     """Fake discovery: only versions in `serving` list the DGD resource."""
     api = object.__new__(node_service.InClusterDGDAPI)
-    api._base, api._namespace, api._version = "https://kube", "ns", None
+    api._url, api._namespace, api._version = "https://kube", "ns", None
     group = "https://kube/apis/nvidia.com"
     calls = []
 
@@ -1564,6 +1564,77 @@ def test_dgd_version_fails_closed_when_no_version_serves_the_kind(monkeypatch):
         api.get("lineage")
     assert api._version is None  # rediscovered on the next lookup
     assert _cr_url("v1") not in calls
+
+
+def test_dgd_get_during_another_threads_discovery():
+    """A claim thread and the poll thread discover the version concurrently.
+
+    A pauses mid-discovery while B discovers and reaches its CR read; A then
+    issues its next discovery request before B builds its request. Neither
+    thread may read a URL the other built, and B must not see a 404 (None,
+    "DGD gone") for a live DGD.
+    """
+    api = object.__new__(node_service.InClusterDGDAPI)
+    # _base too, so the test also runs against the pre-fix class.
+    api._url = api._base = "https://kube"
+    api._namespace, api._version = "ns", None
+    group = "https://kube/apis/nvidia.com"
+    a_paused, b_at_cr, a_rediscovering, b_built = (threading.Event() for _ in range(4))
+    urls = {"A": [], "B": []}
+    results, errors = {}, {}
+
+    def wait(event):
+        assert event.wait(10), "interleaving stalled"
+
+    def request(method, suffix="", body=None):
+        thread = threading.current_thread().name
+        step = len(urls[thread])
+        if (thread, step) == ("B", 2):  # B's CR read, before it builds the URL
+            b_at_cr.set()
+            wait(a_rediscovering)
+        url = api._url + suffix  # as InClusterPodAPI._request builds it
+        urls[thread].append(url)
+        if (thread, step) == ("A", 0):  # A's group read: let B run
+            a_paused.set()
+            wait(b_at_cr)
+        elif (thread, step) == ("A", 1):  # A's version read: B builds now
+            a_rediscovering.set()
+            wait(b_built)
+        elif (thread, step) == ("B", 2):
+            b_built.set()
+        if url == group:
+            return {
+                "preferredVersion": {"version": "v1beta1"},
+                "versions": [{"version": "v1beta1"}, {"version": "v1alpha1"}],
+            }
+        if url == f"{group}/v1beta1":
+            return {"resources": [{"name": "dynamographdeployments"}]}
+        if url == _cr_url("v1beta1"):
+            return {"metadata": {"uid": "X"}}
+        raise node_service.PodAPIError(404, method)
+
+    api._request = request
+
+    def run():
+        name = threading.current_thread().name
+        try:
+            results[name] = api.get("lineage")
+        except Exception as error:  # reported by the assertions below
+            errors[name] = error
+
+    a = threading.Thread(target=run, name="A", daemon=True)
+    b = threading.Thread(target=run, name="B", daemon=True)
+    a.start()
+    wait(a_paused)
+    b.start()
+    for thread in (a, b):
+        thread.join(15)
+        assert not thread.is_alive()
+    expected = [group, f"{group}/v1beta1", _cr_url("v1beta1")]
+    assert urls == {"A": expected, "B": expected}
+    assert errors == {}
+    assert results == {"A": {"metadata": {"uid": "X"}}, "B": {"metadata": {"uid": "X"}}}
+    assert api._version == "v1beta1"
 
 
 def test_guard_reclaim_finishes_before_replacement():
