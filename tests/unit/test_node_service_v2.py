@@ -1637,23 +1637,95 @@ def test_dgd_retained_agent_lives_until_last_reclaim(
     table.agents.close()
 
 
-def test_dgd_served_version_discovery(monkeypatch):
+def _dgd_discovery_api(monkeypatch, preferred, versions, serving):
+    """Fake discovery: only versions in `serving` list the DGD resource."""
     api = object.__new__(node_service.InClusterDGDAPI)
     api._base, api._namespace, api._version = "https://kube", "ns", None
+    group = "https://kube/apis/nvidia.com"
     calls = []
 
     def request(method, suffix="", body=None):
-        calls.append(api._url + suffix)
-        if api._url == "https://kube/apis/nvidia.com":
-            return {"preferredVersion": {"version": "v1beta1"}}
+        url = api._url + suffix
+        calls.append(url)
+        if url == group:
+            return {
+                "preferredVersion": {"version": preferred},
+                "versions": [
+                    {"groupVersion": f"nvidia.com/{v}", "version": v} for v in versions
+                ],
+            }
+        version = url[len(group) + 1 :].split("/")[0]
+        if url == f"{group}/{version}":
+            names = (
+                ["dynamographdeployments", "dynamographdeployments/status"]
+                if version in serving
+                else ["dynamocomponentdeployments"]
+            )
+            return {"resources": [{"name": n} for n in names]}
+        if version not in serving:
+            raise node_service.PodAPIError(404, method)
         return {"metadata": {"uid": "X"}}
 
     monkeypatch.setattr(api, "_request", request)
+    return api, calls
+
+
+def _cr_url(version):
+    return (
+        f"https://kube/apis/nvidia.com/{version}/namespaces/ns/"
+        "dynamographdeployments/lineage"
+    )
+
+
+def test_dgd_served_version_discovery(monkeypatch):
+    api, calls = _dgd_discovery_api(
+        monkeypatch, "v1beta1", ["v1beta1", "v1alpha1"], {"v1beta1", "v1alpha1"}
+    )
     assert api.get("lineage")["metadata"]["uid"] == "X"
     assert calls == [
         "https://kube/apis/nvidia.com",
-        "https://kube/apis/nvidia.com/v1beta1/namespaces/ns/dynamographdeployments/lineage",
+        "https://kube/apis/nvidia.com/v1beta1",
+        _cr_url("v1beta1"),
     ]
+
+
+def test_dgd_version_skips_group_preferred_version_without_the_kind(monkeypatch):
+    # The group prefers v1, which does not serve dynamographdeployments.
+    api, calls = _dgd_discovery_api(
+        monkeypatch, "v1", ["v1", "v1beta1", "v1alpha1"], {"v1beta1", "v1alpha1"}
+    )
+    assert api.get("lineage")["metadata"]["uid"] == "X"
+    assert api.get("lineage")["metadata"]["uid"] == "X"  # version is cached
+    assert calls == [
+        "https://kube/apis/nvidia.com",
+        "https://kube/apis/nvidia.com/v1",
+        "https://kube/apis/nvidia.com/v1beta1",
+        _cr_url("v1beta1"),
+        _cr_url("v1beta1"),
+    ]
+
+
+def test_dgd_version_choice_when_several_versions_serve_the_kind(monkeypatch):
+    # Preferred version does not serve it: first serving version in list order.
+    api, _ = _dgd_discovery_api(
+        monkeypatch, "v1", ["v1", "v1alpha1", "v1beta1"], {"v1alpha1", "v1beta1"}
+    )
+    api.get("lineage")
+    assert api._version == "v1alpha1"
+    # Preferred version serves it: preferred wins over list order.
+    api, _ = _dgd_discovery_api(
+        monkeypatch, "v1beta1", ["v1alpha1", "v1beta1"], {"v1alpha1", "v1beta1"}
+    )
+    api.get("lineage")
+    assert api._version == "v1beta1"
+
+
+def test_dgd_version_fails_closed_when_no_version_serves_the_kind(monkeypatch):
+    api, calls = _dgd_discovery_api(monkeypatch, "v1", ["v1", "v1beta1"], set())
+    with pytest.raises(ValueError, match="dynamographdeployments"):
+        api.get("lineage")
+    assert api._version is None  # rediscovered on the next lookup
+    assert _cr_url("v1") not in calls
 
 
 def test_guard_reclaim_finishes_before_replacement():

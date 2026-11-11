@@ -311,7 +311,7 @@ def _contains(actual: Any, expected: Any) -> bool:
 
 
 class InClusterDGDAPI(InClusterPodAPI):
-    """Namespace CR reads, using the API group's advertised preferred version."""
+    """Namespace CR reads, using a group version that serves the DGD resource."""
 
     def __init__(self, namespace: str):
         super().__init__(namespace)
@@ -322,7 +322,19 @@ class InClusterDGDAPI(InClusterPodAPI):
     def get(self, name: str) -> dict[str, Any] | None:
         if self._version is None:
             self._url = self._base + "/apis/nvidia.com"
-            self._version = self._request("GET")["preferredVersion"]["version"]
+            group = self._request("GET")
+            # The preferred version need not serve the kind (v1 may not);
+            # try it first, then the server's priority order.
+            versions = [group["preferredVersion"]["version"]]
+            versions += [v["version"] for v in group["versions"]]
+            for version in dict.fromkeys(versions):
+                self._url = f"{self._base}/apis/nvidia.com/{version}"
+                resources = self._request("GET")["resources"]
+                if any(r["name"] == "dynamographdeployments" for r in resources):
+                    self._version = version
+                    break
+            else:
+                raise ValueError("no nvidia.com version serves dynamographdeployments")
         self._url = (
             f"{self._base}/apis/nvidia.com/{self._version}/namespaces/"
             f"{self._namespace}/dynamographdeployments"
