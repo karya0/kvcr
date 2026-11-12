@@ -66,10 +66,13 @@ def populate_wait_s(data_bytes: int, base_s: float = READINESS_WAIT_S) -> float:
 def claim_wait_s(data_bytes: int) -> float:
     """How long a v2 claimant waits for its grant.
 
-    The service spends up to READINESS_WAIT_S on the holder pod, then
-    populate_wait_s() on its report; wait 20 s longer than both.
+    A claim short of capacity may first reclaim an expired slot and wait up
+    to READINESS_WAIT_S for that slot's holder pod to go; the claimant cannot
+    know whether it will, so the wait is always counted. Then the service
+    spends up to READINESS_WAIT_S on the new holder pod, then
+    populate_wait_s() on its report; wait 20 s longer than all three.
     """
-    return READINESS_WAIT_S + populate_wait_s(data_bytes) + 20
+    return READINESS_WAIT_S + READINESS_WAIT_S + populate_wait_s(data_bytes) + 20
 
 
 class _G3Config(msgspec.Struct, frozen=True, forbid_unknown_fields=True):

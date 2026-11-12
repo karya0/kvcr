@@ -188,12 +188,27 @@ def test_receive_timeout_default_outlasts_the_server_wait():
         return claimant.argparse.Namespace(**{**base, **kw})
 
     gib = 1 << 30
-    assert claimant._receive_timeout_s(args(maximum_bytes=150 * gib)) == 680
-    assert claimant._receive_timeout_s(args(total_bytes=62 * gib)) == 504
+    assert claimant._receive_timeout_s(args(maximum_bytes=150 * gib)) == 860
+    assert claimant._receive_timeout_s(args(total_bytes=62 * gib)) == 684
     assert (
         claimant._receive_timeout_s(args(maximum_bytes=150 * gib, receive_timeout_s=7))
         == 7
     )
+
+
+def test_claim_wait_covers_a_reclaim_wait_and_the_holder_wait():
+    import inspect
+
+    from kvcr.service.protocol import READINESS_WAIT_S, claim_wait_s, populate_wait_s
+
+    data = 32 << 30
+    # The holder: readiness of its pod, then population of the slot.
+    holder = READINESS_WAIT_S + populate_wait_s(data)
+    # A reclaim first waits up to ensure_timeout_s for the old holder pod
+    # (SlotTable.release -> _settle_retiring); the claimant cannot know
+    # whether one will happen.
+    reclaim = inspect.signature(SlotTable).parameters["ensure_timeout_s"].default
+    assert claim_wait_s(data) >= holder + reclaim
 
 
 def test_readiness_wait_is_shared_by_service_and_protocol():
