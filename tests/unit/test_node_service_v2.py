@@ -1342,6 +1342,37 @@ def test_dgd_successor_replaced_between_polls_can_rebind(tmp_path, pools):
     assert table._lineages["t/l"]["dgd_uid"] == "Z"
 
 
+def test_dgd_stale_read_cannot_spend_the_rebind(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path)
+    dgd.put("l", "X")
+    slot = _lineage_claim(table, claim_id="x")
+    stale = copy.deepcopy(dgd.crs["l"])
+    original, paused = dgd.get, []
+
+    def get(name):
+        if paused:
+            return original(name)
+        paused.append(name)
+        # While A's read of X is in flight: X -> Y (rebind), then Y is
+        # replaced by Z and the poll clears the rebind for Z.
+        del dgd.crs["l"]
+        table.poll_dgds()
+        dgd.put("l", "Y")
+        assert _lineage_claim(table, claim_id="y") is slot
+        dgd.put("l", "Z")
+        table.poll_dgds()
+        return stale
+
+    dgd.get = get
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table, claim_id="a")
+    assert raised.value.reason == SLOT_HELD
+    rec = table._lineages["t/l"]
+    assert rec["dgd_uid"] == "Y" and not rec["rebound"]
+    assert _lineage_claim(table, claim_id="z") is slot
+    assert table._lineages["t/l"]["dgd_uid"] == "Z"
+
+
 def test_dgd_reclaims_only_expired_retention_and_stands_down(
     tmp_path, pools, monkeypatch
 ):
