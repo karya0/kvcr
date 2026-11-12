@@ -95,7 +95,6 @@ def _is_recoverable(record: _BlockRecord) -> bool:
 def _project_recovery_record(
     record: _BlockRecord, *, g3_only: bool = False
 ) -> _RecoveryBlock:
-    """``g3_only`` when the pool headers carry G2: only G3 and position go out."""
     disk = record.g3
     local_dram = record.local_dram
     complete = (
@@ -393,10 +392,7 @@ class _RecoveryMirror:
 def _attach_journal(
     local_dram: _LocalDramPools, journal: RecoveryJournal, g3: _G3 | None = None
 ) -> None:
-    """Attach stable G2/G3 residency publication to one journal.
-
-    With pool headers attached, they carry G2 and the journal only G3.
-    """
+    """Attach stable G2/G3 residency publication; with pool headers, G3 only."""
     indexed = bool(local_dram._headers)
     enabled = True
 
@@ -520,8 +516,9 @@ def claim_guarded_pool(
             hold._attachment,
             guard_config.compatibility_digest,
             hold._pools,
-            hold.pool_headers,
         )
+        if hold.pool_headers:  # G2 is in the pools themselves
+            recovered.adopt(recover_g2(recovered.take_records(), hold.pool_headers))
     except BaseException:
         # A failing release must not mask the error that made the claim unusable.
         with suppress(BaseException):
@@ -563,7 +560,7 @@ def adopt_claimed_pool(core: _KVCRCore, claimed: ClaimedPool) -> None:
         dangling.dead_incarnations.update(hold._dead_incarnations)
     if core._local_dram is None:
         raise ValueError("a claimed pool must give the core its local DRAM tier")
-    core._local_dram._pools.attach_headers(hold.pool_headers)
+    core._local_dram._pools._headers = hold.pool_headers
     _attach_journal(
         core._local_dram._pools, RecoveryJournal(hold._attachment), core._g3
     )
@@ -601,10 +598,7 @@ def _pack_frame(record_type: int, key: bytes, payload: bytes, size: int) -> byte
 def _recovery_frames(
     records: Mapping[BlockKey, _BlockRecord], *, g3_only: bool = False
 ) -> Iterator[tuple[int, bytes, bytes]]:
-    """Every frame a returning primary needs to rebuild this state.
-
-    ``g3_only`` when the pool headers carry G2.
-    """
+    """Every frame a returning primary needs to rebuild this state."""
     for key, record in records.items():
         if not _is_recoverable(record) or (g3_only and record.g3 is None):
             continue
@@ -745,11 +739,8 @@ def read_handback(
     pool: KVCRPoolAttachment,
     compatibility_digest: str,
     pools: tuple[_PoolDescriptor, ...],
-    headers: dict[str, PoolHeader] | None = None,
 ) -> _RecoveryMirror:
     """Replay whatever the last Guard left for this pool, if anything.
-
-    With ``headers`` (a claimant taking the pool) G2 comes from them instead.
 
     A region that disagrees about terms is refused, not discarded: every pool of
     a service runs one configuration for its lifetime, so terms that disagree
@@ -768,9 +759,7 @@ def read_handback(
             "KVCR discarding a handback region that was never finished", exc_info=True
         )
         pool.release_snapshot_region()
-        mirror = _RecoveryMirror(pool_names)
-    if headers:
-        mirror.adopt(recover_g2(mirror.take_records(), headers))
+        return _RecoveryMirror(pool_names)
     return mirror
 
 

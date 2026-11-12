@@ -179,7 +179,7 @@ def test_pool_headers_index_ready_blocks_and_clear_freed_slots() -> None:
         ],
     )
     pools = kvcr._core._local_dram._pools
-    pools.attach_headers({"": header})
+    pools._headers = {"": header}
     key, other = BlockKey(b"k0"), BlockKey(b"k10")
     assert not pools.indexable(key, ["", ""])  # a pool twice is not indexed
     stored = kvcr.deposit({key: [_mem_descriptor(0)]})

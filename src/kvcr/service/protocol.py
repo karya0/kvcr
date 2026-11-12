@@ -827,28 +827,18 @@ def _map_data_pool(
     elif granted != gaas.total_bytes:
         problem = f"granted {granted} bytes, requested total {gaas.total_bytes}"
     else:
+        mapping = None
         try:
             ranges = pool_ranges(granted, layouts, key_size)
             mapping = RegionMapping(region_fds, response.regions)
+            base = mapping.address
+            headers = pool_headers(base, ranges, layouts, key_size)
+            pools = [(name, base + data, size) for name, _, data, size in ranges]
+            return mapping, pools, headers
         except (OSError, ValueError) as error:
-            problem = f"cannot map the regions: {error}"
-        else:
-            headers = pool_headers(mapping.address, ranges, layouts, key_size)
-            try:
-                for header in headers.values():
-                    header.verify()
-            except ValueError as error:
+            if mapping is not None:
                 mapping.close()
-                problem = str(error)
-            else:
-                return (
-                    mapping,
-                    [
-                        (name, mapping.address + data, size)
-                        for name, _, data, size in ranges
-                    ],
-                    headers,
-                )
+            problem = f"cannot map the regions: {error}"
     raise KVCRServiceReasonError(f"v2 data pool refused: {problem}", DATA_POOL_LAYOUT)
 
 

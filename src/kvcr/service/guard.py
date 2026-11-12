@@ -953,12 +953,12 @@ class _Guard:
                 address, size, *_, key_size = data_pool
                 layouts = list(tier_config.pool_layouts)
                 try:
-                    ranges = pool_ranges(size, layouts, key_size)
-                    headers = pool_headers(address, ranges, layouts, key_size)
-                    for header in headers.values():
-                        header.verify(initialize=True)
-                    if not headers and has_header(address):
+                    if key_size is None and has_header(address):
                         raise ValueError("it holds the headers of a claim with keys")
+                    ranges = pool_ranges(size, layouts, key_size)
+                    headers = pool_headers(
+                        address, ranges, layouts, key_size, initialize=True
+                    )
                 except ValueError as error:
                     raise KVCRServiceReasonError(
                         f"v2 data pool refused: {error}", DATA_POOL_LAYOUT
@@ -1298,7 +1298,7 @@ class _Guard:
                 ),
             ),
         )
-        core._local_dram._pools.attach_headers(self._recovery.headers)
+        core._local_dram._pools._headers = self._recovery.headers
         self._core = core
         self._log_promotion_stage("core_init_done")
         # Registration can take long; promotion's start() waits for it.

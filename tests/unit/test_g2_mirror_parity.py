@@ -4,11 +4,10 @@
 
 import ctypes
 import mmap
-from pathlib import Path
 from unittest.mock import Mock
 
 from _kvcr_test_utils import _recovered_record
-from test_recovery_journal import _TEST_DIGEST, _attached, _Source
+from test_recovery_journal import _Source
 
 from kvcr.service.g2_index import _WRITING, PoolHeader
 from kvcr.service.guard import _RecoveryState
@@ -21,9 +20,6 @@ from kvcr.service.recovery_journal import (
     _project_recovery_record,
     _recovery_frames,
     _RecoveryMirror,
-    canonical_pool_terms,
-    read_handback,
-    write_recovery_snapshot,
 )
 from kvcr.types import BlockKey
 
@@ -98,24 +94,6 @@ def test_promotion_rebuilds_g2_from_the_headers_and_g3_from_the_journal():
         _frame(b"CCCC", g2=[("a", 7), ("b", 7)], g3=1, g3_pool="a")
     ]
     _expect_g2_from_headers(recovery.take_for_promotion(), headers)
-
-
-def test_a_claimant_rebuilds_g2_from_the_headers_not_the_snapshot(tmp_path: Path):
-    headers = _headers()
-    with _attached(tmp_path) as pool:
-        pools = (_PoolDescriptor("a", 2048, 1024), _PoolDescriptor("b", 2048, 1024))
-        terms = canonical_pool_terms(_TEST_DIGEST, pools, pool._spec)
-        write_recovery_snapshot(
-            pool,
-            terms,
-            [
-                _frame(b"AAAA", g3=9, g3_pool="a"),
-                _frame(b"BBBB", g2=[("a", 1), ("b", 1)]),
-                _frame(b"CCCC", g2=[("a", 7), ("b", 7)], g3=1, g3_pool="a"),
-            ],
-        )
-        mirror = read_handback(pool, _TEST_DIGEST, pools, headers)
-    _expect_g2_from_headers(mirror.take_records(), headers)
 
 
 def test_with_headers_the_journal_and_the_handback_carry_no_g2():

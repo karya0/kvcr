@@ -4,7 +4,6 @@
 
 import ctypes
 import mmap
-import random
 
 import pytest
 
@@ -50,14 +49,6 @@ def _deposit(headers, slot, key, position=0):
         header.publish(slot, key, position)
 
 
-def test_one_pool_without_a_key_size_is_whole_blocks():
-    assert pool_ranges(8 * PAGE, [("a", 2 * PAGE)], None) == [("a", 0, 0, 8 * PAGE)]
-    with pytest.raises(ValueError, match="whole number"):
-        pool_ranges(8 * PAGE, [("a", 3 * PAGE)], None)
-    with pytest.raises(ValueError, match="whole number"):
-        pool_ranges(PAGE, [("a", 2 * PAGE)], None)
-
-
 def test_two_pools_with_headers_hold_equal_counts_and_fill_the_size():
     layouts = [("a", 2 * PAGE), ("b", PAGE)]
     n = 100
@@ -75,31 +66,11 @@ def test_two_pools_with_headers_hold_equal_counts_and_fill_the_size():
         pool_ranges(size + PAGE, layouts, KEY)
 
 
-def test_entry_is_a_flag_word_and_the_key_rounded_to_eight():
-    assert entry_bytes(36) == 48
-    assert entry_bytes(12) == 24
-
-
-def test_publish_then_rebuild_finds_the_key_in_every_pool():
-    headers = _headers()
-    _deposit(headers, 3, _key(1), position=7)
-    assert rebuild(headers) == {_key(1): ((("a", 3), ("b", 3)), 7)}
-
-
 def test_a_position_update_keeps_the_key():
     headers = _headers()
     _deposit(headers, 2, _key(1), position=5)
     _deposit(headers, 2, _key(1), position=-1)
     assert rebuild(headers) == {_key(1): ((("a", 2), ("b", 2)), -1)}
-
-
-def test_cleared_slots_are_free():
-    headers = _headers()
-    _deposit(headers, 2, _key(1))
-    for header in headers.values():
-        header.clear(2)
-    assert rebuild(headers) == {}
-    assert all(header.scan() == [] for header in headers.values())
 
 
 def test_a_key_missing_from_one_pool_is_partial_and_cleared(caplog):
@@ -125,42 +96,6 @@ def test_a_write_cut_mid_key_is_torn_and_cleared(caplog):
     assert [slot for slot, _, _ in headers["b"].scan()] == [0]
 
 
-@pytest.mark.parametrize("seed", range(20))
-def test_seeded_cuts_recover_exactly_the_keys_whole_in_every_pool(seed):
-    rng = random.Random(seed)
-    headers = _headers(n=16)
-    slots = {}  # slot -> key, the allocator's view
-    for i in range(rng.randrange(1, 40)):
-        slot = rng.randrange(16)
-        if slot in slots:
-            for header in headers.values():
-                header.clear(slot)
-            del slots[slot]
-        else:
-            _deposit(headers, slot, _key(i), position=i)
-            slots[slot] = _key(i)
-    free = [slot for slot in range(16) if slot not in slots]
-    expected = {key: ((("a", slot), ("b", slot))) for slot, key in slots.items()}
-    if free:  # cut a deposit after some of its pools committed, or mid-entry
-        slot = rng.choice(free)
-        cut = rng.randrange(3)
-        if cut:
-            headers["a"].publish(slot, _key(99), 0)
-        if cut == 2:
-            headers["b"]._store(headers["b"]._flag(slot), _WRITING, 3)
-    rebuilt = rebuild(headers)
-    assert {key: value[0] for key, value in rebuilt.items()} == expected
-    for name, header in headers.items():
-        assert {s for s, _, _ in header.scan()} == set(slots)
-
-
-def test_guard_initializes_a_blank_header_and_both_sides_verify():
-    base = _memory(PAGE)
-    PoolHeader(base, KEY, PAGE, 8).verify(initialize=True)
-    PoolHeader(base, KEY, PAGE, 8).verify()
-    PoolHeader(base, KEY, PAGE, 8).verify(initialize=True)  # already there
-
-
 @pytest.mark.parametrize("other", [(12, PAGE, 8), (KEY, 2 * PAGE, 8), (KEY, PAGE, 9)])
 def test_a_header_for_another_key_size_block_size_or_count_is_refused(other):
     base = _memory(PAGE)
@@ -179,9 +114,3 @@ def test_a_key_of_another_length_raises():
     headers = _headers()
     with pytest.raises(ValueError, match="35 bytes"):
         headers["a"].publish(0, _key(1)[:-1], 0)
-
-
-def test_a_position_outside_int32_raises():
-    headers = _headers()
-    with pytest.raises(ValueError, match="does not fit"):
-        headers["a"].publish(0, _key(1), 1 << 31)

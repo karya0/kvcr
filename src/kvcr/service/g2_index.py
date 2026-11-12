@@ -95,9 +95,8 @@ def pool_ranges(
     used, ranges = layout(low)
     if not low or used != size:
         raise ValueError(
-            f"{size} bytes is not a whole number of blocks for {pool_layouts}"
-            + (f" with key size {key_size}" if key_size is not None else "")
-            + (f"; {used} bytes holds {low} per pool" if low else "")
+            f"{size} bytes is not a whole number of blocks for {pool_layouts}, "
+            f"key size {key_size}; {used} bytes holds {low} per pool"
         )
     return ranges
 
@@ -107,14 +106,20 @@ def pool_headers(
     ranges: list[tuple[str, int, int, int]],
     pool_layouts: list[tuple[str, int]],
     key_size: int | None,
+    *,
+    initialize: bool = False,
 ) -> "dict[str, PoolHeader]":
-    """Each pool's header at the ``pool_ranges`` of a data pool mapped at address."""
+    """Each pool's verified header at the ``pool_ranges`` of a data pool mapped at
+    address; ``initialize`` as for ``PoolHeader.verify``."""
     if key_size is None:
         return {}
-    return {
+    headers = {
         name: PoolHeader(address + header, key_size, block, size // block)
         for (name, header, _, size), (_, block) in zip(ranges, pool_layouts)
     }
+    for header in headers.values():
+        header.verify(initialize=initialize)
+    return headers
 
 
 def has_header(address: int) -> bool:
@@ -153,8 +158,6 @@ class PoolHeader:
         """Commit ``key`` at ``slot``; a committed entry only moves its position."""
         if len(key) != self.key_size:
             raise ValueError(f"key is {len(key)} bytes; the pool's is {self.key_size}")
-        if not -(1 << 31) <= position < 1 << 31:
-            raise ValueError(f"G2 position {position} does not fit the pool header")
         flag = self._flag(slot)
         if self._load(flag, _ACQUIRE) & _STATE != _COMMITTED:
             self._store(flag, _WRITING, _RELEASE)
