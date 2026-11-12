@@ -1623,7 +1623,7 @@ def test_retiring_holder_stays_charged_until_its_pod_is_gone(tmp_path, pools):
     api = table.broker.api
     dgd.put("l", "X")
     victim = _lineage_claim(table)
-    pod = table._holder_pod(victim)
+    pod = "gaas-pool-" + table.broker._key(node_service.PoolClaim.parse(victim.holder))
     del dgd.crs["l"]
     table.poll_dgds()
     table.stand_down = lambda name: None
