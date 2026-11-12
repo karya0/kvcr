@@ -1748,7 +1748,10 @@ class SlotTable:
             seen = self._lineage_seen(key)
             retiring = bool(self._retiring)
         if retiring:
-            self._settle_retiring()  # holders that have left since their abort
+            # Holders that have left since their abort; one whose delete is
+            # retried is waited for, so a reclaim victim is taken only for a
+            # real shortfall.
+            self._settle_retiring(wait_redeleted=True)
         cr = None if self.dgd_api is None else self._dgd(lineage)
         gone_uid = self._gone_owner(name, claim_id)
         need = minimum or total or maximum
@@ -2132,13 +2135,17 @@ class SlotTable:
     def _holder_pod(self, slot: _Slot) -> str:
         return "gaas-pool-" + self.broker._key(PoolClaim.parse(slot.holder))
 
-    def _settle_retiring(self, wait_for: str | None = None) -> None:
+    def _settle_retiring(
+        self, wait_for: str | None = None, wait_redeleted: bool = False
+    ) -> None:
         """Without ``_lock``: uncharge retiring holders whose pod is gone, and
         delete again a holder whose release did not get its delete through
         (the pod is there and not terminating). With ``wait_for``, poll until
-        that pod is gone or ``ensure_timeout_s`` ends. An API or release error
+        that pod is gone or ``ensure_timeout_s`` ends; ``wait_redeleted`` does
+        the same for each pod this pass deleted again. An API or release error
         keeps the charge."""
         deadline = time.monotonic() + (self.ensure_timeout_s if wait_for else 0)
+        waiting = {wait_for} if wait_for else set()
         while True:
             with self._lock:
                 pending = list(self._retiring.items())
@@ -2149,6 +2156,9 @@ class SlotTable:
                         "deletionTimestamp"
                     ):
                         self.broker.release(holder)
+                        if wait_redeleted:
+                            waiting.add(pod)
+                            deadline = time.monotonic() + self.ensure_timeout_s
                         current = self.broker.api.get(pod)
                 except (OSError, RuntimeError, ValueError) as error:
                     logger.warning("retiring holder %s not settled: %s", pod, error)
@@ -2163,7 +2173,9 @@ class SlotTable:
                         self._retiring.pop(pod, None)
                         self._persist()
             with self._lock:
-                if wait_for not in self._retiring or time.monotonic() >= deadline:
+                if not waiting.intersection(self._retiring) or (
+                    time.monotonic() >= deadline
+                ):
                     return
             time.sleep(max(self.broker.poll_interval, 0.01))
 

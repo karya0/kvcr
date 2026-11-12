@@ -2266,3 +2266,35 @@ def test_reclaim_release_pod_api_error_is_an_internal_reason(tmp_path, pools):
         _lineage_claim(table, "new")
     assert raised.value.reason == INTERNAL
     assert not victim.reclaiming
+
+
+def test_reclaim_waits_for_a_retried_holder_delete_before_taking_a_victim(
+    tmp_path, pools
+):
+    table, dgd = _retention_table(tmp_path, pages=8, **_expire_at_once())
+    api = table.broker.api
+    dgd.put("a", "A")
+    dgd.put("b", "B")
+    first = _lineage_claim(table, "a")
+    second = _lineage_claim(table, "b")
+    pod = "gaas-pool-" + table.broker._key(node_service.PoolClaim.parse(first.holder))
+    real_delete, failures = api.delete, [node_service.PodAPIError(503, "DELETE")]
+
+    def delete(name, uid):
+        if failures:
+            raise failures.pop()
+        real_delete(name, uid)
+        # The holder finishes terminating shortly after its delete.
+        threading.Timer(0.1, lambda: api.pods.pop(pod, None)).start()
+
+    api.delete = delete
+    with pytest.raises(node_service.PodAPIError):
+        table.release(first.name)
+    api.keep_deleted = True
+    dgd.crs.clear()
+    table.poll_dgds()  # b's lineage is retained and expired
+    table.stand_down = lambda name: None
+    dgd.put("new", "N")
+    # The retried delete frees a's 4 pages: b is not a victim it needed.
+    assert _lineage_claim(table, "new").name == "t/new/0"
+    assert table.get(second.name) is second
