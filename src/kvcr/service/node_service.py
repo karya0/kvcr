@@ -1027,6 +1027,9 @@ class _Slot:
     # Last layout that is durable: updated only after a holder ack (or rollback).
     # Persistence reads this, never the live pool, so a grow in flight is invisible.
     committed: tuple | None = None
+    # In memory only: a reclaim reserved this slot and tears it down outside
+    # the table lock; claims on it are refused until then.
+    reclaiming: bool = False
     # Guards the pool layout and the holder socket; never taken while waiting
     # on the table lock.
     lock: Any = field(default_factory=threading.RLock, repr=False)
@@ -1042,6 +1045,8 @@ class LineageAgents:
     def __init__(self, max_slots: int):
         self.max_slots = max_slots
         self.children: dict[str, tuple[str, subprocess.Popen, int]] = {}
+        # Detached by a release and not yet reaped: still counted as running.
+        self.stopping: dict[str, subprocess.Popen] = {}
 
     def _spawn(self, namespace: str) -> subprocess.Popen:
         env = dict(os.environ, DYN_NAMESPACE=namespace)
@@ -1064,7 +1069,11 @@ class LineageAgents:
             raise ValueError("supervisor state agent requires a namespace")
         # A second agent shares POD_NAME/CONTAINER_NAME and would delete the
         # first one's DynamoWorkerMetadata CR: one lineage per node.
-        other = next((key for key in self.children if key != lineage), None)
+        other = next(
+            (k for k in [*self.children, *self.stopping] if k != lineage), None
+        )
+        if lineage in self.stopping:
+            other = lineage
         if other is not None:
             logger.error(
                 "lineage agent refused lineage=%s running=%s reason=one-per-node",
@@ -1090,11 +1099,23 @@ class LineageAgents:
                 self.children[lineage] = (namespace, self._spawn(namespace), 1)
                 logger.warning("lineage agent restarted lineage=%s", lineage)
 
-    def stop(self, lineage: str) -> None:
+    def detach(self, lineage: str) -> subprocess.Popen | None:
+        """Under the table lock: the child stays counted until ``reap``."""
         entry = self.children.pop(lineage, None)
         if entry is None:
-            return
-        child = entry[1]
+            return None
+        self.stopping[lineage] = entry[1]
+        return entry[1]
+
+    def stop(self, lineage: str) -> None:
+        child = self.detach(lineage)
+        if child is not None:
+            self.reap(lineage, child)
+            self.stopping.pop(lineage, None)
+
+    @staticmethod
+    def reap(lineage: str, child: subprocess.Popen) -> None:
+        """Stop a detached child; may wait ~10 s, so not under the table lock."""
         if child.poll() is None:
             child.terminate()
             try:
@@ -1348,22 +1369,37 @@ class SlotTable:
             if self._quarantine_start is None:
                 self._quarantine_start = self._clock()
 
-    def _expire_quarantine(self, slot: _Slot) -> None:
-        if not slot.quarantined:
-            return
-        expired = (
+    def _quarantine_over(self) -> bool:
+        return (
             self._quarantine_start is not None
             and self._clock() - self._quarantine_start >= self.lease_ttl_ms / 1000
         )
-        gone = False
-        if not expired and slot.peer_uid:
-            try:
-                gone = self.broker.api.get_by_uid(slot.peer_uid) is None
-            except PodAPIError as error:
-                from .protocol import INTERNAL
 
-                raise SlotError(INTERNAL, f"pod lookup failed: {error}") from error
-        if expired or gone:
+    def _gone_owner(self, name: str) -> str | None:
+        """Before ``_lock``: the pod UID of a quarantined slot's owner, if gone.
+
+        A UID never returns, so a stale "gone" stays true; a stale "present"
+        only keeps the quarantine (the claim is refused or reconnects).
+        """
+        with self._lock:
+            slot = self._slots.get(name)
+            if slot is None or not slot.quarantined or self._quarantine_over():
+                return None
+            uid = slot.peer_uid
+        if not uid:
+            return None
+        try:
+            return uid if self.broker.api.get_by_uid(uid) is None else None
+        except PodAPIError as error:
+            from .protocol import INTERNAL
+
+            raise SlotError(INTERNAL, f"pod lookup failed: {error}") from error
+
+    def _expire_quarantine(self, slot: _Slot, gone_uid: str | None) -> None:
+        if not slot.quarantined:
+            return
+        gone = gone_uid is not None and gone_uid == slot.peer_uid
+        if self._quarantine_over() or gone:
             if slot.claim_id:
                 self.dead_incarnations.add(slot.claim_id)
             slot.claim_generation += 1
@@ -1428,12 +1464,16 @@ class SlotTable:
         except (PodAPIError, OSError, ValueError, KeyError) as error:
             raise SlotError(INTERNAL, f"DGD lookup failed: {error}") from error
 
-    def _admit_dgd(self, key: str) -> None:
+    def _admit_dgd(self, key: str, cr: dict[str, Any] | None) -> None:
+        """Caller holds ``_lock``; ``cr`` was read before it was taken.
+
+        The record is read now, so a poll or rebind that landed after the read
+        is honored; an older read can only be refused against it.
+        """
         from .protocol import INTERNAL, SLOT_STALE
 
         if self.dgd_api is None:
             return
-        cr = self._dgd(key.split("/", 1)[1])
         if cr is None or cr["metadata"].get("deletionTimestamp"):
             raise SlotError(INTERNAL, "DGD is absent or deleting; retry")
         meta = cr["metadata"]
@@ -1500,37 +1540,67 @@ class SlotTable:
             self._persist()
 
     def _reclaim_for(self, tenant: str, name: str, minimum: int) -> None:
-        # Free capacity needs no DGD reads, so an API outage cannot fail it.
-        if self.dgd_api is None or self._available(tenant, name) >= minimum:
-            return
+        """Free capacity from expired retained slots; caller does not hold ``_lock``.
+
+        One victim at a time: reserve it under ``_lock`` (``reclaiming`` refuses
+        claims on it and hides it from other reclaims), then read its DGD and
+        tear it down with ``_lock`` free. Before the teardown the victim is
+        revalidated under ``_lock``; if its lineage record or the slot changed,
+        the claim is refused. The caller refuses if capacity is still short.
+        """
         from .protocol import SLOT_HELD
 
-        victims = []
-        now = self._wall_clock()
-        for slot in self._slots.values():
-            key = slot.name.rsplit("/", 1)[0]
-            rec = self._lineages.get(key)
-            if rec is None or rec["retained_at"] is None or slot.held:
-                continue
-            # Retention is eligibility, not order: an unexpired lineage is kept.
-            if now - rec["retained_at"] <= rec["retention_s"]:
-                continue
-            cr = self._dgd(key.split("/", 1)[1])
-            if cr is not None:
-                continue
-            victims.append((rec["retained_at"], slot.name))
-        for _, victim in sorted(victims):
-            if self._available(tenant, name) >= minimum:
-                break
-            if self.stand_down is None:
-                raise SlotError(SLOT_HELD, "Guard stand-down unavailable; retry")
-            self.stand_down(victim)
-            self.release(victim)
-            logger.info("slot reclaimed slot=%s reason=expired", victim)
-        if self._available(tenant, name) < minimum:
-            raise SlotError(
-                SLOT_HELD, "capacity retained by live or unexpired lineage; retry"
-            )
+        skip: set[str] = set()
+        while True:
+            with self._lock:
+                # Free capacity needs no DGD reads, so an outage cannot fail it.
+                if self._available(tenant, name) >= minimum:
+                    return
+                victim = None
+                now = self._wall_clock()
+                for slot in self._slots.values():
+                    key = slot.name.rsplit("/", 1)[0]
+                    rec = self._lineages.get(key)
+                    if (
+                        rec is None
+                        or rec["retained_at"] is None
+                        or slot.reclaiming
+                        or slot.name in skip
+                        or slot.held
+                        # Retention is eligibility, not order: an unexpired
+                        # lineage is kept.
+                        or now - rec["retained_at"] <= rec["retention_s"]
+                    ):
+                        continue
+                    seen = (rec["retained_at"], slot.name)
+                    if victim is None or seen < victim[2]:
+                        victim = (slot, key, seen, rec["dgd_uid"])
+                if victim is None:
+                    return
+                if self.stand_down is None:
+                    raise SlotError(SLOT_HELD, "Guard stand-down unavailable; retry")
+                slot, key, (retained_at, _), uid = victim
+                slot.reclaiming = True
+            try:
+                if self._dgd(key.split("/", 1)[1]) is not None:
+                    skip.add(slot.name)
+                    continue
+                with self._lock:
+                    rec = self._lineages.get(key)
+                    if (
+                        self._slots.get(slot.name) is not slot
+                        or slot.held
+                        or rec is None
+                        or (rec["dgd_uid"], rec["retained_at"]) != (uid, retained_at)
+                    ):
+                        raise SlotError(
+                            SLOT_HELD, f"reclaim victim {slot.name} changed; retry"
+                        )
+                self.stand_down(slot.name)
+                self.release(slot.name)
+            finally:
+                slot.reclaiming = False
+            logger.info("slot reclaimed slot=%s reason=expired", slot.name)
 
     def _expire_waiters(self, name: str) -> None:
         """Caller holds ``_lock``. Drop waiters that died or stopped re-claiming."""
@@ -1636,15 +1706,38 @@ class SlotTable:
         from .regions import CapacityError, RegionPool
 
         name = self.slot_name(tenant, lineage, guard_index)
+        key = f"{tenant}/{lineage}"
         self._check_identity(peer)
         self._check_lineage(lineage, namespace, peer)
+        # The accept loop takes _lock too, so API reads and reclaim run outside
+        # it; the locked pass below applies their results to the table as it
+        # is then, and refuses what no longer holds.
+        cr = None if self.dgd_api is None else self._dgd(lineage)
+        gone_uid = self._gone_owner(name)
+        need = minimum or total or maximum
+        with self._lock:
+            self._admit_dgd(key, cr)
+            self._expire_waiters(name)
+            queue = self._waiters.get(name)
+            short = (
+                self.dgd_api is not None
+                and need
+                and claim_generation is None
+                and name not in self._slots
+                and not (queue and queue[0].claim_id != claim_id)
+                and self._available(tenant, name) < need
+            )
+        if short:
+            self._reclaim_for(tenant, name, need)
         created = False
         with self._lock:
-            self._admit_dgd(f"{tenant}/{lineage}")
+            self._admit_dgd(key, cr)
             self._expire_waiters(name)
             slot = self._slots.get(name)
             if slot is not None:
-                self._expire_quarantine(slot)
+                if slot.reclaiming:
+                    raise SlotError(SLOT_HELD, f"slot {name} is being reclaimed")
+                self._expire_quarantine(slot, gone_uid)
             reconnect = False
             if claim_generation is not None:
                 if (
@@ -1690,7 +1783,13 @@ class SlotTable:
                 size = total or maximum or minimum
                 if not size:
                     raise SlotError(INTERNAL, "claim carries no size")
-                self._reclaim_for(tenant, name, minimum or size)
+                if self.dgd_api is not None and self._available(tenant, name) < (
+                    minimum or size
+                ):
+                    raise SlotError(
+                        SLOT_HELD,
+                        "capacity retained by live or unexpired lineage; retry",
+                    )
                 effective = effective_grant(
                     size, minimum or size, maximum, self._available(tenant, name)
                 )
@@ -2175,10 +2274,16 @@ class SlotTable:
             else:
                 self.broker.release(slot.holder)
         if self.agents is not None:
+            lineage = name.rsplit("/", 1)[0]
             with self._lock:
-                lineage = name.rsplit("/", 1)[0]
-                if not any(n.rsplit("/", 1)[0] == lineage for n in self._slots):
-                    self.agents.stop(lineage)
+                last = not any(n.rsplit("/", 1)[0] == lineage for n in self._slots)
+                child = self.agents.detach(lineage) if last else None
+            if child is not None:
+                try:
+                    self.agents.reap(lineage, child)  # outside _lock: may wait
+                finally:
+                    with self._lock:
+                        self.agents.stopping.pop(lineage, None)
         return waiters
 
 

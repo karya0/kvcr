@@ -1585,6 +1585,69 @@ def test_slow_dgd_poll_blocks_neither_accept_loop_nor_slot_lock(tmp_path, pools)
     assert table._lineages["t/l"]["retained_at"] is not None
 
 
+def test_reclaim_teardown_leaves_the_slot_lock_to_the_accept_loop(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path, pages=4, **_expire_at_once())
+    dgd.put("l", "X")
+    victim = _lineage_claim(table)
+    del dgd.crs["l"]
+    table.poll_dgds()
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_stand_down(name):  # stands in for finish_close's 30 s wait
+        entered.set()
+        assert release.wait(10)
+
+    table.stand_down = slow_stand_down
+    dgd.put("new", "N")
+    granted = []
+    claimer = threading.Thread(
+        target=lambda: granted.append(_lineage_claim(table, "new")), daemon=True
+    )
+    claimer.start()
+    try:
+        assert entered.wait(5)
+        started = time.monotonic()
+        table.start_quarantine()  # what the accept loop does on every connection
+        assert table._lock.acquire(timeout=1)
+        table._lock.release()
+        assert time.monotonic() - started < 1
+    finally:
+        release.set()
+        claimer.join(5)
+    assert granted[0].name == "t/new/0" and table.get(victim.name) is None
+
+
+def test_reclaim_refuses_a_victim_that_changed_while_unlocked(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path, pages=4, **_expire_at_once())
+    dgd.put("l", "X")
+    victim = _lineage_claim(table)
+    del dgd.crs["l"]
+    table.poll_dgds()
+    table.stand_down = lambda name: pytest.fail("changed victim stood down")
+    dgd.put("new", "N")
+    original, reads = dgd.get, []
+
+    def get(name):
+        if name != "l" or reads:
+            return original(name)
+        reads.append(name)
+        # During the reclaim's unlocked read, a successor DGD rebinds the
+        # lineage; its claim on the reserved victim slot is refused.
+        dgd.put("l", "Y")
+        with pytest.raises(SlotError) as held:
+            _lineage_claim(table, claim_id="successor")
+        assert held.value.reason == SLOT_HELD
+        return None  # the reclaim's read predates the successor
+
+    dgd.get = get
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table, "new")
+    assert raised.value.reason == SLOT_HELD and "changed" in str(raised.value)
+    assert table.get(victim.name) is victim and not victim.reclaiming
+    assert table._lineages["t/l"]["dgd_uid"] == "Y"
+    assert _lineage_claim(table, claim_id="successor") is victim
+
+
 def test_dgd_registry_persists(tmp_path, pools):
     table, dgd = _retention_table(tmp_path)
     dgd.put("l", "X")
