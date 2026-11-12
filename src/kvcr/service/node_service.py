@@ -1498,25 +1498,25 @@ class SlotTable:
             rec = self._lineages.get(key)
             if rec is None or rec["retained_at"] is None or slot.held:
                 continue
+            # Retention is eligibility, not order: an unexpired lineage is kept.
+            if now - rec["retained_at"] <= rec["retention_s"]:
+                continue
             cr = self._dgd(key.split("/", 1)[1])
             if cr is not None:
                 continue
-            expired = now - rec["retained_at"] > rec["retention_s"]
-            victims.append((not expired, rec["retained_at"], slot.name))
-        for pressure, _, victim in sorted(victims):
+            victims.append((rec["retained_at"], slot.name))
+        for _, victim in sorted(victims):
             if self._available(tenant, name) >= minimum:
                 break
             if self.stand_down is None:
                 raise SlotError(SLOT_HELD, "Guard stand-down unavailable; retry")
             self.stand_down(victim)
             self.release(victim)
-            logger.info(
-                "slot reclaimed slot=%s reason=%s",
-                victim,
-                "pressure" if pressure else "expired",
-            )
+            logger.info("slot reclaimed slot=%s reason=expired", victim)
         if self._available(tenant, name) < minimum:
-            raise SlotError(SLOT_HELD, "capacity retained by live lineage; retry")
+            raise SlotError(
+                SLOT_HELD, "capacity retained by live or unexpired lineage; retry"
+            )
 
     def _expire_waiters(self, name: str) -> None:
         """Caller holds ``_lock``. Drop waiters that died or stopped re-claiming."""
