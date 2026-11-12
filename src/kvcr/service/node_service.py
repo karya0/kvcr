@@ -1204,6 +1204,8 @@ class SlotTable:
         self.dgd_poll_seconds = dgd_poll_seconds
         self._wall_clock = wall_clock
         self._lineages: dict[str, dict] = {}
+        # Released slots' bytes by holder pod name, counted until the pod is gone.
+        self._retiring: dict[str, int] = {}
         self.stand_down: Callable[[str], None] | None = None
         self._restore()
         self.agents = (
@@ -1544,6 +1546,7 @@ class SlotTable:
         """
         from .protocol import SLOT_HELD
 
+        self._settle_retiring()  # holders that have left since their release
         skip: set[str] = set()
         while True:
             with self._lock:
@@ -1617,7 +1620,7 @@ class SlotTable:
     def _available(self, tenant: str, name: str) -> int:
         others = sum(
             s.effective_maximum_bytes for n, s in self._slots.items() if n != name
-        )
+        ) + sum(self._retiring.values())
         return (
             self.cap_bytes + self.local_requests(tenant) - self.headroom_bytes - others
         )
@@ -2075,10 +2078,32 @@ class SlotTable:
                 slot.holder_conn.close()
             slot.holder_conn = None
 
+    def _holder_pod(self, slot: _Slot) -> str:
+        return "gaas-pool-" + self.broker._key(PoolClaim.parse(slot.holder))
+
+    def _settle_retiring(self, wait_for: str | None = None) -> None:
+        """Without ``_lock``: uncharge retiring holders whose pod is gone. With
+        ``wait_for``, poll until that pod is gone or ``ensure_timeout_s`` ends.
+        A read error keeps the charge."""
+        deadline = time.monotonic() + (self.ensure_timeout_s if wait_for else 0)
+        while True:
+            with self._lock:
+                pending = list(self._retiring)
+            for pod in pending:
+                try:
+                    gone = self.broker.api.get(pod) is None
+                except PodAPIError:
+                    gone = False
+                if gone:
+                    with self._lock:
+                        self._retiring.pop(pod, None)
+            with self._lock:
+                if wait_for not in self._retiring or time.monotonic() >= deadline:
+                    return
+            time.sleep(max(self.broker.poll_interval, 0.01))
+
     def _holder_dead(self, slot: _Slot) -> bool:
-        pod = self.broker.api.get(
-            "gaas-pool-" + self.broker._key(PoolClaim.parse(slot.holder))
-        )
+        pod = self.broker.api.get(self._holder_pod(slot))
         return (
             pod is None
             or bool(pod["metadata"].get("deletionTimestamp"))
@@ -2242,6 +2267,10 @@ class SlotTable:
             slot = self._slots.pop(name, None)
             if slot is None:
                 raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
+            # The bytes stay charged until the holder pod is gone, not just
+            # asked to go: a terminating holder still has the memory.
+            pod = self._holder_pod(slot)
+            self._retiring[pod] = slot.effective_maximum_bytes
             self._persist()
             waiters = self.waiters(name)
             for waiter in self._waiters.get(name, ()):
@@ -2254,6 +2283,7 @@ class SlotTable:
                 self.broker.abandon(slot.holder)
             else:
                 self.broker.release(slot.holder)
+        self._settle_retiring(wait_for=pod)
         if self.agents is not None:
             lineage = name.rsplit("/", 1)[0]
             with self._lock:

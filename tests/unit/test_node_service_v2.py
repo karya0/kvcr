@@ -1517,6 +1517,40 @@ def test_reclaim_refuses_a_victim_that_changed_while_unlocked(tmp_path, pools):
     assert _lineage_claim(table, claim_id="successor") is victim
 
 
+def test_retiring_holder_stays_charged_until_its_pod_is_gone(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path, pages=4, **_expire_at_once())
+    api = table.broker.api
+    dgd.put("l", "X")
+    victim = _lineage_claim(table)
+    pod = table._holder_pod(victim)
+    del dgd.crs["l"]
+    table.poll_dgds()
+    table.stand_down = lambda name: None
+    api.keep_deleted = True  # the deleted holder pod lingers, terminating
+    dgd.put("new", "N")
+    dgd.put("other", "O")
+    granted = []
+    claimer = threading.Thread(
+        target=lambda: granted.append(_lineage_claim(table, "new")), daemon=True
+    )
+    claimer.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not api.pods[pod]["metadata"].get("deletionTimestamp"):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert table.get(victim.name) is None
+        # The victim's memory is still in use: nobody may be granted it yet.
+        with pytest.raises(SlotError) as raised:
+            _lineage_claim(table, "other")
+        assert raised.value.reason == SLOT_HELD
+        assert not granted and claimer.is_alive()
+    finally:
+        del api.pods[pod]  # the holder finished terminating
+        claimer.join(5)
+    assert granted[0].name == "t/new/0" and not table._retiring
+
+
 def test_dgd_registry_persists(tmp_path, pools):
     table, dgd = _retention_table(tmp_path)
     dgd.put("l", "X")
