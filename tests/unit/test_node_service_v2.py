@@ -2298,3 +2298,35 @@ def test_reclaim_waits_for_a_retried_holder_delete_before_taking_a_victim(
     # The retried delete frees a's 4 pages: b is not a victim it needed.
     assert _lineage_claim(table, "new").name == "t/new/0"
     assert table.get(second.name) is second
+
+
+def test_redeleting_a_holder_does_not_extend_the_wait_past_ensure_timeout(
+    tmp_path, pools
+):
+    table, dgd = _retention_table(tmp_path, pages=8, **_expire_at_once())
+    api = table.broker.api
+    dgd.put("a", "A")
+    first = _lineage_claim(table, "a")
+    pod = "gaas-pool-" + table.broker._key(node_service.PoolClaim.parse(first.holder))
+    real_delete, state = api.delete, {"fail": True, "calls": 0}
+
+    def delete(name, uid):
+        if state["fail"]:
+            state["fail"] = False
+            raise node_service.PodAPIError(503, "DELETE")
+        state["calls"] += 1
+        if state["calls"] >= 40:  # stop the loop if the bound is not honoured
+            real_delete(name, uid)
+            api.pods.pop(pod, None)
+
+    api.delete = delete
+    with pytest.raises(node_service.PodAPIError):
+        table.release(first.name)
+    assert pod in table._retiring
+    table.ensure_timeout_s = 0.3
+    table.broker.poll_interval = 0.02
+    started = time.monotonic()
+    table._settle_retiring(wait_redeleted=True)  # the pod never goes away
+    # Without the fix every re-delete restarts the wait: about 40 * 0.02 s.
+    assert time.monotonic() - started < 0.6
+    assert state["calls"] < 40 and pod in table._retiring

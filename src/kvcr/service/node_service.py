@@ -2144,7 +2144,10 @@ class SlotTable:
         that pod is gone or ``ensure_timeout_s`` ends; ``wait_redeleted`` does
         the same for each pod this pass deleted again. An API or release error
         keeps the charge."""
-        deadline = time.monotonic() + (self.ensure_timeout_s if wait_for else 0)
+        # Set once: a re-delete does not extend the wait past ensure_timeout_s.
+        deadline = time.monotonic() + (
+            self.ensure_timeout_s if wait_for or wait_redeleted else 0
+        )
         waiting = {wait_for} if wait_for else set()
         while True:
             with self._lock:
@@ -2158,7 +2161,6 @@ class SlotTable:
                         self.broker.release(holder)
                         if wait_redeleted:
                             waiting.add(pod)
-                            deadline = time.monotonic() + self.ensure_timeout_s
                         current = self.broker.api.get(pod)
                 except (OSError, RuntimeError, ValueError) as error:
                     logger.warning("retiring holder %s not settled: %s", pod, error)
