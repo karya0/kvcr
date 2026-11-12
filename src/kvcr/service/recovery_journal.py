@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Recovery wire projection, mirroring, and bounded journal storage."""
 
-import ctypes
-import ctypes.util
 import hashlib
 import hmac
 import logging
@@ -12,8 +10,7 @@ import struct
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from functools import cache
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated
 
 import msgspec
 
@@ -26,6 +23,7 @@ from ..backends.local_dram_pools import (
 from ..config import KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
 from ..runtime.core import _BlockRecord, _KVCRCore
 from ..types import BlockKey, RecoveryMirrorError
+from .g2_index import _AtomicU64
 from .memory import _JOURNAL_HEADER_BYTES, KVCRPoolAttachment, KVCRPoolSpec
 from .protocol import KVCRClient, KVCRPoolHold, _PoolDescriptor
 
@@ -33,37 +31,6 @@ if TYPE_CHECKING:
     from ..api import KVCRBindings
 
 logger = logging.getLogger(__name__)
-
-_ACQUIRE, _RELEASE = 2, 3
-
-
-@cache
-def _atomics() -> tuple[Any, Any]:
-    """Bind libatomic's 8-byte acquire/release operations on first use.
-
-    Late because libatomic is a system library, not a declared dependency:
-    importing kvcr must not require what only recovery uses.
-    """
-    # Keep the GIL across these tiny atomics to avoid a handoff for every frame.
-    library = ctypes.PyDLL(ctypes.util.find_library("atomic") or "libatomic.so.1")
-    load, store = library["__atomic_load_8"], library["__atomic_store_8"]
-    load.argtypes, load.restype = [ctypes.c_void_p, ctypes.c_int], ctypes.c_uint64
-    store.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
-    store.restype = None
-    return load, store
-
-
-class _AtomicU64:
-    def __init__(self, address: int) -> None:
-        self._address = address
-        self._load, self._store = _atomics()
-
-    def load_acquire(self) -> int:
-        return int(self._load(self._address, _ACQUIRE))
-
-    def store_release(self, value: int) -> None:
-        self._store(self._address, value, _RELEASE)
-
 
 _INVALID_OFFSET, _PUBLISHED_OFFSET, _CONSUMED_OFFSET = 0, 128, 192
 _VALID, _INVALID = 0, 1
