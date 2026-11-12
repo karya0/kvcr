@@ -1204,9 +1204,9 @@ class SlotTable:
         self.dgd_poll_seconds = dgd_poll_seconds
         self._wall_clock = wall_clock
         self._lineages: dict[str, dict] = {}
-        # Released slots' bytes by holder pod name, counted until the pod is
-        # gone; persisted, so a restarted supervisor still counts them.
-        self._retiring: dict[str, int] = {}
+        # Released slots' [bytes, holder claim] by holder pod name, counted until
+        # the pod is gone; persisted, so a restarted supervisor still counts them.
+        self._retiring: dict[str, list] = {}
         self.stand_down: Callable[[str], None] | None = None
         self._restore()
         self.agents = (
@@ -1649,7 +1649,7 @@ class SlotTable:
     def _available(self, tenant: str, name: str) -> int:
         others = sum(
             s.effective_maximum_bytes for n, s in self._slots.items() if n != name
-        ) + sum(self._retiring.values())
+        ) + sum(charged for charged, _ in self._retiring.values())
         return (
             self.cap_bytes + self.local_requests(tenant) - self.headroom_bytes - others
         )
@@ -2115,19 +2115,26 @@ class SlotTable:
         return "gaas-pool-" + self.broker._key(PoolClaim.parse(slot.holder))
 
     def _settle_retiring(self, wait_for: str | None = None) -> None:
-        """Without ``_lock``: uncharge retiring holders whose pod is gone. With
-        ``wait_for``, poll until that pod is gone or ``ensure_timeout_s`` ends.
-        A read error keeps the charge."""
+        """Without ``_lock``: uncharge retiring holders whose pod is gone, and
+        delete again a holder whose release did not get its delete through
+        (the pod is there and not terminating). With ``wait_for``, poll until
+        that pod is gone or ``ensure_timeout_s`` ends. An API or release error
+        keeps the charge."""
         deadline = time.monotonic() + (self.ensure_timeout_s if wait_for else 0)
         while True:
             with self._lock:
-                pending = list(self._retiring)
-            for pod in pending:
+                pending = list(self._retiring.items())
+            for pod, (_, holder) in pending:
                 try:
-                    gone = self.broker.api.get(pod) is None
-                except PodAPIError:
-                    gone = False
-                if gone:
+                    current = self.broker.api.get(pod)
+                    if current is not None and not current["metadata"].get(
+                        "deletionTimestamp"
+                    ):
+                        self.broker.release(holder)
+                        current = self.broker.api.get(pod)
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if current is None:
                     with self._lock:
                         self._retiring.pop(pod, None)
                         self._persist()
@@ -2312,7 +2319,7 @@ class SlotTable:
             # The bytes stay charged until the holder pod is gone, not just
             # asked to go: a terminating holder still has the memory.
             pod = self._holder_pod(slot)
-            self._retiring[pod] = slot.effective_maximum_bytes
+            self._retiring[pod] = [slot.effective_maximum_bytes, slot.holder]
             self._persist()
             waiters = self.waiters(name)
             for waiter in self._waiters.get(name, ()):

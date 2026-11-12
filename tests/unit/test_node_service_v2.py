@@ -1723,6 +1723,35 @@ def test_retiring_charge_survives_a_supervisor_restart(tmp_path, pools):
     assert old._retiring == {} and old.get("t/new/0") is not None
 
 
+def test_unfinished_holder_delete_is_retried_until_the_pod_is_gone(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path, pages=4)
+    api = table.broker.api
+    dgd.put("l", "X")
+    victim = _lineage_claim(table)
+    pod = "gaas-pool-" + table.broker._key(node_service.PoolClaim.parse(victim.holder))
+    real_delete, failures = api.delete, [node_service.PodAPIError(503, "DELETE")]
+
+    def delete(name, uid):
+        if failures:
+            raise failures.pop()
+        real_delete(name, uid)
+
+    api.delete = delete
+    with pytest.raises(node_service.PodAPIError):
+        table.release(victim.name)
+    assert not api.pods[pod]["metadata"].get("deletionTimestamp")
+    assert pod in table._retiring  # fail-closed: still charged
+    api.keep_deleted = True  # the deleted holder pod lingers, terminating
+    dgd.put("new", "N")
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table, "new")  # its settle pass deletes the holder again
+    assert raised.value.reason == SLOT_HELD
+    assert api.pods[pod]["metadata"].get("deletionTimestamp")
+    del api.pods[pod]  # the holder finished terminating
+    assert _lineage_claim(table, "new").name == "t/new/0"
+    assert not table._retiring
+
+
 def test_dgd_registry_persists(tmp_path, pools):
     table, dgd = _retention_table(tmp_path)
     dgd.put("l", "X")
