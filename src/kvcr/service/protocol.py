@@ -616,8 +616,12 @@ class KVCRPoolHold:
                 try:
                     self.reconnect()
                     break
-                except (OSError, EOFError, KVCRSocketError):
-                    continue
+                except Exception as error:
+                    # Only a staleness verdict is terminal; anything else (a
+                    # transient INTERNAL included) is retried until the deadline.
+                    if getattr(error, "reason", None) == SLOT_STALE:
+                        self._fence(error)
+                        return
                 except BaseException as error:
                     self._fence(error)
                     return

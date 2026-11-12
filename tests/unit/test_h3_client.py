@@ -271,3 +271,28 @@ def test_reattach_inside_the_window_clears_the_deadline(reconnect_hold, monkeypa
     connection._connection.recv.return_value = b""
     hold.check_lease()
     hold._data_map.close.assert_not_called()
+
+
+def test_transient_reattach_refusal_is_retried_not_fenced(reconnect_hold, monkeypatch):
+    hold, _, listener, region, meta = reconnect_hold
+    _eof(hold, monkeypatch)
+    stop = Mock()
+    # EOF observed; INTERNAL refusal; successful re-attach; exit outer loop.
+    stop.wait.side_effect = [False, False, False, True]
+    stop.is_set.return_value = False
+    hold._heartbeat_stop = stop
+    refused, granted = Mock(), Mock()
+    refused.receive_with_fd.return_value = (
+        _ErrorV2("pod lookup failed", 1, protocol.INTERNAL),
+        [],
+    )
+    received = [os.dup(region), os.dup(listener.fileno()), os.dup(region), os.dup(meta)]
+    granted.receive_with_fd.return_value = (_response(hold), received)
+    monkeypatch.setattr(
+        protocol.FramedConnection, "connect", Mock(side_effect=[refused, granted])
+    )
+    hold._watch_connection()
+    assert hold._connection is granted
+    hold.check_lease()
+    hold._data_map.close.assert_not_called()
+    hold._attachment.close.assert_not_called()
