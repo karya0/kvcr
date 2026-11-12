@@ -1813,6 +1813,26 @@ def test_aborted_claim_keeps_its_ready_holder_charged(tmp_path, pools, monkeypat
     table.agents.close()
 
 
+def test_default_mode_retry_after_an_aborted_claim_gets_the_full_size(tmp_path, pools):
+    table, api = _table(tmp_path, pages=4)
+    api.keep_deleted = True  # the aborted holder pod lingers, terminating
+    real_ensure, failed = table.broker.ensure, []
+
+    def ensure(holder, timeout_s):
+        real_ensure(holder, timeout_s)
+        if not failed:
+            failed.append(holder)
+            raise RuntimeError("holder not ready")
+
+    table.broker.ensure = ensure
+    with pytest.raises(SlotError) as raised:
+        _claim(table, total=4, minimum=4)
+    assert raised.value.reason == INTERNAL and table._retiring
+    api.pods.clear()  # the aborted holder finished terminating
+    slot = _claim(table, total=4, minimum=4)  # not CAPACITY_BELOW_MINIMUM
+    assert slot.effective_maximum_bytes == 4 * PAGE and not table._retiring
+
+
 def test_dgd_registry_persists(tmp_path, pools):
     table, dgd = _retention_table(tmp_path)
     dgd.put("l", "X")

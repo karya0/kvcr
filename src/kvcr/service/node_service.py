@@ -1740,6 +1740,9 @@ class SlotTable:
         # is then, and refuses what no longer holds.
         with self._lock:
             seen = self._lineage_seen(key)
+            retiring = bool(self._retiring)
+        if retiring:
+            self._settle_retiring()  # holders that have left since their abort
         cr = None if self.dgd_api is None else self._dgd(lineage)
         gone_uid = self._gone_owner(name, claim_id)
         need = minimum or total or maximum
