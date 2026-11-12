@@ -1424,11 +1424,11 @@ def _expire_at_once():
     return {"retention_seconds": 0, "wall_clock": itertools.count().__next__}
 
 
-def _lineage_claim(table, lineage="l", claim_id="a", alive=lambda: False):
+def _lineage_claim(table, lineage="l", claim_id="a", alive=lambda: False, index=0):
     return table.claim(
         "t",
         lineage,
-        0,
+        index,
         total=4 * PAGE,
         minimum=4 * PAGE,
         maximum=None,
@@ -1662,11 +1662,11 @@ def test_reclaim_refuses_a_victim_that_changed_while_unlocked(tmp_path, pools):
         if name != "l" or reads:
             return original(name)
         reads.append(name)
-        # During the reclaim's unlocked read, a successor DGD rebinds the
-        # lineage; its claim on the reserved victim slot is refused.
+        # During the reclaim's unlocked read, a successor DGD's worker 1
+        # rebinds the lineage (its own claim is short of capacity).
         dgd.put("l", "Y")
         with pytest.raises(SlotError) as held:
-            _lineage_claim(table, claim_id="successor")
+            _lineage_claim(table, claim_id="successor-1", index=1)
         assert held.value.reason == SLOT_HELD
         return None  # the reclaim's read predates the successor
 
@@ -1676,6 +1676,37 @@ def test_reclaim_refuses_a_victim_that_changed_while_unlocked(tmp_path, pools):
     assert raised.value.reason == SLOT_HELD and "changed" in str(raised.value)
     assert table.get(victim.name) is victim and not victim.reclaiming
     assert table._lineages["t/l"]["dgd_uid"] == "Y"
+    assert _lineage_claim(table, claim_id="successor") is victim
+
+
+def test_reclaim_keeps_a_victim_rebound_during_its_stand_down(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path, pages=4, **_expire_at_once())
+    dgd.put("l", "X")
+    victim = _lineage_claim(table)
+    del dgd.crs["l"]
+    table.poll_dgds()
+    before = dict(table._lineages["t/l"])
+
+    def stand_down(name):  # after both validations, before the release
+        dgd.put("l", "Y")
+        # A claim on the reserved slot is refused before it can rebind.
+        with pytest.raises(SlotError) as held:
+            _lineage_claim(table, claim_id="successor")
+        assert held.value.reason == SLOT_HELD
+        assert table._lineages["t/l"] == before
+        # Another worker of the successor rebinds the lineage (its own claim
+        # is short of capacity).
+        with pytest.raises(SlotError) as short:
+            _lineage_claim(table, claim_id="successor-1", index=1)
+        assert short.value.reason == SLOT_HELD
+        assert table._lineages["t/l"]["dgd_uid"] == "Y"
+
+    table.stand_down = stand_down
+    dgd.put("new", "N")
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table, "new")
+    assert raised.value.reason == SLOT_HELD
+    assert table.get(victim.name) is victim and not victim.reclaiming
     assert _lineage_claim(table, claim_id="successor") is victim
 
 
