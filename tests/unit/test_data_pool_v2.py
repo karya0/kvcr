@@ -185,6 +185,9 @@ def test_two_pool_tier_splits_the_data_pool_alike_in_client_and_guard(
             assert core.call_args.args[2].local_dram.pools == [
                 (n, a - base + guard_base, s) for n, a, s in expected
             ]
+            # The Guard's core keeps the same headers once it serves.
+            attach = core.return_value._local_dram._pools.attach_headers
+            assert list(attach.call_args.args[0]) == list(hold.pool_headers)
             assert sorted(hold.pool_headers) == (["a", "b"] if key_size else [])
             if key_size:  # the Guard wrote each header, in the slot's memory
                 with mmap.mmap(hold.region_fds[0], 6 * PAGE) as direct:
@@ -209,6 +212,69 @@ def test_another_key_size_or_a_total_the_pools_do_not_fill_is_refused(
             _claim_two_pools(harness, *first).release()
         with pytest.raises(KVCRServiceReasonError, match=problem) as refused:
             _claim_two_pools(harness, *second)
+        assert refused.value.reason == DATA_POOL_LAYOUT
+
+
+def test_headers_carry_g2_to_the_guard_and_to_the_next_claimant(short_dir):
+    server, table = _serve(
+        short_dir, server_args={"pool_sizes_bytes": (2 * PAGE, 2 * PAGE)}
+    )
+    with server as harness:
+        _attach(harness, table)
+        guard = harness.server._server.registry._guards[0]
+        hold = _claim_two_pools(harness, 14, 36)
+        key = b"k" * 36
+        try:
+            for header in hold.pool_headers.values():  # as the worker's core does
+                header.publish(1, key, 3)
+            records = guard._recovery.take_for_promotion()
+            assert {k: r.local_dram.slots for k, r in records.items()} == {
+                key: (("a", 1), ("b", 1))
+            }
+        finally:
+            hold.release()
+        again = _claim_two_pools(harness, 14, 36)
+        try:
+            recovered = read_handback(
+                again._attachment, _TEST_DIGEST, again._pools, again.pool_headers
+            )
+            assert list(recovered.take_records()) == [key]
+        finally:
+            again.release()
+
+
+def _claim_one_pool(harness, key_size):
+    return harness.client.claim(
+        0,
+        [("pool0", PAGE)],
+        _TEST_DIGEST,
+        _control_bind(0),
+        gaas=GaaSSettings("t", "l", *(3 * (4 * PAGE,)), key_size_bytes=key_size),
+        receive_timeout_s=10,
+    )
+
+
+def test_an_indexed_pool_refuses_a_claim_without_keys_and_a_resize(short_dir):
+    server, table = _serve(short_dir)
+    with server as harness:
+        _attach(harness, table)
+        hold = _claim_one_pool(harness, 36)
+        try:
+            for resize in (
+                lambda: harness.client.grow(
+                    hold.slot_name, PAGE, hold.claim_generation
+                ),
+                lambda: harness.client.shrink(
+                    hold.slot_name, (hold.regions[0].index,), hold.claim_generation
+                ),
+            ):
+                with pytest.raises(KVCRServiceReasonError, match="not resized") as no:
+                    resize()
+                assert no.value.reason == DATA_POOL_LAYOUT
+        finally:
+            hold.release()
+        with pytest.raises(KVCRServiceReasonError, match="headers") as refused:
+            _claim_one_pool(harness, None)  # its blocks would overwrite them
         assert refused.value.reason == DATA_POOL_LAYOUT
 
 

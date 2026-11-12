@@ -55,7 +55,8 @@ class _AtomicU64:
 
 _PREFIX = struct.Struct("<QIIQQ")  # magic, version, key size, block size, entries
 _PREFIX_BYTES = 64
-_MAGIC = int.from_bytes(b"KVCRG2PH", "little")
+_MAGIC_BYTES = b"KVCRG2PH"
+_MAGIC = int.from_bytes(_MAGIC_BYTES, "little")
 _VERSION = 1
 _STATE = 0xFFFFFFFF
 _WRITING, _COMMITTED = 1, 2
@@ -114,6 +115,11 @@ def pool_headers(
         name: PoolHeader(address + header, key_size, block, size // block)
         for (name, header, _, size), (_, block) in zip(ranges, pool_layouts)
     }
+
+
+def has_header(address: int) -> bool:
+    """Whether the data pool mapped at ``address`` starts with a pool header."""
+    return ctypes.string_at(address, len(_MAGIC_BYTES)) == _MAGIC_BYTES
 
 
 class PoolHeader:

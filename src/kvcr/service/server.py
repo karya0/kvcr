@@ -34,6 +34,7 @@ from ..runtime.control_channels import (
 )
 from ..runtime.progress import _STARTUP_TIMEOUT_SECONDS
 from . import memmap
+from .g2_index import has_header
 from .guard import _DataPool, _Guard, _Lease, _Phase
 from .health import _serve_health
 from .memory import (
@@ -52,6 +53,7 @@ from .protocol import (
     _HOLD_DECODER,
     _MIN_HEARTBEAT_TIMEOUT_SECONDS,
     _PROTOCOL_VERSION,
+    DATA_POOL_LAYOUT,
     INTERNAL,
     NOT_IMPLEMENTED,
     KVCRServiceReasonError,
@@ -521,6 +523,12 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             return _reason_error(NOT_IMPLEMENTED, "resize is not implemented")
         try:
             peer = _peer_identity(self.request)
+            slot = slots.get(request.slot_name)
+            # Its pools' headers name a block count that a resize would change.
+            if slot is not None and has_header(slot.pool.address(slot.pool.regions[0])):
+                return _reason_error(
+                    DATA_POOL_LAYOUT, "a data pool with pool headers is not resized"
+                )
             if isinstance(request, _Grow):
                 regions, generation = slots.grow(
                     request.slot_name,

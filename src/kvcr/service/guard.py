@@ -29,7 +29,7 @@ from ..config import (
 from ..runtime.control_channels import KVCRServiceError, ZmqPeerControlChannel
 from ..runtime.core import _BlockRecord, _KVCRCore
 from ..types import BlockKey, PoolBlockLayouts
-from .g2_index import PoolHeader, pool_headers, pool_ranges
+from .g2_index import PoolHeader, has_header, pool_headers, pool_ranges
 from .memory import (
     LAYOUT_DIGEST_BYTES,
     KVCRPoolAttachment,
@@ -957,6 +957,8 @@ class _Guard:
                     headers = pool_headers(address, ranges, layouts, key_size)
                     for header in headers.values():
                         header.verify(initialize=True)
+                    if not headers and has_header(address):
+                        raise ValueError("it holds the headers of a claim with keys")
                 except ValueError as error:
                     raise KVCRServiceReasonError(
                         f"v2 data pool refused: {error}", DATA_POOL_LAYOUT
@@ -1296,6 +1298,7 @@ class _Guard:
                 ),
             ),
         )
+        core._local_dram._pools.attach_headers(self._recovery.headers)
         self._core = core
         self._log_promotion_stage("core_init_done")
         # Registration can take long; promotion's start() waits for it.
