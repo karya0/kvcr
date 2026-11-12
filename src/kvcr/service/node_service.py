@@ -2318,15 +2318,18 @@ class SlotTable:
             for waiter in self._waiters.get(name, ()):
                 waiter.close()
             self._waiters.pop(name, None)
-        with slot.lock:
-            self._drop_holder_conn(slot)
-            slot.pool.close()
-            if self._holder_dead(slot):
-                self.broker.abandon(slot.holder)
-            else:
-                self.broker.release(slot.holder)
-        self._settle_retiring(wait_for=pod)
-        self._stop_unused_agent(name.rsplit("/", 1)[0])
+        try:
+            with slot.lock:
+                self._drop_holder_conn(slot)
+                slot.pool.close()
+                if self._holder_dead(slot):
+                    self.broker.abandon(slot.holder)
+                else:
+                    self.broker.release(slot.holder)
+            self._settle_retiring(wait_for=pod)
+        finally:
+            # The slot is gone either way: its agent must not outlive it.
+            self._stop_unused_agent(name.rsplit("/", 1)[0])
         return waiters
 
     def _stop_unused_agent(self, lineage: str) -> None:

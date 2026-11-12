@@ -1247,6 +1247,45 @@ def test_refused_first_spawn_leaves_no_agent_without_a_slot(
     table.agents.close()
 
 
+def test_failed_holder_teardown_still_stops_the_agent(tmp_path, pools, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(
+        node_service.subprocess,
+        "Popen",
+        lambda command, *, env: spawned.append(_AgentProcess()) or spawned[-1],
+    )
+    table, _ = _table(tmp_path)
+    table.agents = node_service.LineageAgents(2)
+
+    def claim(lineage):
+        return table.claim(
+            "t",
+            lineage,
+            0,
+            total=4 * PAGE,
+            minimum=2 * PAGE,
+            maximum=None,
+            digest=DIGEST,
+            claim_id=f"worker-{lineage}",
+            peer=ME,
+            owner_alive=lambda: False,
+            namespace="ns1",
+        )
+
+    claim("a")
+
+    def release(holder):
+        raise node_service.PodAPIError(503, "DELETE")
+
+    monkeypatch.setattr(table.broker, "release", release)
+    with pytest.raises(node_service.PodAPIError):
+        table.release("t/a/0")
+    assert spawned[0].terminated and not table.agents.children
+    assert not table.agents.stopping
+    assert claim("b").name == "t/b/0"  # not refused as one-per-node
+    table.agents.close()
+
+
 def test_supervisor_refuses_second_lineage_agent(monkeypatch, caplog):
     spawned = []
     monkeypatch.setattr(
