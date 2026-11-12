@@ -1208,6 +1208,45 @@ def test_supervisor_checks_a_first_spawn_that_exits_at_once(monkeypatch):
     agents.close()
 
 
+def test_refused_first_spawn_leaves_no_agent_without_a_slot(
+    tmp_path, pools, monkeypatch
+):
+    dead = [True]
+
+    def spawn(command, *, env):
+        child = _AgentProcess()
+        child.returncode = 1 if dead[0] else None
+        return child
+
+    monkeypatch.setattr(node_service.subprocess, "Popen", spawn)
+    table, _ = _table(tmp_path)
+    table.agents = node_service.LineageAgents(2)
+
+    def claim(lineage):
+        return table.claim(
+            "t",
+            lineage,
+            0,
+            total=4 * PAGE,
+            minimum=2 * PAGE,
+            maximum=None,
+            digest=DIGEST,
+            claim_id=f"worker-{lineage}",
+            peer=ME,
+            owner_alive=lambda: False,
+            namespace="ns1",
+        )
+
+    with pytest.raises(SlotError) as raised:
+        claim("a")
+    assert raised.value.reason == INTERNAL
+    assert table.get("t/a/0") is None and not table.agents.children
+    dead[0] = False
+    assert claim("b").name == "t/b/0"
+    assert list(table.agents.children) == ["t/b"]
+    table.agents.close()
+
+
 def test_supervisor_refuses_second_lineage_agent(monkeypatch, caplog):
     spawned = []
     monkeypatch.setattr(
