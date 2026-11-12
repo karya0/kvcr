@@ -1511,7 +1511,10 @@ class SlotTable:
                 if rec is None or rec["dgd_uid"] != uid:
                     continue  # rebound while the read was in flight
                 deletion = cr and cr["metadata"].get("deletionTimestamp")
-                if (cr is None or deletion) and rec["retained_at"] is None:
+                # A live CR with another UID: the bound one was deleted and
+                # replaced between polls, so it is gone too.
+                replaced = cr is not None and cr["metadata"]["uid"] != uid
+                if (cr is None or deletion or replaced) and rec["retained_at"] is None:
                     rec["retained_at"] = (
                         datetime.fromisoformat(
                             deletion.replace("Z", "+00:00")

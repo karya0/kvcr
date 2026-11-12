@@ -1311,6 +1311,21 @@ def test_dgd_rebind_again_after_successor_deleted(tmp_path, pools):
         assert table._lineages["t/l"]["dgd_uid"] == uid
 
 
+def test_dgd_successor_replaced_between_polls_can_rebind(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path)
+    dgd.put("l", "X")
+    slot = _lineage_claim(table)
+    del dgd.crs["l"]
+    table.poll_dgds()
+    dgd.put("l", "Y")
+    assert _lineage_claim(table, claim_id="y") is slot
+    dgd.put("l", "Z")  # Y deleted and Z created before the next poll
+    table.poll_dgds()
+    assert table._lineages["t/l"]["retained_at"] is not None
+    assert _lineage_claim(table, claim_id="z") is slot
+    assert table._lineages["t/l"]["dgd_uid"] == "Z"
+
+
 def test_dgd_reclaims_only_expired_retention_and_stands_down(
     tmp_path, pools, monkeypatch
 ):
