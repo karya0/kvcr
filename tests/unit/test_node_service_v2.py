@@ -4,6 +4,7 @@
 
 import copy
 import errno
+import itertools
 import json
 import mmap
 import os
@@ -1402,6 +1403,11 @@ def _retention_table(tmp_path, pages=8, **kwargs):
     return table, dgd
 
 
+def _expire_at_once():
+    """Retention 0 on a clock that ticks per read: a retained lineage is expired."""
+    return {"retention_seconds": 0, "wall_clock": itertools.count().__next__}
+
+
 def _lineage_claim(table, lineage="l", claim_id="a", alive=lambda: False):
     return table.claim(
         "t",
@@ -1467,7 +1473,7 @@ def test_dgd_rebind_again_after_successor_deleted(tmp_path, pools):
         assert table._lineages["t/l"]["dgd_uid"] == uid
 
 
-def test_dgd_pressure_reclaims_expired_first_and_stands_down(
+def test_dgd_reclaims_only_expired_retention_and_stands_down(
     tmp_path, pools, monkeypatch
 ):
     now = [1000]
@@ -1493,14 +1499,20 @@ def test_dgd_pressure_reclaims_expired_first_and_stands_down(
     _lineage_claim(table, "new")
     assert table.get(expired.name) is None and table.get(fresh.name) is fresh
     assert order[:2] == [(expired.name, "stand-down"), (expired.name, "close")]
+    # Capacity pressure never cuts a retention window short: refuse, keep it.
     dgd.put("next", "Q")
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table, "next")
+    assert raised.value.reason == SLOT_HELD
+    assert table.get(fresh.name) is fresh and len(order) == 2
+    now[0] += 1000
     _lineage_claim(table, "next")
     assert table.get(fresh.name) is None
 
 
 @pytest.mark.parametrize("protected", ["peer", "cr", "error"])
 def test_dgd_never_reclaims_live_or_unreadable(tmp_path, pools, protected):
-    table, dgd = _retention_table(tmp_path, pages=4)
+    table, dgd = _retention_table(tmp_path, pages=4, **_expire_at_once())
     dgd.put("l", "X")
     live = [False]
     slot = _lineage_claim(table, alive=lambda: live[0])
@@ -1597,7 +1609,9 @@ def test_dgd_retained_agent_lives_until_last_reclaim(
         return child
 
     monkeypatch.setattr(node_service.subprocess, "Popen", spawn)
-    table, dgd = _retention_table(tmp_path, pages=4, state_agent_mode="supervisor")
+    table, dgd = _retention_table(
+        tmp_path, pages=4, state_agent_mode="supervisor", **_expire_at_once()
+    )
     dgd.put("l", "X")
     slot = table.claim(
         "t",
@@ -1870,7 +1884,9 @@ def test_real_agent_survives_dgd_404_and_reclaim(tmp_path, pools, monkeypatch, c
     monkeypatch.setenv("DYN_DISCOVERY_BACKEND", "file")
     monkeypatch.setenv("DYN_REQUEST_PLANE", "tcp")
     monkeypatch.setenv("DYN_SYSTEM_PORT", "18081")
-    table, dgd = _retention_table(tmp_path, pages=4, state_agent_mode="supervisor")
+    table, dgd = _retention_table(
+        tmp_path, pages=4, state_agent_mode="supervisor", **_expire_at_once()
+    )
     table.stand_down = lambda name: None  # No Guard was started by FakeAPI.
     dgd.put("l", "X")
     try:
