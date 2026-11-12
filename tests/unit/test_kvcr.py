@@ -42,6 +42,7 @@ from kvcr.runtime import progress as kvcr_progress
 from kvcr.runtime.core import _BlockRecord
 from kvcr.runtime.progress import _TransferRef
 from kvcr.service import recovery_journal as kvcr_recovery
+from kvcr.service.g2_index import PoolHeader, rebuild
 from kvcr.service.memory import KVCRPoolSpec
 from kvcr.service.protocol import KVCRPoolHold
 from kvcr.types import BlockKey, KVCRStartupError, MemoryRef, RegionDescriptor
@@ -51,6 +52,7 @@ def _fake_hold(**fields: Any) -> SimpleNamespace:
     """A hold double that hands its listener over exactly like the real one."""
     fields.setdefault("_pools", ())
     fields.setdefault("slot_name", None)  # a v1 grant
+    fields.setdefault("pool_headers", {})
     hold = SimpleNamespace(_incarnation=None, _dead_incarnations=(), **fields)
     hold.hand_listener_to = partial(KVCRPoolHold.hand_listener_to, hold)
     return hold
@@ -153,6 +155,47 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
         (keys[2], [("", 0)]),
         (keys[2], None),
     ]
+
+
+def test_pool_headers_index_ready_blocks_and_clear_freed_slots() -> None:
+    """A READY block is committed in its pool's header, its position follows the
+    G2 order, a freed slot's entry is cleared, and a key of another size fails."""
+    block_size = 16
+    primary = ctypes.create_string_buffer(block_size * 2)
+    local = ctypes.create_string_buffer(block_size)
+    memory = mmap.mmap(-1, mmap.PAGESIZE)
+    header = PoolHeader(
+        ctypes.addressof(ctypes.c_char.from_buffer(memory)), 2, block_size, 1
+    )
+    header.verify(initialize=True)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_local_kvcr(
+        agent,
+        local,
+        1,
+        framework_regions=[
+            RegionDescriptor(addr=ctypes.addressof(primary), size=block_size, count=2)
+        ],
+    )
+    pools = kvcr._core._local_dram._pools
+    pools.attach_headers({"": header})
+    key, other = BlockKey(b"k0"), BlockKey(b"k10")
+    assert not pools.indexable(key, ["", ""])  # a pool twice is not indexed
+    stored = kvcr.deposit({key: [_mem_descriptor(0)]})
+    _poll_until(kvcr, lambda done: stored in dict(done))
+    kvcr._core.align_sequence([BlockKey(b"xx"), key])
+    assert [(slot, entry) for slot, _, entry in header.scan()] == [(0, b"k0")]
+    assert rebuild({"": header}) == {b"k0": ((("", 0),), 1)}
+
+    refused = kvcr.deposit({other: [_mem_descriptor(1)]})
+    results = dict(_poll_until(kvcr, lambda done: refused in dict(done)))
+    assert not results[refused][other].success
+
+    pools.acquire_sources((key,))
+    pools.retire_sources((key,))
+    pools.release_sources((key,))
+    assert header.scan() == []
 
 
 _GUARD_CONFIG = KVCRGuardConfig(
@@ -408,7 +451,7 @@ def test_service_journal_is_attached_before_primary_start(
         release=lambda **_kwargs: events.append("hold.release"),
     )
     claim = Mock(return_value=hold)
-    local_dram = SimpleNamespace(_pools=object())
+    local_dram = SimpleNamespace(_pools=Mock())
     g3 = object()
     core = Mock(_local_dram=local_dram, _g3=g3)
     core.start.side_effect = lambda: events.append("core.start")

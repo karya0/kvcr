@@ -30,6 +30,7 @@ from ..types import (
 
 if TYPE_CHECKING:
     from ..runtime.core import _BlockRecord, _KVCRCore
+    from ..service.g2_index import PoolHeader
 
 logger = logging.getLogger(__name__)
 
@@ -239,9 +240,11 @@ class _LocalDramPools:
         self._next_release_handle = 1
         # A no-op until something attaches: the tiers publish residency
         # changes unconditionally, and only recovery cares to hear them.
-        self._residency_observer: Callable[[BlockKey, "_BlockRecord"], None] = (
+        self._observer: Callable[[BlockKey, "_BlockRecord"], None] = (
             lambda key, record: None
         )
+        # Each pool's header, when the data pool indexes its G2 there.
+        self._headers: dict[str, "PoolHeader"] = {}
         # Final claim release must wake waiters before returning to the caller.
         self._resume_capacity_waiters = resume_capacity_waiters
 
@@ -408,7 +411,38 @@ class _LocalDramPools:
     def observe_residency(
         self, observer: Callable[[BlockKey, "_BlockRecord"], None]
     ) -> None:
-        self._residency_observer = observer
+        self._observer = observer
+
+    def attach_headers(self, headers: dict[str, "PoolHeader"]) -> None:
+        """Index G2 in the pool headers: a block is committed in every pool's
+        header once its bytes are, and each entry is cleared before its slot is
+        reused. Attach before any slot is allocated."""
+        self._headers = headers
+
+    def indexable(self, key: BlockKey, layout: Collection[str]) -> bool:
+        """With headers, only a key of their size, stored once in every pool in
+        pool order, can be indexed; any other fails its deposit closed."""
+        if not self._headers:
+            return True
+        key_size = next(iter(self._headers.values())).key_size
+        if len(key) != key_size:
+            logger.warning(
+                "KVCR key is %d bytes, not %d: not stored", len(key), key_size
+            )
+            return False
+        return tuple(layout) == tuple(self._headers)
+
+    def _residency_observer(self, key: BlockKey, record: "_BlockRecord") -> None:
+        residency = record.local_dram
+        if (
+            self._headers
+            and residency is not None
+            and residency.state is _LocalDramState.READY
+            and not residency.pending_labels
+        ):
+            for label, slot in residency.slots:
+                self._headers[label].publish(slot, bytes(key), record.position)
+        self._observer(key, record)
 
     def adopt_recovery_slots(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
         """Take the rows already-recovered records name, before the core starts.
@@ -804,7 +838,10 @@ class _LocalDramPools:
 
     def _free(self, locations: Collection[tuple[str, int]]) -> None:
         for label, slot in locations:
-            self._free_slots[label.partition(":")[0]].append(slot)
+            pool = label.partition(":")[0]
+            if self._headers:
+                self._headers[pool].clear(slot)
+            self._free_slots[pool].append(slot)
 
     def _size_bytes(self, residency: _LocalDramResidency) -> int:
         if residency._cached_size is None:

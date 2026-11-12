@@ -297,6 +297,9 @@ class _LocalDram:
                 if decision[0] is PlacementAction.DROP:
                     op.results[key] = _DROPPED_RESULT
                     continue
+                if not self._pools.indexable(key, local_layout):
+                    op.results[key] = _FAILED_RESULT
+                    continue
                 locations, evicted_keys, eviction_pending = self._pools._allocate_slots(
                     local_layout, op.keys, op.deadline
                 )
@@ -803,7 +806,9 @@ class _LocalDram:
             required_local=True,
             framework_hints=op.hints,
         )
-        if decision[0] is PlacementAction.DROP:
+        if decision[0] is PlacementAction.DROP or not self._pools.indexable(
+            key, layout
+        ):
             return False, False
         locations, evicted, waiting = self._pools._allocate_slots(
             layout, op.keys, op.deadline
