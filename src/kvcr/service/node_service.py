@@ -1572,6 +1572,7 @@ class SlotTable:
                 victim = None
                 now = self._wall_clock()
                 for slot in self._slots.values():
+                    self._expire_quarantine(slot, None)  # TTL only, no API call
                     key = slot.name.rsplit("/", 1)[0]
                     rec = self._lineages.get(key)
                     if (

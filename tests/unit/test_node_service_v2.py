@@ -1833,6 +1833,38 @@ def test_default_mode_retry_after_an_aborted_claim_gets_the_full_size(tmp_path, 
     assert slot.effective_maximum_bytes == 4 * PAGE and not table._retiring
 
 
+def test_restored_uuid_slot_is_a_reclaim_victim_once_its_quarantine_ends(
+    tmp_path, pools
+):
+    import uuid
+
+    wall = [1000]
+    expire = {"retention_seconds": 0, "wall_clock": lambda: wall[0]}
+    table, dgd = _retention_table(tmp_path, pages=4, **expire)
+    dgd.put("l", "X")
+    _lineage_claim(table, claim_id=uuid.uuid4().hex)  # its worker dies unreleased
+    del dgd.crs["l"]
+    table.poll_dgds()
+    wall[0] += 10
+    restarted = SlotTable(
+        table.broker, table.cap_bytes, require_pod_identity=False, dgd_api=dgd, **expire
+    )
+    victim = restarted.get("t/l/0")
+    pools.append(victim.pool)  # closed by the fixture
+    assert victim.quarantined
+    now = [0.0]
+    restarted._clock = lambda: now[0]
+    restarted.start_quarantine()
+    restarted.stand_down = lambda name: None
+    dgd.put("new", "N")
+    with pytest.raises(SlotError) as held:
+        _lineage_claim(restarted, "new")  # inside the lease TTL
+    assert held.value.reason == SLOT_HELD
+    now[0] = restarted.lease_ttl_ms / 1000
+    assert _lineage_claim(restarted, "new").name == "t/new/0"
+    assert restarted.get("t/l/0") is None
+
+
 def test_dgd_registry_persists(tmp_path, pools):
     table, dgd = _retention_table(tmp_path)
     dgd.put("l", "X")
