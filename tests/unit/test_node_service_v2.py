@@ -1752,6 +1752,51 @@ def test_unfinished_holder_delete_is_retried_until_the_pod_is_gone(tmp_path, poo
     assert not table._retiring
 
 
+def test_aborted_claim_keeps_its_ready_holder_charged(tmp_path, pools, monkeypatch):
+    dead = [True]
+
+    def spawn(command, *, env):
+        child = _AgentProcess()
+        child.returncode = 1 if dead[0] else None
+        return child
+
+    monkeypatch.setattr(node_service.subprocess, "Popen", spawn)
+    table, dgd = _retention_table(tmp_path, pages=4, state_agent_mode="supervisor")
+    api = table.broker.api
+    api.keep_deleted = True  # the deleted holder pod lingers, terminating
+    dgd.put("a", "A")
+    dgd.put("b", "B")
+
+    def claim(lineage):
+        return table.claim(
+            "t",
+            lineage,
+            0,
+            total=4 * PAGE,
+            minimum=4 * PAGE,
+            maximum=None,
+            digest=DIGEST,
+            claim_id=f"worker-{lineage}",
+            peer=ME,
+            owner_alive=lambda: False,
+            namespace="ns1",
+        )
+
+    with pytest.raises(SlotError) as raised:
+        claim("a")  # its holder came up, then its state agent was refused
+    assert raised.value.reason == INTERNAL and table.get("t/a/0") is None
+    pod = api.creates[0]["metadata"]["name"]
+    assert api.pods[pod]["metadata"].get("deletionTimestamp")
+    dead[0] = False
+    with pytest.raises(SlotError) as raised:
+        claim("b")  # fits only if the terminating holder were not charged
+    assert raised.value.reason == SLOT_HELD
+    del api.pods[pod]  # the holder finished terminating
+    assert claim("b").name == "t/b/0"
+    assert not table._retiring
+    table.agents.close()
+
+
 def test_dgd_registry_persists(tmp_path, pools):
     table, dgd = _retention_table(tmp_path)
     dgd.put("l", "X")

@@ -1903,6 +1903,12 @@ class SlotTable:
                 return
             if self._slots.get(slot.name) is slot:
                 del self._slots[slot.name]
+            # As in release(): a holder that came up keeps its memory until
+            # its pod is gone.
+            self._retiring[self._holder_pod(slot)] = [
+                slot.effective_maximum_bytes,
+                slot.holder,
+            ]
             for waiter in self._waiters.get(slot.name, ()):
                 waiter.close()
             self._waiters.pop(slot.name, None)
@@ -1914,6 +1920,7 @@ class SlotTable:
             slot.pool.close()
             with contextlib.suppress(Exception):
                 self.broker.release(slot.holder)
+        self._settle_retiring()  # one pass: a holder already gone is uncharged
 
     def vacate(self, name: str, peer: Any, generation: int) -> None:
         """The claimant released its lease: free the slot, keep pool and holder.
