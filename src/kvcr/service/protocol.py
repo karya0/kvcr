@@ -726,16 +726,18 @@ class KVCRPoolHold:
                 connection.close()
 
     def _stop_local_access(self) -> None:
-        if self._data_map is not None:
-            self._data_map.close()
-        self._attachment.close()
-        self._heartbeat_stop.set()
-        for fd in (self._control_listener_fd, *self.region_fds):
-            if fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-        self._control_listener_fd = None
-        self.region_fds.clear()
+        # Serialized: a release racing a fence finds the teardown done, not half done.
+        with self._lease_lock:
+            if self._data_map is not None:
+                self._data_map.close()
+            self._attachment.close()
+            self._heartbeat_stop.set()
+            for fd in (self._control_listener_fd, *self.region_fds):
+                if fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+            self._control_listener_fd = None
+            self.region_fds.clear()
 
     def close_local(self) -> None:
         """Stop local access and drop the connection without releasing the lease.

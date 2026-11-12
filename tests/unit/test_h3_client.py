@@ -377,6 +377,29 @@ def test_check_lease_and_watcher_at_the_deadline_unmap_once(
     hold._attachment.close.assert_called_once()
 
 
+def test_release_racing_a_fence_waits_for_its_teardown(reconnect_hold):
+    hold, _, _, _, _ = reconnect_hold
+    entered, inside, overlapped = threading.Event(), threading.Lock(), []
+
+    def unmap():
+        if not inside.acquire(blocking=False):
+            overlapped.append(True)
+            return
+        entered.set()
+        time.sleep(0.05)
+        inside.release()
+
+    hold._data_map.close.side_effect = unmap
+    error = KVCRServiceReasonError("lost", SLOT_STALE)
+    fence = _Thread(target=hold._fence, args=(error,))
+    fence.start()
+    entered.wait()
+    hold.release()
+    fence.join()
+    assert not overlapped
+    assert hold.region_fds == [] and hold._control_listener_fd is None
+
+
 def test_check_lease_waits_for_a_reattach_publishing_in_time(
     reconnect_hold, monkeypatch
 ):
