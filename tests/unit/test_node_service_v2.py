@@ -2217,3 +2217,32 @@ def test_real_agent_survives_dgd_404_and_reclaim(tmp_path, pools, monkeypatch, c
         assert child.poll() is not None and "t/l" not in table.agents.children
     finally:
         table.agents.close()
+
+
+def test_settle_logs_an_api_error_and_the_refusal_names_the_retiring_holder(
+    tmp_path, pools, caplog
+):
+    table, dgd = _retention_table(tmp_path, pages=4)
+    api = table.broker.api
+    dgd.put("a", "A")
+    victim = _lineage_claim(table, "a")
+    pod = "gaas-pool-" + table.broker._key(node_service.PoolClaim.parse(victim.holder))
+    api.keep_deleted = True  # the deleted holder pod lingers, terminating
+    table.ensure_timeout_s = 0.01  # release's wait for the pod ends at once
+    table.release(victim.name)
+    assert pod in table._retiring
+    real_get = api.get
+
+    def get(name):
+        raise node_service.PodAPIError(503, "GET")
+
+    api.get = get
+    with caplog.at_level("WARNING"):
+        table._settle_retiring()
+    assert pod in table._retiring and f"retiring holder {pod} not settled" in caplog.text
+    api.get = real_get
+    dgd.put("b", "B")
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table, "b")
+    assert raised.value.reason == SLOT_HELD
+    assert "retiring holder" in str(raised.value)

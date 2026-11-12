@@ -1820,7 +1820,9 @@ class SlotTable:
                 ):
                     raise SlotError(
                         SLOT_HELD,
-                        "capacity retained by live or unexpired lineage; retry",
+                        "capacity held by a retiring holder or a live or unexpired lineage; retry"
+                        if self._retiring
+                        else "capacity retained by live or unexpired lineage; retry",
                     )
                 effective = effective_grant(
                     size, minimum or size, maximum, self._available(tenant, name)
@@ -2143,12 +2145,14 @@ class SlotTable:
                     ):
                         self.broker.release(holder)
                         current = self.broker.api.get(pod)
-                except (OSError, RuntimeError, ValueError):
+                except (OSError, RuntimeError, ValueError) as error:
+                    logger.warning("retiring holder %s not settled: %s", pod, error)
                     continue
                 if current is None:
                     try:
                         self.broker.abandon(holder)
-                    except (OSError, RuntimeError, ValueError):
+                    except (OSError, RuntimeError, ValueError) as error:
+                        logger.warning("retiring holder %s not settled: %s", pod, error)
                         continue
                     with self._lock:
                         self._retiring.pop(pod, None)
