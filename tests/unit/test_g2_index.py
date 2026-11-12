@@ -62,8 +62,21 @@ def test_two_pools_with_headers_hold_equal_counts_and_fill_the_size():
         ("b", b_header, b_header + header, n * PAGE),
     ]
     assert all(data % PAGE == 0 for _, _, data, _ in ranges)
-    with pytest.raises(ValueError, match=f"{size} bytes holds {n} per pool"):
-        pool_ranges(size + PAGE, layouts, KEY)
+    assert pool_ranges(size + PAGE, layouts, KEY) == ranges  # the tail is unused
+
+
+def test_headers_take_one_block_of_a_whole_block_pool():
+    # Qwen3-32B: 1044 vLLM chunks of 49 MiB; without keys they fill it exactly.
+    block = 49 << 20
+    assert pool_ranges(1044 * block, [("", block)], None) == [
+        ("", 0, 0, 1044 * block)
+    ]
+    header = -(-(_PREFIX_BYTES + 1043 * entry_bytes(KEY)) // PAGE) * PAGE
+    assert pool_ranges(1044 * block, [("", block)], KEY) == [
+        ("", 0, header, 1043 * block)
+    ]
+    with pytest.raises(ValueError, match="holds 0 per pool"):
+        pool_ranges(block, [("", block)], KEY)
 
 
 def test_a_position_update_keeps_the_key():

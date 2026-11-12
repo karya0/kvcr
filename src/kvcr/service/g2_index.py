@@ -73,7 +73,9 @@ def pool_ranges(
 
     Each pool holds the same number of blocks: its header (none without a key
     size), then its block data from the next page. Returns (name, header offset,
-    data offset, data bytes) per pool; refuses a size the pools do not fill.
+    data offset, data bytes) per pool. Without a key size the pools must fill
+    the size exactly; with one, the tail the headers leave short of a block is
+    unused.
     """
 
     def layout(n: int) -> tuple[int, list[tuple[str, int, int, int]]]:
@@ -93,7 +95,7 @@ def pool_ranges(
         middle = (low + high + 1) // 2
         low, high = (middle, high) if layout(middle)[0] <= size else (low, middle - 1)
     used, ranges = layout(low)
-    if not low or used != size:
+    if not low or (used != size and key_size is None):
         raise ValueError(
             f"{size} bytes is not a whole number of blocks for {pool_layouts}, "
             f"key size {key_size}; {used} bytes holds {low} per pool"
