@@ -3,9 +3,12 @@
 """Q7 reconnect retains mappings until a terminal lease refusal."""
 
 import contextlib
+import logging
 import os
 import socket
 import sys
+import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -14,6 +17,8 @@ from test_guard import _TEST_SPEC
 from kvcr.config import LocalDramOptions
 from kvcr.service import protocol
 from kvcr.service.protocol import (
+    INCOMPATIBLE_LINEAGE,
+    INTERNAL,
     SLOT_STALE,
     KVCRPoolHold,
     KVCRServiceReasonError,
@@ -24,6 +29,7 @@ from kvcr.service.protocol import (
 )
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux memfds/pidfds")
+_Thread = threading.Thread  # the fixture patches threading.Thread
 
 
 @pytest.fixture
@@ -296,3 +302,149 @@ def test_transient_reattach_refusal_is_retried_not_fenced(reconnect_hold, monkey
     hold.check_lease()
     hold._data_map.close.assert_not_called()
     hold._attachment.close.assert_not_called()
+
+
+def _grant(hold, monkeypatch, listener, region, meta, *, on_receive=lambda: None):
+    connection = Mock()
+    received = [os.dup(region), os.dup(listener.fileno()), os.dup(region), os.dup(meta)]
+
+    def receive(*_args):
+        on_receive()
+        return _response(hold), received
+
+    connection.receive_with_fd.side_effect = receive
+    monkeypatch.setattr(
+        protocol.FramedConnection, "connect", Mock(return_value=connection)
+    )
+    return connection
+
+
+def test_reattach_anchors_the_deadline_at_the_request_time(reconnect_hold, monkeypatch):
+    hold, _, listener, region, meta = reconnect_hold
+    now = _clock(monkeypatch, hold)
+    now[0] += 5
+
+    def slow():
+        now[0] += 3
+
+    _grant(hold, monkeypatch, listener, region, meta, on_receive=slow)
+    hold.reconnect()
+    assert hold._alive_at == 105  # sent at 105, granted at 108
+
+
+def test_reattach_granted_after_the_deadline_does_not_revive(
+    reconnect_hold, monkeypatch
+):
+    hold, _, listener, region, meta = reconnect_hold
+    old = hold._connection
+    now = _clock(monkeypatch, hold)
+    now[0] += 5
+
+    def late():
+        now[0] += hold._lease_ttl_ms / 1000
+
+    connection = _grant(hold, monkeypatch, listener, region, meta, on_receive=late)
+    with pytest.raises(KVCRServiceReasonError) as refused:
+        hold.reconnect()
+    assert refused.value.reason == SLOT_STALE
+    assert hold._connection is old
+    connection.close.assert_called_once()
+    hold._data_map.close.assert_called_once()
+    with pytest.raises(KVCRServiceReasonError):
+        hold.check_lease()
+
+
+def test_check_lease_and_watcher_at_the_deadline_unmap_once(
+    reconnect_hold, monkeypatch
+):
+    hold, _, _, _, _ = reconnect_hold
+    now = _clock(monkeypatch, hold)
+    _eof(hold, monkeypatch)
+    now[0] += hold._lease_ttl_ms / 1000
+    stop = Mock()
+    stop.wait.side_effect = [False, False, True]
+    stop.is_set.return_value = False
+    hold._heartbeat_stop = stop
+    hold._data_map.close.side_effect = lambda: time.sleep(0.05)
+    caller = _Thread(target=lambda: pytest.raises(Exception, hold.check_lease))
+    watcher = _Thread(target=hold._watch_connection)
+    caller.start()
+    watcher.start()
+    caller.join()
+    watcher.join()
+    hold._fence_expired()
+    hold._data_map.close.assert_called_once()
+    hold._attachment.close.assert_called_once()
+
+
+def test_check_lease_waits_for_a_reattach_publishing_in_time(
+    reconnect_hold, monkeypatch
+):
+    hold, _, listener, region, meta = reconnect_hold
+    old = hold._connection
+    now = _clock(monkeypatch, hold)
+    _eof(hold, monkeypatch)
+    _grant(hold, monkeypatch, listener, region, meta)
+    now[0] += hold._lease_ttl_ms / 1000 - 1  # sent and granted inside the window
+    checker = _Thread(target=hold.check_lease)
+
+    def publishing():
+        now[0] += 2  # past the lost connection's deadline, inside the new one
+        checker.start()
+        checker.join(0.2)
+        assert checker.is_alive()  # the deadline check waits for the publication
+
+    old.close.side_effect = publishing
+    hold.reconnect()
+    checker.join()
+    hold.check_lease()
+    assert hold._alive_at == 109
+    hold._data_map.close.assert_not_called()
+
+
+def _refusing(hold, monkeypatch, reason, now=None):
+    refused = Mock()
+    error = _ErrorV2("pod lookup failed", 1, reason)
+    refused.receive_with_fd.return_value = error, []
+
+    def connect(_path):
+        if now is not None:
+            now[0] += 4
+        return refused
+
+    connect = Mock(side_effect=connect)
+    monkeypatch.setattr(protocol.FramedConnection, "connect", connect)
+    stop = Mock()
+    stop.wait.return_value = False
+    stop.is_set.return_value = False
+    hold._heartbeat_stop = stop
+    return connect
+
+
+def test_incompatible_lineage_on_reattach_is_terminal(reconnect_hold, monkeypatch):
+    hold, _, _, _, _ = reconnect_hold
+    _eof(hold, monkeypatch)
+    connect = _refusing(hold, monkeypatch, INCOMPATIBLE_LINEAGE)
+    hold._watch_connection()
+    assert connect.call_count == 1
+    hold._data_map.close.assert_called_once()
+    with pytest.raises(KVCRServiceReasonError) as refused:
+        hold.check_lease()
+    assert refused.value.reason == INCOMPATIBLE_LINEAGE
+
+
+def test_internal_refusals_retry_log_once_and_name_the_last_in_the_fence(
+    reconnect_hold, monkeypatch, caplog
+):
+    hold, _, _, _, _ = reconnect_hold
+    now = _clock(monkeypatch, hold)
+    _eof(hold, monkeypatch)
+    connect = _refusing(hold, monkeypatch, INTERNAL, now)
+    with caplog.at_level(logging.WARNING, logger=protocol.logger.name):
+        hold._watch_connection()
+    assert connect.call_count == 3  # at 104, 108 and 112; the deadline was 110
+    assert sum("retrying" in record.message for record in caplog.records) == 1
+    with pytest.raises(KVCRServiceReasonError) as refused:
+        hold.check_lease()
+    assert refused.value.reason == SLOT_STALE
+    assert "pod lookup failed" in str(refused.value)

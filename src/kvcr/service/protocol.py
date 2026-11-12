@@ -522,13 +522,17 @@ class KVCRPoolHold:
     _lease_ttl_ms: int = 10000
     _duplicate_listener: Callable[[], int] | None = field(default=None, repr=False)
     _lease_error: BaseException | None = field(default=None, init=False, repr=False)
-    # Last monotonic time the supervisor connection was seen open.
-    _alive_at: float = field(default_factory=time.monotonic, init=False, repr=False)
+    # Monotonic time taken before the last request or probe that renewed the lease.
+    _alive_at: float = field(default_factory=time.monotonic, repr=False)
+    _reattach_error: BaseException | None = field(default=None, init=False, repr=False)
     _release_attempted: bool = field(default=False, init=False, repr=False)
     _heartbeat_stop: threading.Event = field(
         default_factory=threading.Event, init=False
     )
     _send_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    # Serializes the deadline decision, the terminal transition and reconnect's
+    # publication; taken before _send_lock, never after it.
+    _lease_lock: threading.RLock = field(default_factory=threading.RLock, init=False)
 
     def __post_init__(self) -> None:
         if self._reconnect_request is not None:
@@ -560,21 +564,31 @@ class KVCRPoolHold:
     def check_lease(self) -> None:
         """Surface a terminal lease error to the owner of this hold. Compares the
         clock itself, so a worker resuming from a freeze is refused at once."""
-        if (
-            self._lease_error is None
-            and self._reconnect_request is not None
-            and self._lease_window_passed()
-        ):
-            now = time.monotonic()
-            if self._connection_open():
-                self._alive_at = now
-            else:
-                self._fence_expired()
+        if self._lease_error is None and self._reconnect_request is not None:
+            self._check_connection(always=False)
         if self._lease_error is not None:
             raise self._lease_error
 
-    # The supervisor frees a quarantined slot a TTL (>= ours) after its first accept
-    # on restart, which follows its death, which follows _alive_at: we stop first.
+    def _check_connection(self, *, always: bool) -> bool:
+        """Renew from an open connection, or fence once it is closed past the
+        deadline; ``always=False`` probes only past the deadline. True if open."""
+        with self._lease_lock:
+            if self._lease_error is not None:
+                return False
+            if not always and not self._lease_window_passed():
+                return True
+            now = time.monotonic()
+            if self._connection_open():
+                self._alive_at = now
+                return True
+            if self._lease_window_passed():
+                self._fence_expired()
+            return False
+
+    # _alive_at is taken before the claim, re-attach or probe that renews it, so
+    # our deadline is never later than (that request's send time + TTL). The
+    # supervisor frees a quarantined slot a TTL (>= ours) after its first accept
+    # on restart, which follows its death, which follows that send: we stop first.
     def _lease_window_passed(self) -> bool:
         return time.monotonic() - self._alive_at >= self._lease_ttl_ms / 1000
 
@@ -588,40 +602,56 @@ class KVCRPoolHold:
             return False
 
     def _fence_expired(self) -> None:
+        last = self._reattach_error
         self._fence(
             KVCRServiceReasonError(
-                "supervisor lost for the lease TTL without re-attach", SLOT_STALE
+                "supervisor lost for the lease TTL without re-attach"
+                + (f"; last re-attach error: {last}" if last is not None else ""),
+                SLOT_STALE,
             )
         )
 
     def _fence(self, error: BaseException) -> None:
-        if self._lease_error is None:
+        with self._lease_lock:
+            if self._lease_error is not None:
+                return
             logger.warning("KVCR pool lease %s is terminal: %s", self.slot_name, error)
             self._lease_error = error
-        if not self._heartbeat_stop.is_set():
-            # Unmapping under native work is the intended fail-stop: a fenced
-            # worker faults rather than writes into a pool another worker may own.
-            self._stop_local_access()
+            if not self._heartbeat_stop.is_set():
+                # Unmapping under native work is the intended fail-stop: a fenced
+                # worker faults rather than writes into a pool another worker may own.
+                self._stop_local_access()
 
     def _watch_connection(self) -> None:
         while not self._heartbeat_stop.wait(_HEARTBEAT_SECONDS):
-            now = time.monotonic()
-            if self._connection_open():
-                self._alive_at = now
+            if self._check_connection(always=True):
                 continue
+            if self._lease_error is not None:
+                return
+            self._reattach_error, seen = None, set()
             while not self._heartbeat_stop.wait(min(1.0, self._lease_ttl_ms / 10000)):
-                if self._lease_window_passed():
-                    self._fence_expired()
+                self._check_connection(always=False)
+                if self._lease_error is not None:
                     return
                 try:
                     self.reconnect()
                     break
                 except Exception as error:
-                    # Only a staleness verdict is terminal; anything else (a
-                    # transient INTERNAL included) is retried until the deadline.
-                    if getattr(error, "reason", None) == SLOT_STALE:
+                    # A staleness verdict, or the pod being gone (what lets the
+                    # supervisor free the slot early), is terminal; anything else
+                    # (a transient INTERNAL included) is retried until the deadline.
+                    reason = getattr(error, "reason", None)
+                    if reason in (SLOT_STALE, INCOMPATIBLE_LINEAGE):
                         self._fence(error)
                         return
+                    self._reattach_error = error
+                    if (reason or type(error).__name__) not in seen:
+                        seen.add(reason or type(error).__name__)
+                        logger.warning(
+                            "KVCR pool lease %s re-attach refused, retrying: %s",
+                            self.slot_name,
+                            error,
+                        )
                 except BaseException as error:
                     self._fence(error)
                     return
@@ -638,6 +668,7 @@ class KVCRPoolHold:
         )
         connection = None
         received = []
+        sent_at = time.monotonic()
         try:
             connection = FramedConnection.connect(self._socket_path)
             pidfd = os.pidfd_open(os.getpid())
@@ -670,11 +701,17 @@ class KVCRPoolHold:
             ):
                 raise KVCRServiceReasonError("reconnect backing changed", SLOT_STALE)
             connection._connection.settimeout(None)
-            with self._send_lock:
-                previous, self._connection = self._connection, connection
-                connection = None
-                previous.close()
-                self._alive_at = time.monotonic()
+            with self._lease_lock:
+                # A grant that arrives after the deadline does not revive the lease.
+                if self._lease_error is None and self._lease_window_passed():
+                    self._fence_expired()
+                if self._lease_error is not None:
+                    raise self._lease_error
+                with self._send_lock:
+                    previous, self._connection = self._connection, connection
+                    connection = None
+                    previous.close()
+                    self._alive_at = sent_at
             if self._heartbeat_enabled:
                 threading.Thread(target=self._heartbeat, daemon=True).start()
         except KVCRServiceReasonError as error:
@@ -798,6 +835,7 @@ class KVCRClient:
                 }
             )
         request = msgspec.convert(fields, type=_ClaimV2 if v2 else _Claim)
+        sent_at = time.monotonic()  # the lease anchor: before the claim is sent
         connection = FramedConnection.connect(self._socket_path)
         if v2:
             # connect() leaves its short timeout.
@@ -886,6 +924,7 @@ class KVCRClient:
                 _reconnect_request=request if v2 else None,
                 _socket_path=self._socket_path if v2 else None,
                 _lease_ttl_ms=response.lease_ttl_ms if v2 else 10000,
+                _alive_at=sent_at,
                 **(_slot_fields(response, region_fds) if v2 else {}),
             )
         except BaseException as error:
