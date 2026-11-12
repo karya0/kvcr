@@ -28,6 +28,7 @@ from ..runtime.control_channels import (
     KVCRSocketError,
 )
 from ..types import PoolBlockLayouts
+from .g2_index import PoolHeader, pool_headers, pool_ranges
 from .memory import KVCRPoolAttachment, KVCRPoolSpec, _compute_pool_geometry
 
 if TYPE_CHECKING:
@@ -220,6 +221,8 @@ class _ClaimV2(msgspec.Struct, frozen=True, tag="claim2"):
     maximum_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
     placement: PlacementHints | None = None
     state_agent: StateAgentSettings | None = None
+    # Not in tier_config, which v1 claims share byte for byte.
+    key_size_bytes: Annotated[int, msgspec.Meta(gt=0)] | None = None
 
     def __post_init__(self) -> None:
         _require_literal_ipv4(self.control_host)
@@ -503,6 +506,8 @@ class KVCRPoolHold:
     regions: tuple[PoolRegion, ...] = ()
     region_fds: list[int] = field(default_factory=list, repr=False)
     guard_endpoint: str | None = None
+    # With a key size: each pool's header, in the data pool's mapping.
+    pool_headers: dict[str, PoolHeader] = field(default_factory=dict)
     _release_attempted: bool = field(default=False, init=False, repr=False)
     _heartbeat_stop: threading.Event = field(
         default_factory=threading.Event, init=False
@@ -636,6 +641,7 @@ class KVCRClient:
                         "maximum_bytes",
                         "state_agent",
                         "placement",
+                        "key_size_bytes",
                     )
                 }
             )
@@ -654,6 +660,7 @@ class KVCRClient:
         pool_fd: int | None = None
         meta_fd: int | None = None
         region_fds: list[int] = []
+        headers: dict[str, PoolHeader] = {}
         grant_received = False
         try:
             try:
@@ -700,7 +707,9 @@ class KVCRClient:
                 ]
             else:
                 # The data pool is the regions; the meta memfd keeps the journal.
-                data_map = _map_data_pool(response, gaas, region_fds)
+                data_map, dram_pools, headers = _map_data_pool(
+                    response, gaas, region_fds
+                )
                 attachment.set_layout_digest(
                     region_table_digest(
                         response.regions,
@@ -709,9 +718,6 @@ class KVCRClient:
                         response.claim_generation,
                     )
                 )
-                dram_pools = [
-                    (granted_pools[0].name, data_map.address, data_map.size_bytes)
-                ]
             return KVCRPoolHold(
                 local_dram=LocalDramOptions(
                     dram_pools, request.tier_config.remote_fw_dram_backend
@@ -724,6 +730,7 @@ class KVCRClient:
                 _incarnation=request.incarnation,
                 _dead_incarnations=response.dead_incarnations,
                 _heartbeat_enabled=response.heartbeat_enabled,
+                pool_headers=headers,
                 **(_slot_fields(response, region_fds) if v2 else {}),
             )
         except BaseException as error:
@@ -802,28 +809,46 @@ class KVCRClient:
 
 def _map_data_pool(
     response: "_GrantedV2", gaas: GaaSSettings, region_fds: list[int]
-) -> "RegionMapping":
-    """Map the granted regions as the one data pool, or fail the claim closed.
+) -> "tuple[RegionMapping, list[tuple[str, int, int]], dict[str, PoolHeader]]":
+    """Map the granted regions as the data pool, or fail the claim closed.
 
-    The engine sized its block pool before claiming, so a partial grant cannot
+    The engine sized its block pools before claiming, so a partial grant cannot
     be used: specs set minimum = maximum = total and anything else is refused.
+    Returns the mapping, each pool's (name, address, bytes) and, with a key size,
+    each pool's header, which the Guard initialized at claim.
     """
     from .regions import RegionMapping
 
     granted = sum(region.size for region in response.regions)
-    if len(response.pools) != 1:
-        problem = f"{len(response.pools)} pools; a v2 data pool is one pool"
-    elif gaas.total_bytes is None:
+    layouts = [(pool.name, pool.block_size_bytes) for pool in response.pools]
+    key_size = gaas.key_size_bytes
+    if gaas.total_bytes is None:
         problem = "no total_bytes requested"
     elif granted != gaas.total_bytes:
         problem = f"granted {granted} bytes, requested total {gaas.total_bytes}"
-    elif granted % response.pools[0].block_size_bytes:
-        problem = f"{granted} bytes is not a whole number of blocks"
     else:
         try:
-            return RegionMapping(region_fds, response.regions)
+            ranges = pool_ranges(granted, layouts, key_size)
+            mapping = RegionMapping(region_fds, response.regions)
         except (OSError, ValueError) as error:
             problem = f"cannot map the regions: {error}"
+        else:
+            headers = pool_headers(mapping.address, ranges, layouts, key_size)
+            try:
+                for header in headers.values():
+                    header.verify()
+            except ValueError as error:
+                mapping.close()
+                problem = str(error)
+            else:
+                return (
+                    mapping,
+                    [
+                        (name, mapping.address + data, size)
+                        for name, _, data, size in ranges
+                    ],
+                    headers,
+                )
     raise KVCRServiceReasonError(f"v2 data pool refused: {problem}", DATA_POOL_LAYOUT)
 
 

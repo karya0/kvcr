@@ -137,7 +137,8 @@ class GaaSSettings(msgspec.Struct, frozen=True):
 
     The v2 claim is selected iff tenant and lineage are both set; otherwise the
     claim stays v1. state_agent and placement are mappings validated when the
-    claim is built.
+    claim is built. key_size_bytes, the engine's fixed BlockKey length, gives each
+    data pool a header indexing its G2 blocks.
     """
 
     tenant: str | None = None
@@ -147,6 +148,7 @@ class GaaSSettings(msgspec.Struct, frozen=True):
     maximum_bytes: int | None = None
     state_agent: dict[str, Any] | None = None
     placement: dict[str, Any] | None = None
+    key_size_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if (self.tenant is None) != (self.lineage is None):
@@ -159,6 +161,7 @@ class GaaSSettings(msgspec.Struct, frozen=True):
                 self.maximum_bytes,
                 self.state_agent,
                 self.placement,
+                self.key_size_bytes,
             )
         ):
             raise ValueError("GaaS settings need tenant and lineage")

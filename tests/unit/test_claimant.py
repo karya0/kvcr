@@ -81,7 +81,7 @@ def _run(harness, capsys, *flags, pages=(4, 2, 8)):
     return code, {step["step"]: step for step in steps}
 
 
-def _serve(tmp_path, pages=64, journal_bytes=None, **slot_table_args):
+def _serve(tmp_path, pages=64, journal_bytes=None, server_args=(), **slot_table_args):
     info = {
         "state": "ready",
         "pool_specs": _SPECS,
@@ -91,7 +91,9 @@ def _serve(tmp_path, pages=64, journal_bytes=None, **slot_table_args):
     table = SlotTable(
         broker, HEADROOM + pages * PAGE, require_pod_identity=False, **slot_table_args
     )
-    extra = {} if journal_bytes is None else {"journal_bytes": journal_bytes}
+    extra = dict(server_args)
+    if journal_bytes is not None:
+        extra["journal_bytes"] = journal_bytes
     return _running_server(tmp_path, slots=table, **extra), table
 
 

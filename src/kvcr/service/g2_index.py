@@ -101,6 +101,21 @@ def pool_ranges(
     return ranges
 
 
+def pool_headers(
+    address: int,
+    ranges: list[tuple[str, int, int, int]],
+    pool_layouts: list[tuple[str, int]],
+    key_size: int | None,
+) -> "dict[str, PoolHeader]":
+    """Each pool's header at the ``pool_ranges`` of a data pool mapped at address."""
+    if key_size is None:
+        return {}
+    return {
+        name: PoolHeader(address + header, key_size, block, size // block)
+        for (name, header, _, size), (_, block) in zip(ranges, pool_layouts)
+    }
+
+
 class PoolHeader:
     """One pool's header in mapped memory. A slot's entry is cleared before the
     slot is reused, so a committed entry always names the slot's current key."""

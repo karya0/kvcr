@@ -29,6 +29,7 @@ from ..config import (
 from ..runtime.control_channels import KVCRServiceError, ZmqPeerControlChannel
 from ..runtime.core import _BlockRecord, _KVCRCore
 from ..types import BlockKey, PoolBlockLayouts
+from .g2_index import PoolHeader, pool_headers, pool_ranges
 from .memory import (
     LAYOUT_DIGEST_BYTES,
     KVCRPoolAttachment,
@@ -62,6 +63,10 @@ logger = logging.getLogger(__name__)
 _POLL_SECONDS, _POLL_BATCH = 0.001, 64
 # ENOMEM: no memory left to back the handback region.
 _RECOVERY_CAPACITY_ERRORS = (errno.ENOSPC, errno.EDQUOT, errno.ENOMEM)
+
+# A v2 slot's data pool as the service mapped it: address, bytes, layout digest,
+# slot name, region count, meta memfd, and the claim's key size (None: no headers).
+_DataPool = tuple[int, int, Callable[..., bytes], str, int, int, int | None]
 
 # Lease identity is the pidfd object itself: a release acts only on THIS
 # object, so nothing stale (reused pid, retried release) can touch a newer lease.
@@ -214,6 +219,8 @@ class _RecoveryState:
         # The backing the mirror and the retained snapshot were recorded under;
         # None is unknown provenance, which a v2 pool never trusts.
         self._backing: bytes | None = None
+        # v2 with a key size: each data pool's header, which indexes its G2.
+        self.headers: dict[str, PoolHeader] = {}
 
     def prepare(self) -> None:
         """Attach everything that depends only on the pool."""
@@ -496,9 +503,7 @@ class _Guard:
         # Owned by the current primary.
         self._control: ZmqPeerControlChannel | None = None
         self._configured: _TierConfig | None = None
-        self._data_pool: tuple[int, int, Callable[..., bytes], str, int, int] | None = (
-            None
-        )
+        self._data_pool: _DataPool | None = None
         self._recovery = _RecoveryState(
             spec, compatibility_digest, pool_sizes_bytes, pool_spec
         )
@@ -563,7 +568,7 @@ class _Guard:
         liveness: PidfdLiveness,
         tier_config: _TierConfig,
         bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[..., bytes], str, int, int] | None = None,
+        data_pool: _DataPool | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give this pool group to a primary, with its Guard's endpoint.
         Reserved on the requesting thread: a mid-transition pool answers busy
@@ -922,7 +927,7 @@ class _Guard:
         liveness: PidfdLiveness,
         tier_config: _TierConfig,
         bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[..., bytes], str, int, int] | None = None,
+        data_pool: _DataPool | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give the pool to a primary, and take up the endpoint it named.
         All fallible work runs before the lease exists, and commit and refusal
@@ -933,10 +938,6 @@ class _Guard:
         listener, bound_here = self._pool_lease.bind(bind)
         granted_fd = -1
         try:
-            if data_pool is not None and len(tier_config.pool_layouts) != 1:
-                raise KVCRServiceReasonError(
-                    "a v2 data pool is one pool", DATA_POOL_LAYOUT
-                )
             if data_pool is not None:
                 try:
                     meta_spec(self._spec, data_pool[5])
@@ -945,6 +946,19 @@ class _Guard:
                         f"v2 slot has no usable meta region: {error}",
                         DATA_POOL_LAYOUT,
                     ) from error
+                # First to map the slot: write each pool's header, or verify it.
+                address, size, *_, key_size = data_pool
+                layouts = list(tier_config.pool_layouts)
+                try:
+                    ranges = pool_ranges(size, layouts, key_size)
+                    headers = pool_headers(address, ranges, layouts, key_size)
+                    for header in headers.values():
+                        header.verify(initialize=True)
+                except ValueError as error:
+                    raise KVCRServiceReasonError(
+                        f"v2 data pool refused: {error}", DATA_POOL_LAYOUT
+                    ) from error
+                self._recovery.headers = headers
             self._data_pool = data_pool
             self._recovery.layout_digest = data_pool and data_pool[2]
             self._recovery.set_meta_fd(data_pool and data_pool[5])
@@ -1224,7 +1238,7 @@ class _Guard:
             (serving - started) * 1000,
         )
         if self._data_pool is not None:
-            address, size, _digest, slot_name, regions, _fd = self._data_pool
+            address, size, _digest, slot_name, regions, _fd, _key = self._data_pool
             logger.info(
                 "KVCR_EVENT guard_data_pool_serving guard=%d slot=%s "
                 "base=0x%x bytes=%d regions=%d",
@@ -1249,8 +1263,9 @@ class _Guard:
         """Register the Guard's pool without accepting control traffic."""
 
         if self._data_pool is not None:
-            address, size = self._data_pool[:2]
-            pools = [(self._recovery.pools[0].name, address, size)]
+            address, size, *_, key_size = self._data_pool
+            ranges = pool_ranges(size, list(self._configured.pool_layouts), key_size)
+            pools = [(name, address + data, length) for name, _, data, length in ranges]
         else:
             pools = [
                 (

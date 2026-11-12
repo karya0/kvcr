@@ -18,7 +18,6 @@ import struct
 import sys
 import threading
 import time
-from collections.abc import Callable
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from types import FrameType
@@ -35,7 +34,7 @@ from ..runtime.control_channels import (
 )
 from ..runtime.progress import _STARTUP_TIMEOUT_SECONDS
 from . import memmap
-from .guard import _Guard, _Lease, _Phase
+from .guard import _DataPool, _Guard, _Lease, _Phase
 from .health import _serve_health
 from .memory import (
     _OPEN_FLAGS,
@@ -255,7 +254,7 @@ class _PoolRegistry:
         tier_config: _TierConfig,
         liveness: PidfdLiveness,
         control_bind: tuple[str, int],
-        data_pool: tuple[int, int, Callable[..., bytes], str, int, int] | None = None,
+        data_pool: _DataPool | None = None,
     ) -> "tuple[KVCRPoolSpec, tuple[_PoolDescriptor, ...], int, _Lease]":
         """Give a pool group to a primary and return its Guard endpoint.
 
@@ -793,6 +792,7 @@ class _ThreadingUnixServer(
                     slot.name,
                     len(slot.pool.regions),
                     slot.pool.meta_fd,
+                    request.key_size_bytes,
                 ),
             )
             if guard is None:

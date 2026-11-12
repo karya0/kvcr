@@ -68,6 +68,7 @@ def test_v2_claim_roundtrip():
         maximum_bytes=200,
         placement=PlacementHints("n0", 1, 2 << 20),
         state_agent=StateAgentSettings("ns", "c", "e", False),
+        key_size_bytes=36,
     )
     assert _roundtrip(claim, _CLAIM_DECODER) == claim
 

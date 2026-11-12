@@ -145,19 +145,70 @@ def test_partial_grant_fails_closed_and_frees_the_slot(short_dir):
         assert not table.get("t/l/0").held
 
 
-def test_two_pool_tier_fails_closed(short_dir):
-    server, table = _serve(short_dir)
+def _claim_two_pools(harness, pages, key_size):
+    return harness.client.claim(
+        0,
+        [("a", PAGE), ("b", 2 * PAGE)],
+        _TEST_DIGEST,
+        _control_bind(0),
+        gaas=GaaSSettings("t", "l", *(3 * (pages * PAGE,)), key_size_bytes=key_size),
+        receive_timeout_s=10,
+    )
+
+
+@pytest.mark.parametrize(
+    "key_size, pages, ranges",
+    [
+        # Four blocks per pool: each pool's data follows its one-page header.
+        (36, 14, [("a", 1, 4), ("b", 6, 8)]),
+        (None, 12, [("a", 0, 4), ("b", 4, 8)]),  # no key size: no headers
+    ],
+)
+def test_two_pool_tier_splits_the_data_pool_alike_in_client_and_guard(
+    short_dir, key_size, pages, ranges
+):
+    server, table = _serve(
+        short_dir, server_args={"pool_sizes_bytes": (2 * PAGE, 2 * PAGE)}
+    )
     with server as harness:
         _attach(harness, table)
-        with pytest.raises(KVCRServiceReasonError, match="one pool") as refused:
-            harness.client.claim(
-                0,
-                [("a", 1024), ("b", 1024)],
-                _TEST_DIGEST,
-                _control_bind(0),
-                gaas=GaaSSettings("t", "l", 4 * PAGE, 4 * PAGE, 4 * PAGE),
-                receive_timeout_s=10,
-            )
+        guard = harness.server._server.registry._guards[0]
+        hold = _claim_two_pools(harness, pages, key_size)
+        try:
+            base = hold._data_map.address
+            expected = [(n, base + o * PAGE, s * PAGE) for n, o, s in ranges]
+            assert hold.local_dram.pools == expected
+            del guard._prepare_core
+            with patch.object(guard_module, "_KVCRCore") as core:
+                guard._prepare_core()
+            guard_base = guard._data_pool[0]
+            assert core.call_args.args[2].local_dram.pools == [
+                (n, a - base + guard_base, s) for n, a, s in expected
+            ]
+            assert sorted(hold.pool_headers) == (["a", "b"] if key_size else [])
+            if key_size:  # the Guard wrote each header, in the slot's memory
+                with mmap.mmap(hold.region_fds[0], 6 * PAGE) as direct:
+                    assert direct[:8] == direct[5 * PAGE : 5 * PAGE + 8] == b"KVCRG2PH"
+        finally:
+            hold.release()
+
+
+@pytest.mark.parametrize(
+    "first, second, problem",
+    [((14, 36), (14, 12), "does not match"), (None, (15, 36), "whole number")],
+)
+def test_another_key_size_or_a_total_the_pools_do_not_fill_is_refused(
+    short_dir, first, second, problem
+):
+    server, table = _serve(
+        short_dir, server_args={"pool_sizes_bytes": (2 * PAGE, 2 * PAGE)}
+    )
+    with server as harness:
+        _attach(harness, table)
+        if first:
+            _claim_two_pools(harness, *first).release()
+        with pytest.raises(KVCRServiceReasonError, match=problem) as refused:
+            _claim_two_pools(harness, *second)
         assert refused.value.reason == DATA_POOL_LAYOUT
 
 
@@ -633,7 +684,7 @@ def test_data_pool_refuses_a_total_that_is_not_whole_blocks():
 
     def grant(size):
         return SimpleNamespace(
-            pools=(SimpleNamespace(block_size_bytes=block),),
+            pools=(SimpleNamespace(name="pool0", block_size_bytes=block),),
             regions=(PoolRegion(0, 0, size, 0),),
         )
 
@@ -644,7 +695,7 @@ def test_data_pool_refuses_a_total_that_is_not_whole_blocks():
     fd = os.memfd_create("data-pool-aligned")  # sparse: nothing is touched
     try:
         os.ftruncate(fd, aligned)
-        mapping = _map_data_pool(
+        mapping, _, _ = _map_data_pool(
             grant(aligned), GaaSSettings("t", "l", aligned, aligned, aligned), [fd]
         )
         try:
