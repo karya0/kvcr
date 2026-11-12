@@ -629,6 +629,12 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             else:  # v1 claim: untouched path
                 response, grant = self.server.dispatch(request, liveness)
         except SlotError as error:
+            logger.info(
+                "claim refused reason=%s lineage=%s: %s",
+                error.reason,
+                getattr(request, "lineage", None),
+                error,
+            )
             response = _reason_error(error.reason, str(error))
         except KVCRServiceReasonError as error:
             response = _reason_error(error.reason, error.message)
