@@ -125,8 +125,8 @@ class KVCRConfig(msgspec.Struct, frozen=True):
     nixl_agent_name: str
     pool_layouts: PoolBlockLayouts
     enable_telemetry: bool = False
-    operation_timeout_ms: int = 1000
-    abandon_timeout_ms: int = 5000
+    operation_timeout_ms: int = 5000
+    abandon_timeout_ms: int = 10000
     capacity_low_watermark_percent: float = 0
     nixl_listen_port: int | None = None
     startup_timeout_seconds: int | None = None

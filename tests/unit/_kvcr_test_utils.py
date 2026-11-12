@@ -41,6 +41,10 @@ from kvcr.types import (
 
 _OPEN_KVCRS: list[KVCR] = []
 
+# The fake-clock timeout tests step time against these, the defaults before
+# KVCRConfig moved to 5000/10000 ms; helpers pin them so the steps stay valid.
+_TEST_TIMEOUTS = {"operation_timeout_ms": 1000, "abandon_timeout_ms": 5000}
+
 
 _HANDED_OUT: set[int] = set()
 
@@ -558,6 +562,7 @@ def _new_kvcr(
         or KVCRConfig(
             nixl_agent_name=name,
             pool_layouts=[("", 16)],
+            **_TEST_TIMEOUTS,
         ),
         nixl_agent_name=name,
         nixl_listen_port=1,
@@ -617,6 +622,7 @@ def _new_local_kvcr(
                 pool_layouts=[("", len(local) // slot_count)],
                 nixl_listen_port=1,
                 capacity_low_watermark_percent=capacity_low_watermark_percent,
+                **_TEST_TIMEOUTS,
             ),
             KVCRBindings(
                 pinning.request_pin,

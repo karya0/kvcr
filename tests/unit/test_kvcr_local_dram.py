@@ -13,6 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 from _kvcr_test_utils import (
+    _TEST_TIMEOUTS,
     FakeBytesControl,
     FakeNixlAgent,
     FakePrimaryPinning,
@@ -71,7 +72,9 @@ def _two_pool_kvcr(
     agent, pools, source, config=None, capacity_needed_callback=None, *, labeled=False
 ):
     config = config or KVCRConfig(
-        nixl_agent_name="target", pool_layouts=[("full", 8), ("swa", 8)]
+        nixl_agent_name="target",
+        pool_layouts=[("full", 8), ("swa", 8)],
+        **_TEST_TIMEOUTS,
     )
     return _new_kvcr(
         agent,

@@ -12,6 +12,7 @@ from unittest.mock import DEFAULT, Mock
 import msgspec
 import pytest
 from _kvcr_test_utils import (
+    _TEST_TIMEOUTS,
     FakeBytesControl,
     FakeNixlAgent,
     FakePrimaryPinning,
@@ -377,7 +378,9 @@ def test_remote_fetch_timeout_preserves_committed_local_piece(queued_success) ->
         agent,
         FakePrimaryPinning(),
         control,
-        KVCRConfig(nixl_agent_name="target", pool_layouts=[("p", 16)]),
+        KVCRConfig(
+            nixl_agent_name="target", pool_layouts=[("p", 16)], **_TEST_TIMEOUTS
+        ),
         key_adapter=_ConstantHashAdapter(),
         remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
         framework_regions=[_buffer_region(primary, 16, "p:*")],
@@ -1212,9 +1215,7 @@ def test_remote_write_cancellation_and_late_completion(
         agent,
         FakePrimaryPinning(),
         control,
-        KVCRConfig(
-            nixl_agent_name="target", pool_layouts=[("", 16)], operation_timeout_ms=1000
-        ),
+        KVCRConfig(nixl_agent_name="target", pool_layouts=[("", 16)], **_TEST_TIMEOUTS),
         on_resilience_event=on_resilience_event if outcome == "raise" else None,
     )
     kvcr._core._clock = lambda: now
