@@ -1900,6 +1900,8 @@ class SlotTable:
                     self.agents.ensure(f"{tenant}/{lineage}", namespace)
             except (OSError, ValueError) as error:
                 self._abort_claim(slot, created, generation)
+                # A refused first spawn must not outlive its aborted slot.
+                self._stop_unused_agent(f"{tenant}/{lineage}")
                 raise SlotError(
                     INTERNAL, f"state agent for {lineage}: {error}"
                 ) from error
@@ -2344,18 +2346,22 @@ class SlotTable:
             else:
                 self.broker.release(slot.holder)
         self._settle_retiring(wait_for=pod)
-        if self.agents is not None:
-            lineage = name.rsplit("/", 1)[0]
-            with self._lock:
-                last = not any(n.rsplit("/", 1)[0] == lineage for n in self._slots)
-                child = self.agents.detach(lineage) if last else None
-            if child is not None:
-                try:
-                    self.agents.reap(lineage, child)  # outside _lock: may wait
-                finally:
-                    with self._lock:
-                        self.agents.stopping.pop(lineage, None)
+        self._stop_unused_agent(name.rsplit("/", 1)[0])
         return waiters
+
+    def _stop_unused_agent(self, lineage: str) -> None:
+        """Stop the lineage's state agent once no slot of the lineage is left."""
+        if self.agents is None:
+            return
+        with self._lock:
+            last = not any(n.rsplit("/", 1)[0] == lineage for n in self._slots)
+            child = self.agents.detach(lineage) if last else None
+        if child is not None:
+            try:
+                self.agents.reap(lineage, child)  # outside _lock: may wait
+            finally:
+                with self._lock:
+                    self.agents.stopping.pop(lineage, None)
 
 
 def _rpc(
