@@ -53,6 +53,7 @@ from .recovery_journal import (
     _RecoveryMirror,
     canonical_pool_terms,
     read_handback,
+    recover_g2,
     write_recovery_snapshot,
 )
 
@@ -360,6 +361,8 @@ class _RecoveryState:
                 records = mirror.take_records()
             except (RecoveryJournalError, RecoveryMirrorError) as error:
                 self._drop_recovery(error)
+        if self.headers:  # G2 is in the pools themselves, whatever became of G3
+            records = recover_g2(records, self.headers)
         # A handover still needs somewhere to put the core's eventual records.
         self.mirror = _RecoveryMirror(tuple(pool.name for pool in self.pools))
         return records
@@ -429,7 +432,7 @@ class _RecoveryState:
             canonical_pool_terms(
                 self._compatibility_digest, self.pools, self.attachment._spec
             ),
-            _recovery_frames(records),
+            _recovery_frames(records, g3_only=bool(self.headers)),
         )
 
     def close(self) -> None:

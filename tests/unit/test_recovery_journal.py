@@ -129,6 +129,8 @@ def test_ring_round_trips_wraps_and_drains_streaming(
 
 
 class _Source:
+    _headers: dict = {}  # no pool headers: G2 goes to the journal
+
     def __init__(self) -> None:
         self._observer: Callable[[BlockKey, _BlockRecord], None] | None = None
 
