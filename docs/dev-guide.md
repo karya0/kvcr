@@ -422,7 +422,7 @@ The important fields are:
 | `local_dram_backend` | NIXL backend used for local DRAM transfers |
 | `remote_fw_dram_backend` | NIXL backend used for peer DRAM transfers |
 | `operation_timeout_ms` | Deadline for KVCR operations; timeout begins cancellation and cleanup |
-| `abandon_timeout_ms` | Deadline from operation start to report unresolved memory as uncertain; default `5000`, at least twice `operation_timeout_ms` |
+| `abandon_timeout_ms` | Deadline from operation start to report unresolved memory as uncertain; default `10000`, at least twice `operation_timeout_ms` |
 | `enable_telemetry` | Publishes KVCR operation, transfer, and state metrics through the vLLM wrapper |
 
 For several local DP ranks, provide one `control_ports` entry per local rank in local-rank order. Every worker must advertise an address reachable from its peers, and every port must be unique on that host.

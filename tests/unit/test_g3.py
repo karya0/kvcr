@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import pytest
 from _kvcr_test_utils import (
     _OPEN_KVCRS,
+    _TEST_TIMEOUTS,
     FakeBytesControl,
     FakeNixlAgent,
     FakePrimaryPinning,
@@ -178,6 +179,7 @@ def _new_g3_kvcr(
             nixl_agent_name="target",
             pool_layouts=[("", len(local) // slot_count)],
             enable_telemetry=telemetry,
+            **_TEST_TIMEOUTS,
         ),
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
         g3=G3Options(
