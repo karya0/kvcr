@@ -155,11 +155,14 @@ class PoolHeader:
         return self.address + _PREFIX_BYTES + slot * self._entry
 
     def publish(self, slot: int, key: bytes, position: int) -> None:
-        """Commit ``key`` at ``slot``; a committed entry only moves its position."""
+        """Commit ``key`` at ``slot``; the same key committed only moves position."""
         if len(key) != self.key_size:
             raise ValueError(f"key is {len(key)} bytes; the pool's is {self.key_size}")
         flag = self._flag(slot)
-        if self._load(flag, _ACQUIRE) & _STATE != _COMMITTED:
+        if (
+            self._load(flag, _ACQUIRE) & _STATE != _COMMITTED
+            or ctypes.string_at(flag + 8, self.key_size) != key
+        ):
             self._store(flag, _WRITING, _RELEASE)
             ctypes.memmove(flag + 8, key, self.key_size)
         self._store(flag, (position & _STATE) << 32 | _COMMITTED, _RELEASE)

@@ -88,11 +88,11 @@ class _PoolLease:
         if self.current is lease:
             self.current = None
 
-    def poll_pidfd(self, lease: _Lease) -> int | None:
+    def poll_pidfd(self, lease: _Lease, timeout_s: float = 0) -> int | None:
         """Return raw pidfd events for interpretation after lifecycle validation."""
         poller = select.poll()
         poller.register(lease.fileno(), select.POLLIN)
-        events = poller.poll(0)
+        events = poller.poll(int(timeout_s * 1000))
         return events[0][1] if events else None
 
     def bind(self, address: tuple[str, int]) -> tuple[socket.socket, bool]:
@@ -873,6 +873,14 @@ class _Guard:
             if flags is None:
                 if not self._fence_missing_primary(lease):
                     return
+                # Rebuilding clears what it drops, so its writer must be gone.
+                if self._recovery.headers:
+                    flags = self._pool_lease.poll_pidfd(lease, self._heartbeat_timeout)
+                    if not (flags or 0) & select.POLLIN:
+                        raise RecoveryMirrorError(
+                            "KVCR primary did not exit after SIGKILL; its pool "
+                            "headers are not rebuilt"
+                        )
                 self._promote()
                 with self._phase_lock:
                     self._last_heartbeat = None
@@ -955,6 +963,13 @@ class _Guard:
                 try:
                     if key_size is None and has_header(address):
                         raise ValueError("it holds the headers of a claim with keys")
+                    previous = self._data_pool  # this Guard's last claim
+                    if (
+                        previous
+                        and previous[3] == data_pool[3]
+                        and previous[6] != key_size
+                    ):
+                        raise ValueError(f"key size {key_size} does not match")
                     ranges = pool_ranges(size, layouts, key_size)
                     headers = pool_headers(
                         address, ranges, layouts, key_size, initialize=True

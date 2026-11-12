@@ -199,7 +199,11 @@ def test_two_pool_tier_splits_the_data_pool_alike_in_client_and_guard(
 
 @pytest.mark.parametrize(
     "first, second, problem",
-    [((14, 36), (14, 12), "does not match"), (None, (15, 36), "whole number")],
+    [
+        ((14, 36), (14, 12), "does not match"),
+        ((12, None), (12, 36), "does not match"),  # keyless, then keyed
+        (None, (15, 36), "whole number"),
+    ],
 )
 def test_another_key_size_or_a_total_the_pools_do_not_fill_is_refused(
     short_dir, first, second, problem

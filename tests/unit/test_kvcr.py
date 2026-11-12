@@ -192,6 +192,12 @@ def test_pool_headers_index_ready_blocks_and_clear_freed_slots() -> None:
     results = dict(_poll_until(kvcr, lambda done: refused in dict(done)))
     assert not results[refused][other].success
 
+    # The one slot is evicted and reused: its entry names the new key.
+    key = BlockKey(b"k1")
+    replaced = kvcr.deposit({key: [_mem_descriptor(1)]})
+    _poll_until(kvcr, lambda done: replaced in dict(done))
+    assert rebuild({"": header}) == {b"k1": ((("", 0),), -1)}
+
     pools.acquire_sources((key,))
     pools.retire_sources((key,))
     pools.release_sources((key,))

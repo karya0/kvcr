@@ -264,6 +264,31 @@ def test_missed_heartbeats_promote_before_pidfd_readiness(monkeypatch) -> None:
     assert guard._pool_lease.current is None
 
 
+@pytest.mark.parametrize("exits", [False, True])
+def test_heartbeat_promotion_rebuilds_pool_headers_only_once_the_writer_exits(
+    monkeypatch, exits
+) -> None:
+    _stub_fence(monkeypatch)
+    guard = _configurable_guard(heartbeat_timeout_seconds=1.0)
+    lease = Mock(incarnation="primary")
+    guard._phase = _Phase.PRIMARY
+    guard._pool_lease.current = lease
+    guard._last_heartbeat = 0.0
+    monkeypatch.setattr("kvcr.service.guard.time.monotonic", lambda: 10.0)
+    header = Mock()
+    guard._recovery.headers = {"a": header}
+    after_kill = select.POLLIN if exits else None
+    guard._pool_lease.poll_pidfd = Mock(side_effect=[None, after_kill])
+    guard._promote = Mock()
+
+    guard._observe_holder()
+
+    assert guard._pool_lease.poll_pidfd.call_args.args == (lease, 1.0)
+    assert guard._promote.called is exits
+    assert guard._phase is (_Phase.PRIMARY if exits else _Phase.FAILED)
+    assert not header.mock_calls
+
+
 def test_live_release_during_speculative_promotion_is_honored() -> None:
     guard = _configurable_guard(heartbeat_timeout_seconds=1.0)
     lease = Mock(incarnation="primary")

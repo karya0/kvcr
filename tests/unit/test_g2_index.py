@@ -73,6 +73,13 @@ def test_a_position_update_keeps_the_key():
     assert rebuild(headers) == {_key(1): ((("a", 2), ("b", 2)), -1)}
 
 
+def test_a_committed_entry_takes_a_new_key():
+    headers = _headers()
+    _deposit(headers, 3, _key(1))
+    _deposit(headers, 3, _key(2))  # a slot reused without its entry cleared
+    assert list(rebuild(headers)) == [_key(2)]
+
+
 def test_a_key_missing_from_one_pool_is_partial_and_cleared(caplog):
     headers = _headers()
     headers["a"].publish(1, _key(1), 0)

@@ -525,7 +525,14 @@ class _RequestHandler(socketserver.BaseRequestHandler):
             peer = _peer_identity(self.request)
             slot = slots.get(request.slot_name)
             # Its pools' headers name a block count that a resize would change.
-            if slot is not None and has_header(slot.pool.address(slot.pool.regions[0])):
+            indexed = False
+            if slot is not None:
+                with slot.lock:  # a release unmaps the pool under it
+                    regions = slot.pool.regions
+                    indexed = bool(regions) and has_header(
+                        slot.pool.address(regions[0])
+                    )
+            if indexed:
                 return _reason_error(
                     DATA_POOL_LAYOUT, "a data pool with pool headers is not resized"
                 )
