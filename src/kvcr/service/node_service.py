@@ -1540,9 +1540,11 @@ class SlotTable:
 
         One victim at a time: reserve it under ``_lock`` (``reclaiming`` refuses
         claims on it and hides it from other reclaims), then read its DGD and
-        tear it down with ``_lock`` free. Before the teardown the victim is
-        revalidated under ``_lock``; if its lineage record or the slot changed,
-        the claim is refused. The caller refuses if capacity is still short.
+        stand its Guard down with ``_lock`` free. The victim is revalidated
+        under ``_lock`` before the stand-down and again, in the same locked step
+        that removes it, after; if the slot or its lineage record changed, the
+        slot is kept and the claim refused. The caller refuses if capacity is
+        still short.
         """
         from .protocol import SLOT_HELD
 
@@ -1582,22 +1584,35 @@ class SlotTable:
                 if self._dgd(key.split("/", 1)[1]) is not None:
                     skip.add(slot.name)
                     continue
-                with self._lock:
+
+                def unchanged(slot=slot, key=key, seen=(uid, retained_at)) -> bool:
+                    """Under ``_lock``."""
                     rec = self._lineages.get(key)
-                    if (
-                        self._slots.get(slot.name) is not slot
-                        or slot.held
-                        or rec is None
-                        or (rec["dgd_uid"], rec["retained_at"]) != (uid, retained_at)
-                    ):
+                    return (
+                        self._slots.get(slot.name) is slot
+                        and not slot.held
+                        and rec is not None
+                        and (rec["dgd_uid"], rec["retained_at"]) == seen
+                    )
+
+                with self._lock:
+                    if not unchanged():
                         raise SlotError(
                             SLOT_HELD, f"reclaim victim {slot.name} changed; retry"
                         )
                 self.stand_down(slot.name)
-                self.release(slot.name)
+                self.release(slot.name, only_if=unchanged)
             finally:
                 slot.reclaiming = False
             logger.info("slot reclaimed slot=%s reason=expired", slot.name)
+
+    def _refuse_reclaiming(self, name: str) -> None:
+        """Caller holds ``_lock``: a slot under reclaim takes no claim."""
+        from .protocol import SLOT_HELD
+
+        slot = self._slots.get(name)
+        if slot is not None and slot.reclaiming:
+            raise SlotError(SLOT_HELD, f"slot {name} is being reclaimed")
 
     def _expire_waiters(self, name: str) -> None:
         """Caller holds ``_lock``. Drop waiters that died or stopped re-claiming."""
@@ -1713,6 +1728,7 @@ class SlotTable:
         gone_uid = self._gone_owner(name, claim_id)
         need = minimum or total or maximum
         with self._lock:
+            self._refuse_reclaiming(name)  # before _admit_dgd can rebind
             self._admit_dgd(key, cr)
             self._expire_waiters(name)
             queue = self._waiters.get(name)
@@ -1728,12 +1744,11 @@ class SlotTable:
             self._reclaim_for(tenant, name, need)
         created = False
         with self._lock:
+            self._refuse_reclaiming(name)  # before _admit_dgd can rebind
             self._admit_dgd(key, cr)
             self._expire_waiters(name)
             slot = self._slots.get(name)
             if slot is not None:
-                if slot.reclaiming:
-                    raise SlotError(SLOT_HELD, f"slot {name} is being reclaimed")
                 self._expire_quarantine(slot, gone_uid)
             reconnect = False
             if claim_generation is not None:
@@ -2259,11 +2274,19 @@ class SlotTable:
             self._persist()
         return removed, generation
 
-    def release(self, name: str) -> list[str]:
-        """PoC teardown: close pool, drain and delete holder; returns waiters."""
-        from .protocol import UNKNOWN_SLOT
+    def release(
+        self, name: str, *, only_if: Callable[[], bool] | None = None
+    ) -> list[str]:
+        """PoC teardown: close pool, drain and delete holder; returns waiters.
+
+        ``only_if`` is checked under ``_lock`` in the step that removes the
+        slot; if it is false the slot is kept and SLOT_HELD raised.
+        """
+        from .protocol import SLOT_HELD, UNKNOWN_SLOT
 
         with self._lock:
+            if only_if is not None and name in self._slots and not only_if():
+                raise SlotError(SLOT_HELD, f"slot {name} changed; kept")
             slot = self._slots.pop(name, None)
             if slot is None:
                 raise SlotError(UNKNOWN_SLOT, f"unknown slot {name}")
