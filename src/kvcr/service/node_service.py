@@ -1468,13 +1468,22 @@ class SlotTable:
         except (PodAPIError, OSError, ValueError, KeyError) as error:
             raise SlotError(INTERNAL, f"DGD lookup failed: {error}") from error
 
-    def _admit_dgd(self, key: str, cr: dict[str, Any] | None) -> None:
-        """Caller holds ``_lock``; ``cr`` was read before it was taken.
+    def _lineage_seen(self, key: str) -> tuple | None:
+        """Caller holds ``_lock``: the record state a DGD read is taken against."""
+        rec = self._lineages.get(key)
+        if rec is None:
+            return None
+        return rec["dgd_uid"], rec["rebound"], rec["retained_at"]
 
-        The record is read now, so a poll or rebind that landed after the read
-        is honored; an older read can only be refused against it.
+    def _admit_dgd(self, key: str, cr: dict[str, Any] | None, seen: Any) -> None:
+        """Caller holds ``_lock``; ``cr`` was read without it, after ``seen``
+        (``_lineage_seen``) was taken.
+
+        A read may create or rebind the record only if the record is still as
+        it was before the read; otherwise a stale read could spend the one
+        rebind, so it is refused for a retry with a fresh read.
         """
-        from .protocol import INTERNAL, SLOT_STALE
+        from .protocol import INTERNAL, SLOT_HELD, SLOT_STALE
 
         if self.dgd_api is None:
             return
@@ -1483,6 +1492,8 @@ class SlotTable:
         meta = cr["metadata"]
         uid = meta["uid"]
         rec = self._lineages.get(key)
+        if (rec is None or uid != rec["dgd_uid"]) and self._lineage_seen(key) != seen:
+            raise SlotError(SLOT_HELD, "lineage changed during the DGD read; retry")
         if rec is None:
             retention = float(
                 (meta.get("annotations") or {}).get(
@@ -1735,12 +1746,14 @@ class SlotTable:
         # The accept loop takes _lock too, so API reads and reclaim run outside
         # it; the locked pass below applies their results to the table as it
         # is then, and refuses what no longer holds.
+        with self._lock:
+            seen = self._lineage_seen(key)
         cr = None if self.dgd_api is None else self._dgd(lineage)
         gone_uid = self._gone_owner(name)
         need = minimum or total or maximum
         with self._lock:
             self._refuse_reclaiming(name)  # before _admit_dgd can rebind
-            self._admit_dgd(key, cr)
+            self._admit_dgd(key, cr, seen)
             self._expire_waiters(name)
             queue = self._waiters.get(name)
             short = (
@@ -1756,7 +1769,7 @@ class SlotTable:
         created = False
         with self._lock:
             self._refuse_reclaiming(name)  # before _admit_dgd can rebind
-            self._admit_dgd(key, cr)
+            self._admit_dgd(key, cr, seen)
             self._expire_waiters(name)
             slot = self._slots.get(name)
             if slot is not None:
