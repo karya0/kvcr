@@ -1354,6 +1354,22 @@ def test_supervisor_refuses_claim_when_agent_dead_after_restart(monkeypatch, cap
     agents.close()
 
 
+def test_supervisor_checks_a_first_spawn_that_exits_at_once(monkeypatch):
+    spawned = []
+
+    def spawn(command, *, env):
+        spawned.append(_AgentProcess())
+        spawned[-1].returncode = 1  # exits before ensure looks
+        return spawned[-1]
+
+    monkeypatch.setattr(node_service.subprocess, "Popen", spawn)
+    agents = node_service.LineageAgents(2)
+    with pytest.raises(ValueError, match="dead"):
+        agents.ensure("t/l", "ns1")
+    assert len(spawned) == 2  # the first spawn and its one restart
+    agents.close()
+
+
 def test_supervisor_refuses_second_lineage_agent(monkeypatch, caplog):
     spawned = []
     monkeypatch.setattr(

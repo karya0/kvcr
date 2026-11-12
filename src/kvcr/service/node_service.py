@@ -1082,16 +1082,18 @@ class LineageAgents:
             )
             raise ValueError(f"node already runs a state agent for {other}")
         current = self.children.get(lineage)
-        if current is not None:
-            if current[0] != namespace:
-                raise ValueError("state-agent namespace differs for retained lineage")
-            self.upkeep()  # the one permitted restart, if not yet used
-            if self.children[lineage][1].poll() is not None:
-                logger.error("lineage agent dead lineage=%s; claim refused", lineage)
-                raise ValueError(f"state agent for {lineage} is dead")
-            return
-        self.children[lineage] = (namespace, self._spawn(namespace), 0)
-        logger.info("lineage agent started lineage=%s namespace=%s", lineage, namespace)
+        if current is None:
+            self.children[lineage] = (namespace, self._spawn(namespace), 0)
+            logger.info(
+                "lineage agent started lineage=%s namespace=%s", lineage, namespace
+            )
+        elif current[0] != namespace:
+            raise ValueError("state-agent namespace differs for retained lineage")
+        # A first spawn that already exited is checked like an older child.
+        self.upkeep()  # the one permitted restart, if not yet used
+        if self.children[lineage][1].poll() is not None:
+            logger.error("lineage agent dead lineage=%s; claim refused", lineage)
+            raise ValueError(f"state agent for {lineage} is dead")
 
     def upkeep(self) -> None:
         for lineage, (namespace, child, restarts) in list(self.children.items()):
