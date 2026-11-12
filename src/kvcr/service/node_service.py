@@ -1204,7 +1204,8 @@ class SlotTable:
         self.dgd_poll_seconds = dgd_poll_seconds
         self._wall_clock = wall_clock
         self._lineages: dict[str, dict] = {}
-        # Released slots' bytes by holder pod name, counted until the pod is gone.
+        # Released slots' bytes by holder pod name, counted until the pod is
+        # gone; persisted, so a restarted supervisor still counts them.
         self._retiring: dict[str, int] = {}
         self.stand_down: Callable[[str], None] | None = None
         self._restore()
@@ -1263,6 +1264,7 @@ class SlotTable:
                 "lease_ttl_ms": self.lease_ttl_ms,
                 "epochs": self._epochs,
                 "generations": self._generations,
+                "retiring": self._retiring,
                 "slots": {
                     name: {
                         "digest": slot.digest,
@@ -1304,6 +1306,7 @@ class SlotTable:
         self.lease_ttl_ms = max(self.lease_ttl_ms, data.get("lease_ttl_ms", 0))
         self._epochs = {k: int(v) for k, v in data.get("epochs", {}).items()}
         self._generations = {k: int(v) for k, v in data.get("generations", {}).items()}
+        self._retiring = data.get("retiring", {})
         for name, rec in data.get("slots", {}).items():
             pool = RegionPool.create(
                 rec["effective_maximum_bytes"], meta_bytes=self.meta_bytes
@@ -2127,6 +2130,7 @@ class SlotTable:
                 if gone:
                     with self._lock:
                         self._retiring.pop(pod, None)
+                        self._persist()
             with self._lock:
                 if wait_for not in self._retiring or time.monotonic() >= deadline:
                     return

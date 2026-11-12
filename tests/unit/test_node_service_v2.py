@@ -1652,6 +1652,38 @@ def test_retiring_holder_stays_charged_until_its_pod_is_gone(tmp_path, pools):
     assert granted[0].name == "t/new/0" and not table._retiring
 
 
+def test_retiring_charge_survives_a_supervisor_restart(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path, pages=4)
+    api = table.broker.api
+    dgd.put("l", "X")
+    victim = _lineage_claim(table)
+    pod = "gaas-pool-" + table.broker._key(node_service.PoolClaim.parse(victim.holder))
+    api.keep_deleted = True  # the deleted holder pod lingers, terminating
+    table.ensure_timeout_s = 0.01  # release's wait for the pod ends at once
+    table.release(victim.name)
+    assert api.pods[pod]["metadata"].get("deletionTimestamp")
+    # The supervisor restarts while the holder is still terminating.
+    restarted = SlotTable(
+        table.broker, table.cap_bytes, require_pod_identity=False, dgd_api=dgd
+    )
+    dgd.put("new", "N")
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(restarted, "new")  # fits only if the charge was lost
+    assert raised.value.reason == SLOT_HELD
+    del api.pods[pod]  # the holder finished terminating
+    assert _lineage_claim(restarted, "new").name == "t/new/0"
+    assert not restarted._retiring
+    state = json.loads(Path(restarted._state_path).read_text())
+    assert state["retiring"] == {}
+    # A slot table written before the charge was persisted still loads.
+    del state["retiring"]
+    Path(restarted._state_path).write_text(json.dumps(state))
+    old = SlotTable(
+        table.broker, table.cap_bytes, require_pod_identity=False, dgd_api=dgd
+    )
+    assert old._retiring == {} and old.get("t/new/0") is not None
+
+
 def test_dgd_registry_persists(tmp_path, pools):
     table, dgd = _retention_table(tmp_path)
     dgd.put("l", "X")
