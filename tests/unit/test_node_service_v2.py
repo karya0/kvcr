@@ -1691,6 +1691,22 @@ def test_retiring_holder_stays_charged_until_its_pod_is_gone(tmp_path, pools):
     assert granted[0].name == "t/new/0" and not table._retiring
 
 
+def test_reclaimed_holders_leave_the_budget_when_their_pods_are_gone(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path, pages=12)
+    api = table.broker.api
+    api.keep_deleted = True  # the deleted holder pods linger, terminating
+    table.ensure_timeout_s = 0.01  # release's wait for the pod ends at once
+    for lineage in ("a", "b"):
+        dgd.put(lineage, lineage.upper())
+        table.release(_lineage_claim(table, lineage).name)
+    assert len(table._retiring) == 2
+    api.pods.clear()  # both holders finished terminating
+    table._settle_retiring()
+    assert not table._retiring
+    dgd.put("c", "C")
+    assert _lineage_claim(table, "c").name == "t/c/0"  # not "budget exceeded"
+
+
 def test_retiring_charge_survives_a_supervisor_restart(tmp_path, pools):
     table, dgd = _retention_table(tmp_path, pages=4)
     api = table.broker.api

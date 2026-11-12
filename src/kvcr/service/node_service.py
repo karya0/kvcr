@@ -2142,6 +2142,10 @@ class SlotTable:
                 except (OSError, RuntimeError, ValueError):
                     continue
                 if current is None:
+                    try:
+                        self.broker.abandon(holder)
+                    except (OSError, RuntimeError, ValueError):
+                        continue
                     with self._lock:
                         self._retiring.pop(pod, None)
                         self._persist()
