@@ -2246,3 +2246,23 @@ def test_settle_logs_an_api_error_and_the_refusal_names_the_retiring_holder(
         _lineage_claim(table, "b")
     assert raised.value.reason == SLOT_HELD
     assert "retiring holder" in str(raised.value)
+
+
+def test_reclaim_release_pod_api_error_is_an_internal_reason(tmp_path, pools):
+    table, dgd = _retention_table(tmp_path, pages=4, **_expire_at_once())
+    api = table.broker.api
+    dgd.put("l", "X")
+    victim = _lineage_claim(table)
+    del dgd.crs["l"]
+    table.poll_dgds()
+    table.stand_down = lambda name: None
+
+    def delete(name, uid):
+        raise node_service.PodAPIError(503, "DELETE")
+
+    api.delete = delete
+    dgd.put("new", "N")
+    with pytest.raises(SlotError) as raised:
+        _lineage_claim(table, "new")
+    assert raised.value.reason == INTERNAL
+    assert not victim.reclaiming

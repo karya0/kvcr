@@ -1560,7 +1560,7 @@ class SlotTable:
         slot is kept and the claim refused. The caller refuses if capacity is
         still short.
         """
-        from .protocol import SLOT_HELD
+        from .protocol import INTERNAL, SLOT_HELD
 
         self._settle_retiring()  # holders that have left since their release
         skip: set[str] = set()
@@ -1616,7 +1616,12 @@ class SlotTable:
                             SLOT_HELD, f"reclaim victim {slot.name} changed; retry"
                         )
                 self.stand_down(slot.name)
-                self.release(slot.name, only_if=unchanged)
+                try:
+                    self.release(slot.name, only_if=unchanged)
+                except PodAPIError as error:
+                    raise SlotError(
+                        INTERNAL, f"reclaim release of {slot.name}: {error}"
+                    ) from error
             finally:
                 slot.reclaiming = False
             logger.info("slot reclaimed slot=%s reason=expired", slot.name)
