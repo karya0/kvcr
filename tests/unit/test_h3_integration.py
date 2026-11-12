@@ -134,7 +134,8 @@ time.sleep(120)
         assert guard._core is not None
         assert guard._recovery.attachment.layout_digest() == digest()
         assert list(guard._recovery.headers) == [""]
-        assert guard._recovery.mirror._records == {}  # no header scan while W1 lives
+        # Reattach starts with an empty mirror.
+        assert guard._recovery.mirror._records == {}
         child.kill()
         child.wait(timeout=5)
         _wait_until(lambda: guard._serving, timeout=_REAL_NIXL_TIMEOUT_SECONDS)

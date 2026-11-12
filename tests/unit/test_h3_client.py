@@ -204,3 +204,70 @@ def test_q7_existing_caller_operations_surface_terminal_stale(reconnect_hold):
             operation(*args)
         assert refused.value.reason == SLOT_STALE
     assert owner._core.mock_calls == []
+
+
+def _clock(monkeypatch, hold):
+    now = [100.0]
+    monkeypatch.setattr(protocol, "time", Mock(monotonic=lambda: now[0]))
+    hold._alive_at = now[0]
+    return now
+
+
+def _eof(hold, monkeypatch):
+    monkeypatch.setattr(protocol.select, "select", lambda *_args: ([1], [], []))
+    hold._connection._connection.recv.return_value = b""
+
+
+def test_lease_window_passed_fences_and_stops_reconnecting(reconnect_hold, monkeypatch):
+    hold, _, _, _, _ = reconnect_hold
+    now = _clock(monkeypatch, hold)
+    _eof(hold, monkeypatch)
+    stop = Mock()
+    stop.wait.return_value = False
+    stop.is_set.return_value = False
+    hold._heartbeat_stop = stop
+
+    def down():
+        now[0] += hold._lease_ttl_ms / 1000
+        raise OSError("still down")
+
+    hold.reconnect = Mock(side_effect=down)
+    hold._watch_connection()
+    assert hold.reconnect.call_count == 1
+    hold._data_map.close.assert_called_once()
+    with pytest.raises(KVCRServiceReasonError) as refused:
+        hold.check_lease()
+    assert refused.value.reason == SLOT_STALE
+
+
+def test_frozen_worker_is_refused_by_its_next_operation(reconnect_hold, monkeypatch):
+    hold, _, _, _, _ = reconnect_hold
+    now = _clock(monkeypatch, hold)
+    monkeypatch.setattr(protocol.select, "select", lambda *_args: ([], [], []))
+    now[0] += hold._lease_ttl_ms / 1000
+    hold.check_lease()  # the connection is still open: the window restarts
+    assert hold._alive_at == now[0]
+    _eof(hold, monkeypatch)
+    now[0] += hold._lease_ttl_ms / 1000
+    with pytest.raises(KVCRServiceReasonError) as refused:
+        hold.check_lease()
+    assert refused.value.reason == SLOT_STALE
+    hold._data_map.close.assert_called_once()
+
+
+def test_reattach_inside_the_window_clears_the_deadline(reconnect_hold, monkeypatch):
+    hold, _, listener, region, meta = reconnect_hold
+    now = _clock(monkeypatch, hold)
+    _eof(hold, monkeypatch)
+    connection = Mock()
+    received = [os.dup(region), os.dup(listener.fileno()), os.dup(region), os.dup(meta)]
+    connection.receive_with_fd.return_value = (_response(hold), received)
+    monkeypatch.setattr(
+        protocol.FramedConnection, "connect", Mock(return_value=connection)
+    )
+    now[0] += hold._lease_ttl_ms / 1000 - 1
+    hold.reconnect()
+    now[0] += 2  # past the deadline the lost connection set
+    connection._connection.recv.return_value = b""
+    hold.check_lease()
+    hold._data_map.close.assert_not_called()

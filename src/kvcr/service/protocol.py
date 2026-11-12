@@ -12,6 +12,7 @@ import select
 import socket
 import struct
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -521,6 +522,8 @@ class KVCRPoolHold:
     _lease_ttl_ms: int = 10000
     _duplicate_listener: Callable[[], int] | None = field(default=None, repr=False)
     _lease_error: BaseException | None = field(default=None, init=False, repr=False)
+    # Last monotonic time the supervisor connection was seen open.
+    _alive_at: float = field(default_factory=time.monotonic, init=False, repr=False)
     _release_attempted: bool = field(default=False, init=False, repr=False)
     _heartbeat_stop: threading.Event = field(
         default_factory=threading.Event, init=False
@@ -555,30 +558,68 @@ class KVCRPoolHold:
         self._duplicate_listener = getattr(owner, "duplicate_listener", None)
 
     def check_lease(self) -> None:
-        """Surface a terminal reconnect refusal to the owner of this hold."""
+        """Surface a terminal lease error to the owner of this hold. Compares the
+        clock itself, so a worker resuming from a freeze is refused at once."""
+        if (
+            self._lease_error is None
+            and self._reconnect_request is not None
+            and self._lease_window_passed()
+        ):
+            now = time.monotonic()
+            if self._connection_open():
+                self._alive_at = now
+            else:
+                self._fence_expired()
         if self._lease_error is not None:
             raise self._lease_error
 
+    # The supervisor frees a quarantined slot a TTL (>= ours) after its first accept
+    # on restart, which follows its death, which follows _alive_at: we stop first.
+    def _lease_window_passed(self) -> bool:
+        return time.monotonic() - self._alive_at >= self._lease_ttl_ms / 1000
+
+    def _connection_open(self) -> bool:
+        try:
+            sock = self._connection._connection
+            return not select.select([sock], [], [], 0)[0] or bool(
+                sock.recv(1, socket.MSG_PEEK)
+            )
+        except (OSError, ValueError):
+            return False
+
+    def _fence_expired(self) -> None:
+        self._fence(
+            KVCRServiceReasonError(
+                "supervisor lost for the lease TTL without re-attach", SLOT_STALE
+            )
+        )
+
+    def _fence(self, error: BaseException) -> None:
+        if self._lease_error is None:
+            logger.warning("KVCR pool lease %s is terminal: %s", self.slot_name, error)
+            self._lease_error = error
+        if not self._heartbeat_stop.is_set():
+            # Unmapping under native work is the intended fail-stop: a fenced
+            # worker faults rather than writes into a pool another worker may own.
+            self._stop_local_access()
+
     def _watch_connection(self) -> None:
         while not self._heartbeat_stop.wait(_HEARTBEAT_SECONDS):
-            try:
-                sock = self._connection._connection
-                if not select.select([sock], [], [], 0)[0]:
-                    continue
-                if sock.recv(1, socket.MSG_PEEK):
-                    continue
-            except (OSError, ValueError):
-                pass
+            now = time.monotonic()
+            if self._connection_open():
+                self._alive_at = now
+                continue
             while not self._heartbeat_stop.wait(min(1.0, self._lease_ttl_ms / 10000)):
+                if self._lease_window_passed():
+                    self._fence_expired()
+                    return
                 try:
                     self.reconnect()
                     break
                 except (OSError, EOFError, KVCRSocketError):
                     continue
                 except BaseException as error:
-                    self._lease_error = error
-                    if not self._heartbeat_stop.is_set():
-                        self._stop_local_access()
+                    self._fence(error)
                     return
 
     def reconnect(self) -> None:
@@ -606,8 +647,7 @@ class KVCRPoolHold:
             if isinstance(response, _ERRORS):
                 error = _service_error(response)
                 if getattr(response, "reason", None) == SLOT_STALE:
-                    self._lease_error = error
-                    self._stop_local_access()
+                    self._fence(error)
                 raise error
             if not isinstance(response, _GrantedV2) or not response.reattached:
                 raise KVCRServiceReasonError(
@@ -630,12 +670,12 @@ class KVCRPoolHold:
                 previous, self._connection = self._connection, connection
                 connection = None
                 previous.close()
+                self._alive_at = time.monotonic()
             if self._heartbeat_enabled:
                 threading.Thread(target=self._heartbeat, daemon=True).start()
         except KVCRServiceReasonError as error:
-            if error.reason == SLOT_STALE and self._lease_error is None:
-                self._lease_error = error
-                self._stop_local_access()
+            if error.reason == SLOT_STALE:
+                self._fence(error)
             raise
         finally:
             os.close(listener)

@@ -132,3 +132,25 @@ def test_reattach_with_another_key_size_is_refused(monkeypatch, key_size):
     assert refused.value.reason == DATA_POOL_LAYOUT
     assert guard._phase is not _Phase.PRIMARY
     assert ctypes.string_at(address, PAGE) == before
+
+
+def test_reattach_onto_a_blank_header_is_refused_and_writes_nothing(monkeypatch):
+    guard, recovery, _, _ = _recovery(monkeypatch)
+    address, size, _ = _data_pool()
+    ctypes.memset(address, 0, PAGE)
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        with pytest.raises(KVCRServiceReasonError) as refused:
+            _reattach(guard, recovery, monkeypatch, address, size, KEY, listener)
+    assert refused.value.reason == DATA_POOL_LAYOUT
+    assert guard._phase is not _Phase.PRIMARY and guard._failure is None
+    assert not any(ctypes.string_at(address, PAGE))
+
+
+def test_reattach_failing_once_seated_fails_the_guard(monkeypatch):
+    guard, recovery, _, _ = _recovery(monkeypatch)
+    address, size, _ = _data_pool()
+    recovery.reattach = Mock(side_effect=RuntimeError("torn"))
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        with pytest.raises(RuntimeError):
+            _reattach(guard, recovery, monkeypatch, address, size, KEY, listener)
+    assert guard._phase is _Phase.FAILED

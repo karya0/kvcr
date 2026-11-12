@@ -1194,7 +1194,7 @@ class SlotTable:
             if self._quarantine_start is None:
                 self._quarantine_start = self._clock()
 
-    def _expire_quarantine(self, slot: _Slot) -> None:
+    def _expire_quarantine(self, slot: _Slot, claim_id: str) -> None:
         if not slot.quarantined:
             return
         expired = (
@@ -1202,7 +1202,8 @@ class SlotTable:
             and self._clock() - self._quarantine_start >= self.lease_ttl_ms / 1000
         )
         gone = False
-        if not expired and slot.peer_uid:
+        # The holder reclaiming its own slot is alive: no pod lookup under the lock.
+        if not expired and slot.peer_uid and slot.claim_id != claim_id:
             try:
                 gone = self.broker.api.get_by_uid(slot.peer_uid) is None
             except PodAPIError as error:
@@ -1210,6 +1211,12 @@ class SlotTable:
 
                 raise SlotError(INTERNAL, f"pod lookup failed: {error}") from error
         if expired or gone:
+            logger.warning(
+                "quarantine of slot %s ended (%s); claim %s is fenced",
+                slot.name,
+                "lease TTL passed" if expired else "holder pod gone",
+                slot.claim_id,
+            )
             if slot.claim_id:
                 self.dead_incarnations.add(slot.claim_id)
             slot.claim_generation += 1
@@ -1374,7 +1381,7 @@ class SlotTable:
             self._expire_waiters(name)
             slot = self._slots.get(name)
             if slot is not None:
-                self._expire_quarantine(slot)
+                self._expire_quarantine(slot, claim_id)
             reconnect = False
             if claim_generation is not None:
                 if (

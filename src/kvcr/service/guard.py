@@ -1005,7 +1005,9 @@ class _Guard:
                         f"v2 slot has no usable meta region: {error}",
                         DATA_POOL_LAYOUT,
                     ) from error
-                self._recovery.headers = self._headers(tier_config, data_pool)
+                self._recovery.headers = self._headers(
+                    tier_config, data_pool, initialize=True
+                )
             self._data_pool = data_pool
             self._recovery.layout_digest = data_pool and data_pool[2]
             self._recovery.set_meta_fd(data_pool and data_pool[5])
@@ -1052,9 +1054,10 @@ class _Guard:
             raise
 
     def _headers(
-        self, tier_config: _TierConfig, data_pool: _DataPool
+        self, tier_config: _TierConfig, data_pool: _DataPool, *, initialize: bool
     ) -> dict[str, PoolHeader]:
-        """First to map the slot: write each pool's header, or verify it."""
+        """First to map the slot: write each pool's header, or verify it.
+        A re-attach only verifies: a blank header is not the live worker's."""
         address, size, *_, key_size = data_pool
         layouts = list(tier_config.pool_layouts)
         try:
@@ -1064,7 +1067,9 @@ class _Guard:
             if previous and previous[3] == data_pool[3] and previous[6] != key_size:
                 raise ValueError(f"key size {key_size} does not match")
             ranges = pool_ranges(size, layouts, key_size)
-            return pool_headers(address, ranges, layouts, key_size, initialize=True)
+            return pool_headers(
+                address, ranges, layouts, key_size, initialize=initialize
+            )
         except ValueError as error:
             raise KVCRServiceReasonError(
                 f"v2 data pool refused: {error}", DATA_POOL_LAYOUT
@@ -1082,6 +1087,7 @@ class _Guard:
         listener = socket.socket(fileno=os.dup(listener_fd))
         control = None
         granted_fd = -1
+        seated = False
         try:
             if (
                 listener.family != socket.AF_INET
@@ -1095,7 +1101,10 @@ class _Guard:
             meta_spec(self._spec, data_pool[5])
             granted_fd = os.dup(listener.fileno())
             if self._phase is not _Phase.PRIMARY:
-                self._recovery.headers = self._headers(tier_config, data_pool)
+                self._recovery.headers = self._headers(
+                    tier_config, data_pool, initialize=False
+                )
+                seated = True
                 self._data_pool = data_pool
                 self._recovery.layout_digest = data_pool[2]
                 self._recovery.set_meta_fd(data_pool[5])
@@ -1121,12 +1130,15 @@ class _Guard:
             if old_listener is not None:
                 old_listener.close()
             return self._spec, self._recovery.pools, granted_fd, liveness
-        except BaseException:
+        except BaseException as error:
             if granted_fd >= 0:
                 os.close(granted_fd)
             listener.close()
             if control is not None:
                 control.close()
+            if seated:
+                # Half-seated: as in _adopt, nothing here can put the Guard back.
+                self._record_background_failure(error)
             raise
 
     def _stand_down(self, lease: "_Lease") -> None:
