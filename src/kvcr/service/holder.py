@@ -33,6 +33,9 @@ _MAX_FDS = 8
 _META = -1  # the meta memfd's key among the mappings; region indices are >= 0
 _MAX_LINE = 1 << 20
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+# Reconnect backoff cap: a restarted supervisor must be reached well inside the
+# worker lease TTL (server --worker-lease-ttl-ms, default 10 s).
+_RECONNECT_MAX_DELAY_S = 1.0
 
 
 def _log(event: str, **fields: Any) -> None:
@@ -184,7 +187,7 @@ def connect(
 ) -> socket.socket:
     """Connect, retrying until the supervisor has bound its socket.
 
-    With ``stop`` the retry has no deadline and backs off up to 5 s, returning
+    With ``stop`` the retry has no deadline and backs off up to 1 s, returning
     only when connected or raising ``InterruptedError`` once ``stop`` is set.
     """
     deadline = time.monotonic() + timeout_s
@@ -207,7 +210,7 @@ def connect(
             time.sleep(0.2)
         else:
             stop.wait(delay)
-            delay = min(delay * 2, 5.0)
+            delay = min(delay * 2, _RECONNECT_MAX_DELAY_S)
 
 
 def serve(

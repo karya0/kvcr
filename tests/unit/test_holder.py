@@ -37,7 +37,7 @@ from kvcr.service.protocol import (
     _response_fd_counts,
     _TierConfig,
 )
-from kvcr.service.server import pod_uid_from_cgroup
+from kvcr.service.server import _parse_args, pod_uid_from_cgroup
 
 
 @pytest.fixture
@@ -241,6 +241,29 @@ def test_holder_reconnects_after_eof_hands_back_and_keeps_pages(tmp_path, capsys
         for view, _ in mappings.values():
             view.close()
     assert not thread.is_alive()
+
+
+def test_reconnect_backoff_stays_inside_the_default_worker_lease_ttl(tmp_path):
+    args = "--socket-path s --pool-dir d --guard-count 1 --pool-sizes-gb 1"
+    parsed = _parse_args([*args.split(), "--compatibility-digest", "g"])
+    ttl_s = parsed.worker_lease_ttl_ms / 1000
+
+    class _Stop:  # records each backoff instead of sleeping
+        def __init__(self):
+            self.waits = []
+
+        def is_set(self):
+            return sum(self.waits) > 2 * ttl_s
+
+        def wait(self, delay):
+            self.waits.append(delay)
+
+    stop = _Stop()
+    with pytest.raises(InterruptedError):
+        holder.connect(str(tmp_path / "absent.sock"), 0, stop)
+    # A supervisor ready at any point of the TTL window is reached within one cap.
+    assert sum(stop.waits) > ttl_s
+    assert max(stop.waits) <= holder._RECONNECT_MAX_DELAY_S <= ttl_s / 5
 
 
 class _ToucherAPI(FakeAPI):
