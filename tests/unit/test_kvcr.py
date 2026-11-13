@@ -204,6 +204,66 @@ def test_pool_headers_index_ready_blocks_and_clear_freed_slots() -> None:
     assert header.scan() == []
 
 
+@pytest.mark.parametrize("telemetry", [True, False])
+def test_pool_header_cost_is_counted_only_with_telemetry(telemetry) -> None:
+    """With telemetry, each header operation is timed and counted and published
+    as a kvcr_state gauge; without it the untimed methods run and nothing is."""
+    block_size = 16
+    primary = ctypes.create_string_buffer(block_size)
+    local = ctypes.create_string_buffer(block_size)
+    memory = mmap.mmap(-1, mmap.PAGESIZE)
+    header = PoolHeader(
+        ctypes.addressof(ctypes.c_char.from_buffer(memory)), 2, block_size, 1
+    )
+    header.verify(initialize=True)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _new_local_kvcr(
+        agent,
+        local,
+        1,
+        framework_regions=[
+            RegionDescriptor(addr=ctypes.addressof(primary), size=block_size, count=1)
+        ],
+        enable_telemetry=telemetry,
+    )
+    pools = kvcr._core._local_dram._pools
+    pools._headers = {"": header}
+    key = BlockKey(b"k0")
+    stored = kvcr.deposit({key: [_mem_descriptor(0)]})
+    _poll_until(kvcr, lambda done: stored in dict(done))
+    kvcr._core.align_sequence([BlockKey(b"xx"), key])  # position -1 -> 1
+    pools.acquire_sources((key,))
+    pools.retire_sources((key,))
+    pools.release_sources((key,))
+    assert header.scan() == []
+
+    state = pools.telemetry_state()
+    if not telemetry:
+        assert not any(name.startswith("local_g2_header_") for name in state)
+        assert {"_residency_observer", "_free"}.isdisjoint(vars(pools))
+        return
+    assert {"_residency_observer", "_free"} <= set(vars(pools))
+    counts = {
+        op: (state[f"local_g2_header_{op}_count"], state[f"local_g2_header_{op}_bytes"])
+        for op in ("publish_key", "publish_pos", "clear", "journal_g2")
+    }
+    # The journal observer runs on deposit, align and retire; it counts no bytes.
+    assert counts == {
+        "publish_key": (1, 16 + 2),
+        "publish_pos": (1, 8),
+        "clear": (1, 8),
+        "journal_g2": (3, 0),
+    }
+    assert 0 < state["local_g2_header_publish_key_ns_max"]
+    assert (
+        state["local_g2_header_publish_key_ns_max"]
+        <= state["local_g2_header_publish_key_ns_total"]
+    )
+    gauge = ("gauge", "kvcr_state", 1, ("local_g2_header_clear_count",))
+    assert gauge in kvcr.get_stats().records
+
+
 _GUARD_CONFIG = KVCRGuardConfig(
     kvcr_service_socket_path="/tmp/kvcr.sock",
     guard_index=3,

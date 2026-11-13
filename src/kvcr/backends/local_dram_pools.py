@@ -5,6 +5,7 @@
 import logging
 import queue
 import threading
+import time
 from collections import Counter, deque
 from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
@@ -16,6 +17,7 @@ import msgspec
 from ..config import LocalDramOptions
 from ..runtime.policy_runtime import _EvictionQueue
 from ..runtime.progress import _TransferRef
+from ..service.g2_index import HeaderCost
 from ..types import (
     BlockKey,
     CacheTier,
@@ -247,6 +249,13 @@ class _LocalDramPools:
         # committed in every pool's header once its bytes are, and each entry is
         # cleared before its slot is reused. Set before any slot is allocated.
         self._headers: dict[str, "PoolHeader"] = {}
+        # With telemetry, the timed variants measure what the G2 index costs the
+        # hot path; without it the untimed ones run with no flag test.
+        self._header_cost: HeaderCost | None = None
+        if kvcr._stats is not None:
+            self._header_cost = HeaderCost()
+            self._residency_observer = self._timed_residency_observer
+            self._free = self._timed_free
         # Final claim release must wake waiters before returning to the caller.
         self._resume_capacity_waiters = resume_capacity_waiters
 
@@ -436,6 +445,29 @@ class _LocalDramPools:
                 self._headers[label].publish(slot, bytes(key), record.position)
         self._observer(key, record)
 
+    def _timed_residency_observer(self, key: BlockKey, record: "_BlockRecord") -> None:
+        cost, clock = cast(HeaderCost, self._header_cost), time.perf_counter_ns
+        residency = record.local_dram
+        if (
+            self._headers
+            and residency is not None
+            and residency.state is _LocalDramState.READY
+            and not residency.pending_labels
+        ):
+            for label, slot in residency.slots:
+                start = clock()
+                written = self._headers[label].publish(
+                    slot, bytes(key), record.position
+                )
+                elapsed = clock() - start
+                if written:
+                    cost.add(cost.publish_key, elapsed, 16 + len(key))
+                else:
+                    cost.add(cost.publish_pos, elapsed, 8)
+        start = clock()
+        self._observer(key, record)
+        cost.add(cost.journal_g2, clock() - start, 0)
+
     def adopt_recovery_slots(self, records: Mapping[BlockKey, "_BlockRecord"]) -> None:
         """Take the rows already-recovered records name, before the core starts.
 
@@ -510,7 +542,7 @@ class _LocalDramPools:
             "local_g2_allocated_slots": total_slots - free_slots,
             "local_g2_evictable_slots": sum(self._reclaimable_slots().values())
             - free_slots,
-        }
+        } | (self._header_cost.telemetry_state() if self._header_cost else {})
 
     def release(self, handles: Collection[ReleaseHandle]) -> list[ReleaseResult]:
         results: list[ReleaseResult] = []
@@ -833,6 +865,16 @@ class _LocalDramPools:
             pool = label.partition(":")[0]
             if self._headers:
                 self._headers[pool].clear(slot)
+            self._free_slots[pool].append(slot)
+
+    def _timed_free(self, locations: Collection[tuple[str, int]]) -> None:
+        cost, clock = cast(HeaderCost, self._header_cost), time.perf_counter_ns
+        for label, slot in locations:
+            pool = label.partition(":")[0]
+            if self._headers:
+                start = clock()
+                self._headers[pool].clear(slot)
+                cost.add(cost.clear, clock() - start, 8)
             self._free_slots[pool].append(slot)
 
     def _size_bytes(self, residency: _LocalDramResidency) -> int:

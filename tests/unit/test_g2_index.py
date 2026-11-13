@@ -84,6 +84,17 @@ def test_a_position_update_keeps_the_key():
     assert rebuild(headers) == {_key(1): ((("a", 2), ("b", 2)), -1)}
 
 
+def test_publish_says_whether_it_wrote_the_key(caplog):
+    header = _headers(names=("a",))["a"]
+    assert header.publish(2, _key(1), 5)  # a new key
+    assert not header.publish(2, _key(1), 6)  # a position-only move
+    assert header.publish(2, _key(2), 6)  # a slot reused without a clear
+    with caplog.at_level("INFO"):
+        rebuild({"a": header})
+    assert "elapsed_ms=" in caplog.text
+    assert f"scanned_bytes={8 * entry_bytes(KEY)}" in caplog.text
+
+
 def test_a_committed_entry_takes_a_new_key():
     headers = _headers()
     _deposit(headers, 3, _key(1))

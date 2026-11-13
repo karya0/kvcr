@@ -608,6 +608,7 @@ def _new_local_kvcr(
     local_dram_backend="UCX",
     framework_regions: list[RegionDescriptor] | None = None,
     on_resilience_event=None,
+    enable_telemetry: bool = False,
 ) -> KVCR:
     pinning = FakePrimaryPinning()
     with _use_nixl_agent(agent):
@@ -617,6 +618,7 @@ def _new_local_kvcr(
                 pool_layouts=[("", len(local) // slot_count)],
                 nixl_listen_port=1,
                 capacity_low_watermark_percent=capacity_low_watermark_percent,
+                enable_telemetry=enable_telemetry,
             ),
             KVCRBindings(
                 pinning.request_pin,
@@ -626,6 +628,7 @@ def _new_local_kvcr(
                 capacity_needed_callback=capacity_needed_callback,
                 policy=policy,
                 on_resilience_event=on_resilience_event,
+                stats_factory=FakeTelemetryStats if enable_telemetry else None,
             ),
             KVCRBackendConfigs(
                 framework_regions=framework_regions or [],

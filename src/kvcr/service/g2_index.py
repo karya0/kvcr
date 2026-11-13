@@ -15,6 +15,7 @@ import ctypes.util
 import logging
 import mmap
 import struct
+import time
 from functools import cache
 from typing import Any
 
@@ -156,18 +157,23 @@ class PoolHeader:
     def _flag(self, slot: int) -> int:
         return self.address + _PREFIX_BYTES + slot * self._entry
 
-    def publish(self, slot: int, key: bytes, position: int) -> None:
-        """Commit ``key`` at ``slot``; the same key committed only moves position."""
+    def publish(self, slot: int, key: bytes, position: int) -> bool:
+        """Commit ``key`` at ``slot``; the same key committed only moves position.
+
+        True if the key was written, False for a position-only move.
+        """
         if len(key) != self.key_size:
             raise ValueError(f"key is {len(key)} bytes; the pool's is {self.key_size}")
         flag = self._flag(slot)
-        if (
+        written = (
             self._load(flag, _ACQUIRE) & _STATE != _COMMITTED
             or ctypes.string_at(flag + 8, self.key_size) != key
-        ):
+        )
+        if written:
             self._store(flag, _WRITING, _RELEASE)
             ctypes.memmove(flag + 8, key, self.key_size)
         self._store(flag, (position & _STATE) << 32 | _COMMITTED, _RELEASE)
+        return written
 
     def clear(self, slot: int) -> None:
         self._store(self._flag(slot), 0, _RELEASE)
@@ -186,6 +192,34 @@ class PoolHeader:
         ]
 
 
+class HeaderCost:
+    """What G2 indexing costs the hot path, kept only with telemetry on: per
+    operation a [count, total ns, max ns, bytes stored] list. journal_g2 is the
+    residency observer downstream of the headers; its bytes are not counted."""
+
+    __slots__ = ("publish_key", "publish_pos", "clear", "journal_g2")
+
+    def __init__(self) -> None:
+        for op in self.__slots__:
+            setattr(self, op, [0, 0, 0, 0])
+
+    @staticmethod
+    def add(cost: list[int], ns: int, size: int) -> None:
+        cost[0] += 1
+        cost[1] += ns
+        cost[2] = max(cost[2], ns)
+        cost[3] += size
+
+    def telemetry_state(self) -> dict[str, int]:
+        return {
+            f"local_g2_header_{op}_{field}": value
+            for op in self.__slots__
+            for field, value in zip(
+                ("count", "ns_total", "ns_max", "bytes"), getattr(self, op)
+            )
+        }
+
+
 def rebuild(
     headers: dict[str, PoolHeader],
 ) -> dict[bytes, tuple[tuple[tuple[str, int], ...], int]]:
@@ -194,6 +228,7 @@ def rebuild(
     The caller now owns the pools: every other entry -- torn, or a key missing
     from some pool -- is cleared, since its slot is about to be handed out free.
     """
+    started = time.perf_counter()
     names = list(headers)
     scans = {name: header.scan() for name, header in headers.items()}
     found: dict[bytes, list[tuple[str, int, int]]] = {}
@@ -216,9 +251,12 @@ def rebuild(
             if (name, slot) not in kept:
                 headers[name].clear(slot)
     logger.info(
-        "KVCR_EVENT g2_index_rebuilt blocks=%d torn=%d partial=%d",
+        "KVCR_EVENT g2_index_rebuilt blocks=%d torn=%d partial=%d "
+        "elapsed_ms=%.3f scanned_bytes=%d",
         len(present),
         torn,
         len(found) - len(present),
+        (time.perf_counter() - started) * 1000,
+        sum(header.n * header._entry for header in headers.values()),
     )
     return present
