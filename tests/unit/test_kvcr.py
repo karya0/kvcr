@@ -249,13 +249,20 @@ def test_pool_header_cost_is_counted_only_with_telemetry(telemetry) -> None:
         return timed
 
     class SlowHeader:
-        publish = staticmethod(advance(1000, header.publish))
-        clear = staticmethod(advance(300, header.clear))
-        scan = staticmethod(header.scan)
+        """Stands in for the real header: publish and clear advance the clock,
+        every other attribute (key_size, scan, ...) is the wrapped header's."""
+
+        def __init__(self, wrapped) -> None:
+            self._wrapped = wrapped
+            self.publish = advance(1000, wrapped.publish)
+            self.clear = advance(300, wrapped.clear)
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
 
     if telemetry:
         pools._header_cost.clock = clock
-    pools._headers = {"": SlowHeader}
+    pools._headers = {"": SlowHeader(header)}
     pools._observer = advance(40_000, pools._observer)
     key = BlockKey(b"k0")
     stored = kvcr.deposit({key: [_mem_descriptor(0)]})
