@@ -682,11 +682,13 @@ class NodeBroker:
             # its memory: it counts until the pod is gone.
             if state["phase"] != "deleted" or pod is not None:
                 counted.append(state)
+        # Three holders of 161025622016 B (3 workers, 485378490368 B slot cap)
+        # must fit; the slot cap itself is enforced by SlotTable._available.
         if (
-            len(counted) >= 2
+            len(counted) >= 3
             or sum(PoolClaim.parse(s["claim"]).data_bytes for s in counted)
             + claim.data_bytes
-            > 256 * _GIB
+            > 450 * _GIB
         ):
             raise ValueError("H7 holder count or capacity budget exceeded")
 
