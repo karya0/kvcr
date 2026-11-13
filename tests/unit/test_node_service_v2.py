@@ -24,7 +24,7 @@ from test_node_service import _CLAIM, _SPECS, FakeAPI, make_broker
 
 from kvcr.runtime.control_channels import FramedConnection
 from kvcr.service import holder, node_service, server
-from kvcr.service.node_service import SlotError, SlotTable, effective_grant
+from kvcr.service.node_service import SlotError, SlotTable
 from kvcr.service.protocol import (
     _RESIZE_RESPONSE_DECODER,
     CAPACITY_BELOW_MINIMUM,
@@ -43,7 +43,6 @@ from kvcr.service.protocol import (
 from kvcr.service.regions import RegionPool
 
 PAGE = mmap.PAGESIZE
-HEADROOM = node_service._HEADROOM_BYTES
 DIGEST = "model-v1"
 ME = (os.getpid(), os.getuid())
 
@@ -53,20 +52,6 @@ def tmp_path():
     # Short path: holder socket paths are bounded by AF_UNIX.
     with tempfile.TemporaryDirectory(prefix="gaas-v2-", dir="/tmp") as directory:
         yield Path(directory)
-
-
-@pytest.mark.parametrize(
-    ("total", "minimum", "maximum", "available", "expected"),
-    [
-        (8, 4, None, 100, 8),  # full
-        (8, 4, 6, 100, 6),  # maximum caps the grant
-        (8, 4, None, 5, 5),  # partial
-        (8, 4, None, 4, 4),  # exactly the minimum
-        (8, 4, None, 3, None),  # below minimum
-    ],
-)
-def test_effective_grant(total, minimum, maximum, available, expected):
-    assert effective_grant(total, minimum, maximum, available) == expected
 
 
 @pytest.fixture
@@ -84,13 +69,10 @@ def pools(monkeypatch):
         pool.close()
 
 
-def _table(tmp_path, api=None, pages=64, **kwargs):
+def _table(tmp_path, api=None, **kwargs):
     api = api or FakeAPI()
     broker = make_broker(tmp_path, api, **kwargs)
-    return (
-        SlotTable(broker, HEADROOM + pages * PAGE, require_pod_identity=False),
-        api,
-    )
+    return SlotTable(broker, require_pod_identity=False), api
 
 
 def _claim(
@@ -125,45 +107,12 @@ def test_full_grant(tmp_path, pools):
     assert len(api.creates) == 1
 
 
-def test_namespace_local_requests_extend_capacity(tmp_path, pools):
-    table, _ = _table(tmp_path, pages=1)
-    table.local_requests = lambda tenant: 8 * PAGE if tenant == "t" else 0
-    assert _claim(table).effective_maximum_bytes == 4 * PAGE
-
-
-def test_partial_grant(tmp_path, pools):
-    table, _ = _table(tmp_path, pages=3)
-    slot = _claim(table)
-    assert slot.effective_maximum_bytes == 3 * PAGE
-    assert [r.size for r in slot.pool.regions] == [3 * PAGE]
-
-
-def test_other_slots_reduce_capacity(tmp_path, pools):
-    table, _ = _table(tmp_path, pages=5)
-    _claim(table)
-    with pytest.raises(SlotError) as raised:
-        table.claim(
-            "u",
-            "l",
-            0,
-            total=4 * PAGE,
-            minimum=2 * PAGE,
-            maximum=None,
-            digest=DIGEST,
-            claim_id="x",
-            peer=ME,
-            owner_alive=lambda: True,
-        )
-    assert raised.value.reason == CAPACITY_BELOW_MINIMUM
-
-
-def test_below_minimum_leaves_nothing(tmp_path, pools):
-    table, api = _table(tmp_path, pages=1)
-    with pytest.raises(SlotError) as raised:
-        _claim(table)
-    assert raised.value.reason == CAPACITY_BELOW_MINIMUM
-    assert not api.creates and not api.deletes and table.get("t/l/0") is None
-    assert all(pool.fd == -1 for pool in pools)
+def test_grant_is_the_claimed_maximum_with_no_node_cap(tmp_path, pools):
+    table, _ = _table(tmp_path)
+    pages = (600 << 30) // PAGE  # 600 GiB: reserved address space, sparse memfd
+    slot = _claim(table, total=4, minimum=2, maximum=pages)
+    assert slot.effective_maximum_bytes == pages * PAGE
+    assert [r.size for r in slot.pool.regions] == [4 * PAGE]  # sparse memfd
 
 
 def test_failed_holder_closes_pool_and_deletes_holder(tmp_path, pools):
@@ -345,7 +294,7 @@ def test_slot_key_includes_the_worker_position(tmp_path, pools):
 
 def test_v2_fails_closed_without_pod_identity(tmp_path, pools):
     broker = make_broker(tmp_path, FakeAPI())
-    table = SlotTable(broker, HEADROOM + 64 * PAGE)  # require_pod_identity=True
+    table = SlotTable(broker)  # require_pod_identity=True
     for peer in (None, (ME[0], ME[1], None), (0, ME[1], "pod-a"), ME):
         with pytest.raises(SlotError) as raised:
             _claim_raw(table, peer=peer)
@@ -390,7 +339,7 @@ def _worker(lineage, namespace="ns"):
     ],
 )
 def test_claim_proves_lineage_membership(tmp_path, pools, workers, namespace, expected):
-    table = SlotTable(make_broker(tmp_path, _LineageAPI(workers)), HEADROOM + 64 * PAGE)
+    table = SlotTable(make_broker(tmp_path, _LineageAPI(workers)))
     peer = (ME[0], ME[1], "u1")
     if expected is None:
         assert _claim_raw(table, peer=peer, namespace=namespace).peer == peer
@@ -524,9 +473,7 @@ def test_slot_state_persists_across_supervisor_restart(tmp_path, pools):
     table, api = _table(tmp_path)
     slot = _claim(table, uuid.uuid4().hex, total=2, minimum=2, maximum=8)
     table.grow("t/l/0", ME, 2 * PAGE, None)
-    restarted = SlotTable(
-        table.broker, HEADROOM + 64 * PAGE, require_pod_identity=False
-    )
+    restarted = SlotTable(table.broker, require_pod_identity=False)
     again = restarted.get("t/l/0")
     pools.append(again.pool)  # closed by the fixture
     assert again.pool.regions == slot.pool.regions
@@ -556,7 +503,7 @@ def test_slot_state_persists_across_supervisor_restart(tmp_path, pools):
     assert persisted["epochs"] == {"t/l/0": 1}
 
 
-def test_terminating_holders_still_count_toward_the_budget(tmp_path):
+def test_a_terminating_holder_counts_against_nothing_but_its_replacement(tmp_path):
     api = FakeAPI()
     broker = make_broker(tmp_path, api)
     claims = [{**_CLAIM, "pool_id": f"pool-{name}"} for name in "abcd"]
@@ -567,8 +514,6 @@ def test_terminating_holders_still_count_toward_the_budget(tmp_path):
     api.pods[held] = terminating  # gone from the claim's view, not from the API
     broker.ensure(claims[1])
     broker.ensure(claims[2])
-    with pytest.raises(ValueError, match="budget"):
-        broker.ensure(claims[3])
     api.pods[held]["metadata"]["uid"] = "replacement"  # same name, other UID
     with pytest.raises(RuntimeError, match="replaced"):
         broker.ensure(claims[3])
@@ -592,7 +537,8 @@ def test_server_path_waiters_keep_fifo_after_slot_held_replies(tmp_path, pools):
     _claim(table, "a", alive=lambda: owner[0])
 
     class Registry:
-        _guards = {0: object()}
+        def claimed_guard(self, index):
+            return object()
 
         def claim(self, *args):
             raise KVCRServiceError("reached the guard")
@@ -643,7 +589,8 @@ def test_server_path_grant_advertises_a_reachable_guard_endpoint(tmp_path, pools
     guard = SimpleNamespace(dead_incarnations=(), heartbeat_enabled=False)
 
     class Registry:
-        _guards = {0: guard}
+        def claimed_guard(self, index):
+            return guard
 
         def claim(self, *args):
             return None, None, -1, None
@@ -773,9 +720,8 @@ def test_v1_claim_is_refused_on_a_slot_service(tmp_path, pools):
     assert raised.value.reason == NOT_IMPLEMENTED
 
 
-_SLOT_ARGS = (
-    "--socket-path s --pool-dir d --guard-count 1 --pool-sizes-gb 1 "
-    "--compatibility-digest g --slot-cap-bytes 1048576 --namespace bench "
+_SLOT_ARGS = (  # no --guard-count or --pool-sizes-gb: v2 does not read them
+    "--socket-path s --pool-dir d --compatibility-digest g --namespace bench "
     "--node-name node-a --no-require-pod-identity"
 ).split()
 _HOLDER = "reg/holder@sha256:" + "a" * 64
@@ -789,9 +735,10 @@ def test_service_main_builds_the_slot_table(tmp_path, monkeypatch):
     args.socket_path = str(tmp_path / "service.sock")
     table = server._build_slots(args)
     assert isinstance(table, SlotTable)
-    assert table.cap_bytes == 1048576 and not table.require_pod_identity
+    assert not table.require_pod_identity
     assert table.broker.image == _HOLDER and table.broker.node_name == "node-a"
-    assert server._build_slots(server._parse_args(_SLOT_ARGS[:10])) is None
+    v1 = _SLOT_ARGS[:6] + "--guard-count 1 --pool-sizes-gb 1".split()
+    assert server._build_slots(server._parse_args(v1)) is None
     # v2 slots must use the toucher holder, not a v1 service pod.
     assert table.broker.toucher is True
     claim = _Claim_pool("p1")
@@ -845,7 +792,7 @@ def test_advertise_host_rejects_non_hosts(tmp_path, value):
         )
 
 
-def test_service_slots_require_a_holder_image():
+def test_without_a_holder_image_the_service_is_v1_and_needs_its_flags():
     with pytest.raises(SystemExit):
         server._parse_args(_SLOT_ARGS)
 
@@ -910,9 +857,7 @@ def test_restored_slot_adopts_the_holders_handback(tmp_path, pools, monkeypatch)
     table, _ = _table(tmp_path)
     slot = _claim(table)
     os.pwrite(slot.pool.fd, b"S", 0)
-    restarted = SlotTable(
-        table.broker, HEADROOM + 64 * PAGE, require_pod_identity=False
-    )
+    restarted = SlotTable(table.broker, require_pod_identity=False)
     again = restarted.get("t/l/0")
     fresh = again.pool.pass_fd_list()
     sup, peer = socket.socketpair()
@@ -1027,9 +972,7 @@ def test_live_handback_does_not_remap(tmp_path, pools, monkeypatch):
 def test_bad_restored_handback_is_quarantined(tmp_path, pools, monkeypatch, bad):
     table, _ = _table(tmp_path)
     slot = _claim(table)
-    restarted = SlotTable(
-        table.broker, HEADROOM + 64 * PAGE, require_pod_identity=False
-    )
+    restarted = SlotTable(table.broker, require_pod_identity=False)
     again = restarted.get("t/l/0")
     sup, peer = socket.socketpair()
     again.holder_conn = sup

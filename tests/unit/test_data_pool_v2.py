@@ -7,6 +7,7 @@ import errno
 import logging
 import mmap
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -20,6 +21,7 @@ import pytest
 if sys.platform != "linux":
     pytest.skip("memfd and MAP_FIXED regions are Linux-only", allow_module_level=True)
 
+from _kvcr_test_utils import _wait_until
 from test_claimant import (  # noqa: F401 - fixtures
     PAGE,
     _attach,
@@ -32,13 +34,13 @@ from test_kvcr_service import (  # noqa: F401 - _channels_are_taken is autouse
     _control_bind,
     _running_server,
 )
-from test_node_service_v2 import pools  # noqa: F401 - used through pytestmark
+from test_node_service_v2 import _handback, pools  # noqa: F401 - pools: pytestmark
 
 from kvcr.backends.local_disk import _G3Residency
 from kvcr.config import GaaSSettings
 from kvcr.runtime.core import _BlockRecord
 from kvcr.service import guard as guard_module
-from kvcr.service import memmap
+from kvcr.service import holder, memmap
 from kvcr.service import memory as memory_module
 from kvcr.service import node_service
 from kvcr.service.node_service import SlotTable
@@ -133,11 +135,11 @@ def test_client_pool_is_the_regions_and_the_journal_records_their_digest(
 
 
 def test_partial_grant_fails_closed_and_frees_the_slot(short_dir):
-    server, table = _serve(short_dir, pages=3)  # 3 pages free, 4 requested, 2 minimum
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         with pytest.raises(KVCRServiceReasonError) as refused:
-            _claim(harness)
+            _claim(harness, pages=(4, 2, 3))  # a maximum below the total
         assert refused.value.reason == DATA_POOL_LAYOUT
         assert "granted" in refused.value.message
         deadline = time.monotonic() + 5  # the service frees it on the release
@@ -163,15 +165,14 @@ def _claim_two_pools(harness, pages, key_size):
         # Four blocks per pool: each pool's data follows its one-page header.
         (36, 14, [("a", 1, 4), ("b", 6, 8)]),
         (36, 15, [("a", 1, 4), ("b", 6, 8)]),  # the last page is left unused
+        (2000, 16, [("a", 2, 4), ("b", 8, 8)]),  # a larger key: two-page headers
         (None, 12, [("a", 0, 4), ("b", 4, 8)]),  # no key size: no headers
     ],
 )
 def test_two_pool_tier_splits_the_data_pool_alike_in_client_and_guard(
     short_dir, key_size, pages, ranges
 ):
-    server, table = _serve(
-        short_dir, server_args={"pool_sizes_bytes": (2 * PAGE, 2 * PAGE)}
-    )
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         guard = harness.server._server.registry._guards[0]
@@ -180,6 +181,11 @@ def test_two_pool_tier_splits_the_data_pool_alike_in_client_and_guard(
             base = hold._data_map.address
             expected = [(n, base + o * PAGE, s * PAGE) for n, o, s in ranges]
             assert hold.local_dram.pools == expected
+            # The granted pools are the claim's split, not a startup size.
+            assert [(p.name, p.size_bytes) for p in hold._pools] == [
+                (n, s * PAGE) for n, _, s in ranges
+            ]
+            assert guard._recovery.pools == hold._pools
             del guard._prepare_core
             with patch.object(guard_module, "_KVCRCore") as core:
                 guard._prepare_core()
@@ -192,8 +198,9 @@ def test_two_pool_tier_splits_the_data_pool_alike_in_client_and_guard(
             assert list(guard_headers) == list(hold.pool_headers)
             assert sorted(hold.pool_headers) == (["a", "b"] if key_size else [])
             if key_size:  # the Guard wrote each header, in the slot's memory
-                with mmap.mmap(hold.region_fds[0], 6 * PAGE) as direct:
-                    assert direct[:8] == direct[5 * PAGE : 5 * PAGE + 8] == b"KVCRG2PH"
+                second = (ranges[0][1] + ranges[0][2]) * PAGE  # after a's data
+                with mmap.mmap(hold.region_fds[0], second + PAGE) as direct:
+                    assert direct[:8] == direct[second : second + 8] == b"KVCRG2PH"
         finally:
             hold.release()
 
@@ -209,9 +216,7 @@ def test_two_pool_tier_splits_the_data_pool_alike_in_client_and_guard(
 def test_another_key_size_or_a_total_the_pools_do_not_fill_is_refused(
     short_dir, first, second, problem
 ):
-    server, table = _serve(
-        short_dir, server_args={"pool_sizes_bytes": (2 * PAGE, 2 * PAGE)}
-    )
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         if first:
@@ -222,9 +227,7 @@ def test_another_key_size_or_a_total_the_pools_do_not_fill_is_refused(
 
 
 def test_headers_carry_g2_to_the_guard_and_to_the_next_claimant(short_dir):
-    server, table = _serve(
-        short_dir, server_args={"pool_sizes_bytes": (2 * PAGE, 2 * PAGE)}
-    )
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         guard = harness.server._server.registry._guards[0]
@@ -249,9 +252,7 @@ def test_headers_carry_g2_to_the_guard_and_to_the_next_claimant(short_dir):
 
 
 def test_an_indexed_pool_refuses_a_claim_without_keys_and_a_resize(short_dir):
-    server, table = _serve(
-        short_dir, server_args={"pool_sizes_bytes": (2 * PAGE, 2 * PAGE)}
-    )
+    server, table = _serve(short_dir)
     with server as harness:
         _attach(harness, table)
         hold = _claim_two_pools(harness, 14, 36)
@@ -622,8 +623,8 @@ def test_supervisor_pool_rank_is_a_sparse_stub_no_populate_touches(short_dir):
             assert os.stat(path).st_size == 3 * PAGE
             assert os.stat(path).st_blocks == 0  # nothing faulted a page in
             assert all(call[0] != inode for call in populated)
-            # The grant still describes the configured journal, which the meta uses.
-            assert guard._spec.mapping_bytes > 3 * PAGE
+            # The grant describes the configured journal, which the meta uses.
+            assert guard._spec.mapping_bytes == guard._spec.journal_bytes + PAGE
 
 
 def test_meta_region_follows_the_configured_journal_bytes(short_dir):
@@ -649,7 +650,7 @@ def test_configured_journal_survives_a_restart_with_a_persisted_slot(short_dir):
         _claim(harness).release()
     assert (short_dir / "slot-table.json").exists()
     # A new process: a default-sized table restores the slot, then the service binds.
-    reborn = SlotTable(table.broker, table.cap_bytes, require_pod_identity=False)
+    reborn = SlotTable(table.broker, require_pod_identity=False)
     assert "t/l/0" in reborn._slots
     second = short_dir / "second"
     second.mkdir()
@@ -663,6 +664,100 @@ def test_configured_journal_survives_a_restart_with_a_persisted_slot(short_dir):
             assert hold._attachment._spec.journal_bytes == journal
         finally:
             hold.release()
+
+
+def _claim_index(harness, index):
+    return harness.client.claim(
+        index,
+        [("pool0", 1024)],
+        _TEST_DIGEST,
+        _control_bind(index),
+        gaas=GaaSSettings("t", "l", 4 * PAGE, 2 * PAGE, 8 * PAGE),
+        receive_timeout_s=10,
+    )
+
+
+def test_a_restarted_supervisor_rebuilds_the_guards_of_its_slots_and_no_others(
+    short_dir,
+):
+    names = {0: "t/l/0", 2: "t/l/2"}
+    server, table = _serve(short_dir)
+    with server as harness, patch.object(guard_module._Guard, "_prepare_core"):
+        for index in names:
+            hold = _claim_index(harness, index)
+            os.pwrite(hold.region_fds[0], b"slot %d" % index, 0)
+            hold.release()
+        assert sorted(harness.server._server.registry._guards) == [0, 2]
+    # What each slot's live holder hands back: the original memfds.
+    held = {name: _handback(table.get(name), table) for name in names.values()}
+    restarted = SlotTable(table.broker, require_pod_identity=False)  # pools: fixture
+    assert sorted(restarted._slots) == sorted(names.values())
+    second = short_dir / "second"
+    second.mkdir()
+    with (
+        _running_server(second, slots=restarted) as harness,
+        patch.object(guard_module._Guard, "_prepare_core"),
+    ):
+        registry = harness.server._server.registry
+        # Exactly the persisted indices, each started, none holding a lease.
+        assert sorted(registry._guards) == [0, 2]
+        rebuilt = dict(registry._guards)
+        for guard in rebuilt.values():
+            assert guard._thread.is_alive() and guard._pool_lease.current is None
+        assert len(list((second / "pools").glob("kvcr-pool_*"))) == 2
+        for index, name in names.items():
+            slot = restarted.get(name)
+            assert slot.restored_pool  # fresh, empty memfds until the handback
+            supervisor_end, holder_end = socket.socketpair()
+            slot.holder_conn = supervisor_end
+            try:
+                holder.hello(holder_end, held[name])
+                restarted._adopt_handback(slot)  # the path a re-claim's feed takes
+            finally:
+                supervisor_end.close()
+                holder_end.close()
+                slot.holder_conn = None
+            assert not slot.restored_pool
+            assert [os.fstat(fd)[:3] for fd in slot.pool.pass_fd_list()] == [
+                os.fstat(fd)[:3] for fd in held[name]["fds"]
+            ]
+            # The worker's re-claim is served by the rebuilt Guard, on its memory.
+            hold = _claim_index(harness, index)
+            try:
+                assert hold.slot_name == name
+                assert registry._guards[index] is rebuilt[index]
+                assert rebuilt[index]._pool_lease.current is not None
+                assert os.pread(hold.region_fds[0], 6, 0) == b"slot %d" % index
+            finally:
+                hold.release()
+        assert sorted(registry._guards) == [0, 2]
+
+
+def test_a_guard_is_built_at_the_first_claim_of_its_index(short_dir):
+    server, table = _serve(short_dir)
+    with server as harness, patch.object(guard_module._Guard, "_prepare_core"):
+        registry = harness.server._server.registry
+        assert registry._guards == {}  # no Guard at startup
+        hold = _claim_index(harness, 3)
+        try:
+            assert hold.slot_name == "t/l/3" and list(registry._guards) == [3]
+            guard = registry._guards[3]
+            assert guard._pool_lease.current is not None
+        finally:
+            hold.release()
+        _claim_index(harness, 3).release()  # the same index again: the same Guard
+        assert registry._guards == {3: guard}
+        assert len(list((short_dir / "pools").glob("kvcr-pool_*"))) == 1
+
+
+def test_a_slot_service_is_healthy_with_no_guards(short_dir):
+    server, table = _serve(short_dir)
+    with server as harness:
+        service = harness.server
+        assert service._registry._guards == {}
+        _wait_until(lambda: service._server._last_progress is not None, timeout=5)
+        assert service._health_status(30) == (200, "ok")
+        assert service._registry.info()["ready"] is True
 
 
 def test_journal_bind_refusal_leaks_no_guard_or_pool(short_dir):

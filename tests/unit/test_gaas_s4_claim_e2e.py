@@ -5,9 +5,10 @@
 gaas S4 guard r7 (2026-11-08) failed every worker claim with
 ``KVCRServiceError: requested_bytes must hold at least one complete KV block of
 51380224 bytes``: the supervisor ran with ``--pool-sizes-gb 0.00001`` (one 8192 B
-page), and Guard.configure builds ``_PoolDescriptor(name, pool_sizes_bytes[i],
-block)`` whose geometry needs at least one whole block. This drives the same claim
-at that size (refused) and at ``0.0478515625`` GB = 51380224 B = one block (served).
+page), and Guard.configure built ``_PoolDescriptor(name, pool_sizes_bytes[i],
+block)`` whose geometry needs at least one whole block. A slot service no longer
+reads ``--guard-count`` or ``--pool-sizes-gb``: a Guard is built at its index's first
+claim and its pools are the claim's data pool, split by the claim's layouts.
 
 Harness (no cluster, no GPU):
 - Supervisor: the real ``_KVCRService`` that ``server.main`` builds, from
@@ -54,24 +55,8 @@ Client-side consumers of the stub pool size (``response.pools``):
   pool names for the mirror; the full descriptors (size_bytes included) are
   msgpack'd into the snapshot terms a Guard and its replacement must agree on.
 
-Two guard slots against the slot cap (gaas S4 guard r8, 2026-11-08): worker A
-(guard_index 0) was served effective_maximum 53,640,953,856 B (1044 blocks); worker
-B (guard_index 1, same tenant/lineage/total/minimum/maximum) was refused
-``capacity below minimum for <tenant>/<lineage>/1 (reason: capacity_below_minimum)``.
-SlotTable.claim_with_generation (node_service.py:1332-1338) grants
-``effective_grant(size, minimum, maximum, _available(tenant, name))`` (:147-153),
-and ``_available`` (:1220-1226) is cap_bytes + local_requests(tenant) (0: server.py
-_build_slots passes none) - headroom_bytes - the other slots' effective_maximum_bytes.
-headroom_bytes defaults to ``_HEADROOM_BYTES = 2 * _GIB`` (node_service.py:68).
-The meta memfd does NOT count: a slot's effective_maximum_bytes is the data grant
-(:1339, :1351); meta_bytes is charged only to the holder pod's memory (:459-461).
-r8: 68,719,476,736 - 2,147,483,648 - 53,640,953,856 = 12,931,039,232 B (12.04 GiB)
-< 53,640,953,856. Two S4 slots need cap >= 2,147,483,648 + 2 x 53,640,953,856 =
-109,429,391,360 B (101.92 GiB); GAAS_SLOT_CAP_BYTES 120,259,084,288 (112 GiB)
-leaves 10,829,692,928 B, which also covers the 2 x 209,723,392 B meta memfds if
-one wants node RAM for them inside the cap. Scaled here with T = 4 blocks:
-cap = headroom + 1.5 T refuses the second slot; headroom + 2 T + 2 meta + 64 MiB
-serves both.
+Two guard slots (gaas S4 guard r8, 2026-11-08, refused the second under the old
+slot cap): with no node cap each slot is granted its claimed maximum.
 """
 
 import copy
@@ -104,18 +89,15 @@ from kvcr.config import (
     KVCRGuardConfig,
     RemoteFWDramOptions,
 )
-from kvcr.runtime.control_channels import KVCRServiceError
 from kvcr.service import memmap, server
 from kvcr.service.memory import _compute_pool_geometry
-from kvcr.service.node_service import _HEADROOM_BYTES, meta_region_bytes
-from kvcr.service.protocol import CAPACITY_BELOW_MINIMUM, KVCRServiceReasonError
+from kvcr.service.node_service import meta_region_bytes
 from kvcr.service.recovery_journal import claim_guarded_pool
 
 BLOCK = 51380224  # r7 vLLM kv_bytes_per_chunk
 TOTAL = 4 * BLOCK  # 205,520,896
 JOURNAL = 100 << 20
 META = 209723392  # meta_region_bytes(JOURNAL): the slot's meta memfd
-R7_SLOT_CAP = 68719476736  # GAAS_SLOT_CAP_BYTES in r7/r8 (64 GiB)
 DIGEST = "db6b57b2823276ab9eb6a80c1ef5dfc8b295757bac26aa16e92205f8c2469dd7"
 HOLDER_IMAGE = (
     "nvcr.io/0980761089281446/kapila-dev@sha256:"
@@ -167,14 +149,11 @@ def tmp_path():  # the S4 socket root lives on /node-shm; here a fresh /dev/shm 
         yield Path(directory)
 
 
-def _supervisor_argv(root: Path, pool_sizes_gb: str, slot_cap: int) -> list[str]:
+def _supervisor_argv(root: Path) -> list[str]:
     return [
         "--socket-path", str(root / "service.sock"),
         "--pool-dir", str(root / "pools"),
-        "--guard-count", "2",
-        "--pool-sizes-gb", pool_sizes_gb,
         "--compatibility-digest", DIGEST,
-        "--slot-cap-bytes", str(slot_cap),
         "--holder-image", HOLDER_IMAGE,
         "--slot-root", str(root / "slots"),
         "--manager-id", "gaas-s4-claim-e2e",
@@ -186,14 +165,16 @@ def _supervisor_argv(root: Path, pool_sizes_gb: str, slot_cap: int) -> list[str]
     ]  # fmt: skip
 
 
-def _start_supervisor(root, pool_sizes_gb, monkeypatch, slot_cap=R7_SLOT_CAP):
+def _start_supervisor(root, monkeypatch):
     """server.main up to serve_forever, with the pod API and NIXL stood in."""
     (root / "pools").mkdir()
     (root / "slots").mkdir(mode=0o700)
-    args = server._parse_args(_supervisor_argv(root, pool_sizes_gb, slot_cap))
+    args = server._parse_args(_supervisor_argv(root))
     monkeypatch.setattr(memmap, "hugetlb_enabled", not args.disable_hugepages)
     api = _HolderProcessAPI()
     monkeypatch.setattr(server, "InClusterPodAPI", lambda namespace: api)
+    # NIXL registration; the host has none. Guards are built at first claim.
+    monkeypatch.setattr(server._Guard, "_prepare_core", Mock())
     service = server._KVCRService(
         args.socket_path,
         args.pool_dir,
@@ -204,8 +185,6 @@ def _start_supervisor(root, pool_sizes_gb, monkeypatch, slot_cap=R7_SLOT_CAP):
         slots=server._build_slots(args),
         advertise_host=args.advertise_host,
     )
-    for guard in service._server.registry._guards.values():
-        guard._prepare_core = Mock()  # NIXL registration; the host has none
     thread = threading.Thread(target=service.serve_forever)
     thread.start()
     return args, service, thread, api
@@ -237,20 +216,19 @@ def _claim_like_vllm(socket_path, guard_index=0, lineage="r7"):
     )
 
 
-def _pool_rank_files(pool_dir):
+def _pool_rank_files(pool_dir, count):
     """Each Guard rank's pool_{rank} file: (size, allocated bytes).
 
-    The guard-daemonset.yaml comment sizes the supervisor at guard-count x (pool
-    size + 100 MiB) of posix_fallocate'd /node-shm; with slots, pool_{rank} is a
-    sparse 2-page-journal + 1-page stub whatever --pool-sizes-gb says.
+    With slots, pool_{rank} is a sparse 2-page-journal + 1-page stub, one per
+    Guard built so far.
     """
     files = {
         p.name: (p.stat().st_size, p.stat().st_blocks * 512)
         for p in sorted(Path(pool_dir).iterdir())
         if "pool_" in p.name and p.is_file()
     }
-    assert len(files) == 2  # --guard-count 2
-    assert set(files.values()) == {(3 * mmap.PAGESIZE, 0)}
+    assert len(files) == count
+    assert set(files.values()) <= {(3 * mmap.PAGESIZE, 0)}
     return files
 
 
@@ -301,111 +279,45 @@ def _assert_slot_mapped(service, hold, slot_name):
     return base, size, vmas, spec, meta_fd
 
 
-def test_one_page_stub_pool_refuses_the_vllm_claim(tmp_path, monkeypatch):
-    """r7: --pool-sizes-gb 0.00001 is 8192 B, less than one 51380224 B block."""
-    args, service, thread, api = _start_supervisor(tmp_path, "0.00001", monkeypatch)
+def test_the_vllm_claim_is_served_with_no_pool_sizes(tmp_path, monkeypatch):
+    """r7's claim: the grant's pool is the claim's data pool, four whole blocks."""
+    args, service, thread, api = _start_supervisor(tmp_path, monkeypatch)
     try:
-        assert args.pool_sizes_bytes == (8192,)
-        print("S4 r7 supervisor pool_rank files:", _pool_rank_files(args.pool_dir))
-        with pytest.raises(KVCRServiceError) as refused:
-            _claim_like_vllm(args.socket_path)
-        print("S4 r7 claim refused:", type(refused.value).__name__, refused.value)
-        assert (
-            "requested_bytes must hold at least one complete KV block of 51380224"
-            in str(refused.value)
-        )
-    finally:
-        _stop_supervisor(service, thread, api)
-
-
-def test_one_block_stub_pool_serves_the_vllm_claim(tmp_path, monkeypatch):
-    """0.0478515625 GB = 51380224 B: one block per rank, and the v2 claim is served."""
-    args, service, thread, api = _start_supervisor(
-        tmp_path, "0.0478515625", monkeypatch
-    )
-    try:
-        assert args.pool_sizes_bytes == (BLOCK,)
-        files = _pool_rank_files(args.pool_dir)
-        print("one-block supervisor pool_rank files (size, allocated):", files)
+        assert (args.guard_count, args.pool_sizes_bytes) == (None, None)
+        assert _pool_rank_files(args.pool_dir, 0) == {}  # no Guard before a claim
         claimed = _claim_like_vllm(args.socket_path)
         hold = claimed.hold
         try:
-            # The v1 stub descriptor in the grant now holds exactly one block.
-            ((stub,),) = (hold._pools,)
-            assert (stub.name, stub.size_bytes, stub.block_size_bytes) == (
+            ((pool,),) = (hold._pools,)
+            assert (pool.name, pool.size_bytes, pool.block_size_bytes) == (
                 "",
-                BLOCK,
+                TOTAL,
                 BLOCK,
             )
-            assert _compute_pool_geometry(stub.size_bytes, stub.block_size_bytes) == (
-                BLOCK,
-                1,
-            )
+            assert _compute_pool_geometry(pool.size_bytes, BLOCK) == (TOTAL, 4)
             base, size, vmas, spec, meta_fd = _assert_slot_mapped(
                 service, hold, "s4/r7/0"
             )
             print(
-                "one-block claim served:",
+                "claim served:",
                 f"slot={hold.slot_name} regions={len(hold.regions)}",
                 f"base={base:#x} bytes={size} vmas={len(vmas)}",
                 f"meta inode={spec.inode} meta bytes={os.fstat(meta_fd).st_size}",
-                f"stub block_count={_compute_pool_geometry(BLOCK, BLOCK)[1]}",
             )
         finally:
             hold.release(activated=False)
-        # The supervisor's pool_{rank} files are unchanged by the claim.
-        assert _pool_rank_files(args.pool_dir) == files
+        # One sparse stub, for the one Guard the claim built.
+        _pool_rank_files(args.pool_dir, 1)
     finally:
         _stop_supervisor(service, thread, api)
 
 
-def test_second_guard_slot_below_the_slot_cap_is_refused(tmp_path, monkeypatch):
-    """r8: cap = headroom + 1.5 T serves guard 0 and leaves 0.5 T < T for guard 1."""
-    cap = _HEADROOM_BYTES + TOTAL + TOTAL // 2
-    args, service, thread, api = _start_supervisor(
-        tmp_path, "0.0478515625", monkeypatch, cap
-    )
-    try:
-        table = service._server.slots
-        assert (table.cap_bytes, table.headroom_bytes) == (cap, 2 << 30)
-        first = _claim_like_vllm(args.socket_path, guard_index=0, lineage="r8")
-        try:
-            assert first.hold.slot_name == "s4/r8/0"
-            assert table.get("s4/r8/0").effective_maximum_bytes == TOTAL
-            available = table._available("s4", "s4/r8/1")
-            assert available == cap - _HEADROOM_BYTES - TOTAL == TOTAL // 2 < TOTAL
-            with pytest.raises(KVCRServiceReasonError) as refused:
-                _claim_like_vllm(args.socket_path, guard_index=1, lineage="r8")
-            print(
-                "S4 r8 second slot refused:",
-                type(refused.value).__name__,
-                refused.value,
-                f"cap={cap} headroom={table.headroom_bytes}",
-                f"slot0 effective_maximum={TOTAL} available={available}",
-            )
-            assert refused.value.reason == CAPACITY_BELOW_MINIMUM
-            assert refused.value.message == "capacity below minimum for s4/r8/1"
-            assert str(refused.value) == (
-                "capacity below minimum for s4/r8/1 (reason: capacity_below_minimum)"
-            )
-            assert table.get("s4/r8/1") is None
-            assert len(api.processes) == 1  # no holder for the refused slot
-        finally:
-            first.hold.release(activated=False)
-    finally:
-        _stop_supervisor(service, thread, api)
-
-
-def test_two_guard_slots_within_a_sized_slot_cap_are_served(tmp_path, monkeypatch):
-    """cap = headroom + 2 T + 2 meta + 64 MiB: both slots served, each its own pool."""
+def test_two_guard_slots_are_served(tmp_path, monkeypatch):
+    """r8's two slots: both served at their claimed size, each its own pool."""
     assert meta_region_bytes(JOURNAL) == META
-    cap = _HEADROOM_BYTES + 2 * TOTAL + 2 * META + (64 << 20)
-    args, service, thread, api = _start_supervisor(
-        tmp_path, "0.0478515625", monkeypatch, cap
-    )
+    args, service, thread, api = _start_supervisor(tmp_path, monkeypatch)
     try:
         table = service._server.slots
-        assert (table.cap_bytes, table.headroom_bytes) == (cap, 2 << 30)
         holds = []
         try:
             for index in (0, 1):
@@ -431,13 +343,12 @@ def test_two_guard_slots_within_a_sized_slot_cap_are_served(tmp_path, monkeypatc
             assert all(os.fstat(m[4]).st_size == META for m in mapped)
             (b0, s0, *_), (b1, s1, *_) = mapped
             assert b0 + s0 <= b1 or b1 + s1 <= b0
-            # The slot cap holds both grants (meta is not charged against it).
             granted = sum(s.effective_maximum_bytes for s in slots)
-            assert granted == 2 * TOTAL <= cap - table.headroom_bytes
+            assert granted == 2 * TOTAL
+            assert sorted(service._server.registry._guards) == [0, 1]
             print(
                 "two-slot claims served:",
-                f"cap={cap} headroom={table.headroom_bytes} granted={granted}",
-                f"left={cap - table.headroom_bytes - granted}",
+                f"granted={granted}",
                 f"bases={b0:#x},{b1:#x} data inodes={sorted(data_inodes)}",
                 f"meta inodes={sorted(meta_inodes)} meta bytes={META}",
                 f"touched={[s.touched_bytes for s in slots]}",

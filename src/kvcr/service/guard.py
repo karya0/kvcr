@@ -1067,6 +1067,8 @@ class _Guard:
             if previous and previous[3] == data_pool[3] and previous[6] != key_size:
                 raise ValueError(f"key size {key_size} does not match")
             ranges = pool_ranges(size, layouts, key_size)
+            # The claim's pools as the client splits them, for configure.
+            self._recovery._pool_sizes_bytes = tuple(r[3] for r in ranges)
             return pool_headers(
                 address, ranges, layouts, key_size, initialize=initialize
             )

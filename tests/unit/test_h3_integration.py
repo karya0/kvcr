@@ -63,7 +63,7 @@ def test_q14_reattached_guard_serves_pre_restart_key_over_real_nixl(
         startup_timeout_seconds=_REAL_NIXL_TIMEOUT_SECONDS,
         v2_slots=True,
     )
-    guard = registry._guards[0]
+    guard = registry.claimed_guard(0)  # what a restart builds for slot index 0
     attachment = KVCRPoolAttachment.attach_meta_fd(os.dup(pool.meta_fd), guard._spec)
     RecoveryJournal(attachment).reset()  # first writer initialization, before restart
     slot_name, generation = "tenant/lineage/0", 7

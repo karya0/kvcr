@@ -552,48 +552,21 @@ def test_terminating_holder_cannot_be_reattached(tmp_path):
     assert not api.deletes
 
 
-def test_capacity_and_count_budget(tmp_path):
+def test_four_small_holders_have_no_count_limit(tmp_path):
     api = FakeAPI()
     broker = make_broker(tmp_path, api)
-    large_claim = {**_CLAIM, "size_gb": 255.5}
-    broker.ensure(large_claim)
-    with pytest.raises(ValueError, match="budget"):
-        broker.ensure({**_CLAIM, "pool_id": "pool-b", "size_gb": 195})
-    broker.ensure({**_CLAIM, "pool_id": "pool-b", "size_gb": 0.5})
-    broker.ensure({**_CLAIM, "pool_id": "pool-c", "size_gb": 0.5})
-    with pytest.raises(ValueError, match="budget"):
-        broker.ensure({**_CLAIM, "pool_id": "pool-d", "size_gb": 0.5})
-    broker.release(large_claim)
-    broker.ensure({**large_claim, "pool_id": "pool-d"})
+    for name in "abcd":
+        broker.ensure({**_CLAIM, "pool_id": f"pool-{name}", "size_gb": 0.5})
+    assert len(api.creates) == 4
 
 
-def test_holder_count_limit_independent_of_capacity(tmp_path):
+def test_holders_above_450_gib_in_total_are_not_refused(tmp_path):
+    # Fake pod API: nothing is allocated, only the pods are recorded.
     api = FakeAPI()
     broker = make_broker(tmp_path, api)
-    broker.ensure({**_CLAIM, "size_gb": 0.5})
-    broker.ensure({**_CLAIM, "pool_id": "pool-b", "size_gb": 0.5})
-    broker.ensure({**_CLAIM, "pool_id": "pool-c", "size_gb": 0.5})
-    with pytest.raises(ValueError, match="budget"):
-        broker.ensure({**_CLAIM, "pool_id": "pool-d", "size_gb": 0.5})
-    assert len(api.creates) == 3
-
-
-def test_three_slot_cap_sized_holders_fit_the_budget(tmp_path):
-    # The H7 run: three workers, each 161025622016 B, under a 485378490368 B
-    # slot cap (enforced by SlotTable; the broker sees only its holders).
-    claim_bytes, slot_cap_bytes = 161025622016, 485378490368
-    assert 3 * claim_bytes <= slot_cap_bytes - broker_module._HEADROOM_BYTES
-    size_gb = claim_bytes / (1 << 30)  # 153566 MiB, exact in binary
-    api = FakeAPI()
-    broker = make_broker(tmp_path, api)
-    claims = [{**_CLAIM, "pool_id": f"pool-{n}", "size_gb": size_gb} for n in "abcd"]
-    for claim in claims[:3]:
-        broker.ensure(claim)
-    assert len(api.creates) == 3
-    with pytest.raises(ValueError) as rejected:
-        broker.ensure(claims[3])
-    assert str(rejected.value) == "H7 holder count or capacity budget exceeded"
-    assert len(api.creates) == 3
+    for name, size_gb in (("a", 300), ("b", 300)):
+        broker.ensure({**_CLAIM, "pool_id": f"pool-{name}", "size_gb": size_gb})
+    assert len(api.creates) == 2
 
 
 def test_client_server_roundtrip(tmp_path):
@@ -681,7 +654,6 @@ def test_invalid_claim(claim):
         -1,
         0.499,
         12.001,
-        256 + 1 / 1024,
         0.5001,
         "1.00000000000000000000000000001",
         "NaN",
@@ -701,7 +673,9 @@ def test_claim_size_rejects_invalid_capacity(size):
         PoolClaim.parse({**_CLAIM, "size_gb": size})
 
 
-@pytest.mark.parametrize("size", ["0.5", "1", "12", "150", "150.0009765625", "256"])
+@pytest.mark.parametrize(
+    "size", ["0.5", "1", "12", "150", "150.0009765625", "256", "256.0009765625"]
+)
 def test_numeric_string_claim_size_remains_supported(size):
     claim = PoolClaim.parse({**_CLAIM, "size_gb": size})
     assert claim.as_dict()["size_gb"] == float(size)

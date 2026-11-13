@@ -114,10 +114,10 @@ class PoolClaim:
             raise ValueError("invalid size_gb") from error
         if (
             not size.is_finite()
-            or not Decimal("0.5") <= size <= 256
+            or size < Decimal("0.5")
             or size != Decimal(int(size * 1024)) / 1024
         ):
-            raise ValueError("holder size must be 0.5 to 256 GiB in whole MiB")
+            raise ValueError("holder size must be at least 0.5 GiB in whole MiB")
         return cls(name, size.normalize(), digest)
 
     def as_dict(self) -> dict[str, Any]:
@@ -142,15 +142,6 @@ class PoolClaim:
             "backing_limit_bytes": 2 * mapping,
             "memory_request_bytes": 2 * mapping + _HEADROOM_BYTES,
         }
-
-
-def effective_grant(
-    total: int, minimum: int, maximum: int | None, available: int
-) -> int | None:
-    """Bytes to grant a claim, or None when less than its minimum is available."""
-    if available < minimum:
-        return None
-    return min(maximum or total, available)
 
 
 def _matching_tolerations(actual: Any, intended: list[dict[str, Any]]) -> bool:
@@ -660,7 +651,7 @@ class NodeBroker:
             raise ValueError("holder UID changed; refusing replacement")
         return uid
 
-    def _check_budget(self, claim: PoolClaim) -> None:
+    def _check_holders(self) -> None:
         states = [_read_json(path) for path in self.state_dir.glob("*.json")]
         pods = {pod["metadata"]["name"]: pod for pod in self.api.list(self.manager)}
         known = {state["pod_name"] for state in states}
@@ -668,7 +659,6 @@ class NodeBroker:
             raise RuntimeError(
                 "unreconciled holder exists; retain it and refuse allocation"
             )
-        counted = []
         for state in states:
             pod = pods.get(state["pod_name"])
             if pod is not None and state.get("holder_uid") not in (
@@ -678,19 +668,6 @@ class NodeBroker:
                 raise RuntimeError(
                     "a holder was replaced under the same name; refusing allocation"
                 )
-            # A deleted-phase holder still in the API is terminating and keeps
-            # its memory: it counts until the pod is gone.
-            if state["phase"] != "deleted" or pod is not None:
-                counted.append(state)
-        # Three holders of 161025622016 B (3 workers, 485378490368 B slot cap)
-        # must fit; the slot cap itself is enforced by SlotTable._available.
-        if (
-            len(counted) >= 3
-            or sum(PoolClaim.parse(s["claim"]).data_bytes for s in counted)
-            + claim.data_bytes
-            > 450 * _GIB
-        ):
-            raise ValueError("H7 holder count or capacity budget exceeded")
 
     def ensure(self, value: dict[str, Any], timeout_s: float = 180) -> dict[str, Any]:
         claim = PoolClaim.parse(value)
@@ -701,7 +678,7 @@ class NodeBroker:
         with self._lock:
             state = self._load(claim)
             if state is None:
-                self._check_budget(claim)
+                self._check_holders()
                 directory = self.root / f"p-{self._key(claim)}"
                 directory.mkdir(mode=0o700, exist_ok=True)
                 if directory.is_symlink():
@@ -1004,7 +981,7 @@ class _Slot:
 
 
 class SlotTable:
-    """v2 slots keyed ``tenant/lineage/guard_index``: capacity, queueing, holder upkeep.
+    """v2 slots keyed ``tenant/lineage/guard_index``: queueing, holder upkeep.
 
     A slot outlives its worker: death frees the claim (``owner_alive`` turns
     false) but keeps the region pool and holder so a successor reuses them.
@@ -1021,9 +998,6 @@ class SlotTable:
     def __init__(
         self,
         broker: NodeBroker,
-        cap_bytes: int,
-        local_requests: Callable[[str], int] = lambda tenant: 0,
-        headroom_bytes: int = _HEADROOM_BYTES,
         ensure_timeout_s: float = READINESS_WAIT_S,
         *,
         require_pod_identity: bool = True,
@@ -1039,9 +1013,8 @@ class SlotTable:
         if meta_bytes is None:
             meta_bytes = meta_region_bytes(journal_bytes)
         self.meta_bytes = meta_bytes
-        self.broker, self.cap_bytes = broker, cap_bytes
+        self.broker = broker
         broker.meta_bytes = meta_bytes
-        self.local_requests, self.headroom_bytes = local_requests, headroom_bytes
         self.ensure_timeout_s = ensure_timeout_s
         self.require_pod_identity = require_pod_identity
         if lease_ttl_ms < 1000:
@@ -1290,14 +1263,6 @@ class SlotTable:
                 keep.append(waiter)
         queue[:] = keep
 
-    def _available(self, tenant: str, name: str) -> int:
-        others = sum(
-            s.effective_maximum_bytes for n, s in self._slots.items() if n != name
-        )
-        return (
-            self.cap_bytes + self.local_requests(tenant) - self.headroom_bytes - others
-        )
-
     def _new_holder(self, name: str, effective: int, digest: str) -> dict[str, Any]:
         # A fresh pool_id per holder: the broker keeps a deleted claim terminal.
         with self._lock:
@@ -1429,13 +1394,7 @@ class SlotTable:
                 size = total or maximum or minimum
                 if not size:
                     raise SlotError(INTERNAL, "claim carries no size")
-                effective = effective_grant(
-                    size, minimum or size, maximum, self._available(tenant, name)
-                )
-                if effective is None:
-                    raise SlotError(
-                        CAPACITY_BELOW_MINIMUM, f"capacity below minimum for {name}"
-                    )
+                effective = maximum or size  # as claimed: no node cap
                 pool = RegionPool.create(effective, meta_bytes=self.meta_bytes)
                 try:
                     pool.grow(min(size, effective))
@@ -1451,8 +1410,8 @@ class SlotTable:
                     effective,
                     self._new_holder(name, effective, digest),
                 )
-                # Reserved now: capacity is counted and the slot reads as held
-                # while the holder comes up outside this lock.
+                # Reserved now: the slot reads as held while the holder comes
+                # up outside this lock.
                 slot.committed = self._layout(slot)
                 self._slots[name] = slot
                 created = True

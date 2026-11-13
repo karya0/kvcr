@@ -13,7 +13,6 @@ if sys.platform != "linux":
 
 from test_node_service_v2 import (
     DIGEST,
-    HEADROOM,
     ME,
     PAGE,
     _table,
@@ -53,10 +52,7 @@ def _restart(tmp_path, pools, monkeypatch, *, ttl=10000, peer=ME):
     original, generation = _claim(table, claim_id, peer=peer)
     now = [0.0]
     restarted = SlotTable(
-        table.broker,
-        HEADROOM + 64 * PAGE,
-        require_pod_identity=False,
-        clock=lambda: now[0],
+        table.broker, require_pod_identity=False, clock=lambda: now[0]
     )
     slot = restarted.get(original.name)
     pools.append(slot.pool)
@@ -126,9 +122,7 @@ def test_q8_q13_fallback_id_is_not_persisted(tmp_path, pools, monkeypatch):
     slot, _ = _claim(table, "127.0.0.1:5555")
     saved = json.loads((tmp_path / "slot-table.json").read_text())
     assert saved["slots"][slot.name]["claim_id"] is None
-    restarted = SlotTable(
-        table.broker, HEADROOM + 64 * PAGE, require_pod_identity=False
-    )
+    restarted = SlotTable(table.broker, require_pod_identity=False)
     restored = restarted.get(slot.name)
     pools.append(restored.pool)
     assert not restored.held

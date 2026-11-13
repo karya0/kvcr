@@ -20,7 +20,7 @@ if sys.platform != "linux":
     pytest.skip("memfd and SCM_RIGHTS regions are Linux-only", allow_module_level=True)
 
 from test_node_service import FakeAPI, make_broker
-from test_node_service_v2 import DIGEST, HEADROOM, PAGE, _claim
+from test_node_service_v2 import DIGEST, PAGE, _claim
 
 from kvcr.service import holder, protocol
 from kvcr.service.memory import KVCRPoolSpec, _pool_filename
@@ -298,9 +298,7 @@ def test_slot_claim_feeds_toucher(tmp_path):
     api = _ToucherAPI()
     broker = make_broker(tmp_path, api)
     broker.toucher = True
-    table = SlotTable(
-        broker, HEADROOM + 64 * PAGE, ensure_timeout_s=10, require_pod_identity=False
-    )
+    table = SlotTable(broker, ensure_timeout_s=10, require_pod_identity=False)
     reports = []
 
     def run_holder():
@@ -338,7 +336,6 @@ def test_slow_holder_wait_is_size_aware(tmp_path, monkeypatch):
     broker.toucher = True
     table = SlotTable(
         broker,
-        HEADROOM + 64 * PAGE,
         ensure_timeout_s=1,
         require_pod_identity=False,
         meta_bytes=0,  # the wait covers the meta memfd too; this pins the data part
@@ -428,9 +425,7 @@ def _claim_as(table, peer, claim_id="a", alive=lambda: True):
 
 
 def test_resize_identity_by_pod_uid(tmp_path):
-    table = SlotTable(
-        make_broker(tmp_path), HEADROOM + 64 * PAGE, require_pod_identity=False
-    )
+    table = SlotTable(make_broker(tmp_path), require_pod_identity=False)
     owner = (100, 1000, "pod-a")
     try:
         _claim_as(table, owner)
@@ -449,9 +444,7 @@ def test_resize_identity_by_pod_uid(tmp_path):
 
 
 def test_successor_pod_claims_free_slot_not_held_slot(tmp_path):
-    table = SlotTable(
-        make_broker(tmp_path), HEADROOM + 64 * PAGE, require_pod_identity=False
-    )
+    table = SlotTable(make_broker(tmp_path), require_pod_identity=False)
     alive = [True]
     try:
         _claim_as(table, (100, 1000, "pod-a"), alive=lambda: alive[0])

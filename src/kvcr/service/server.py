@@ -96,15 +96,15 @@ _GB = 1 << 30
 class _PoolRegistry:
     """A directory of pool groups, each owned by one Guard thread.
 
-    No locks: each Guard's mailbox orders its claims, releases and deaths;
-    Guards share nothing but the refusal flag.
+    Each Guard's mailbox orders its claims, releases and deaths; Guards share
+    nothing but the refusal flag. Only adding a v2 Guard takes the drain lock.
     """
 
     def __init__(
         self,
         pool_dir: str | os.PathLike[str],
-        guard_count: int,
-        pool_sizes_bytes: tuple[int, ...],
+        guard_count: int | None,
+        pool_sizes_bytes: tuple[int, ...] | None,
         journal_bytes: int,
         compatibility_digest: str,
         heartbeat_timeout_seconds: float | None = None,
@@ -114,7 +114,12 @@ class _PoolRegistry:
         self._pool_dir = Path(pool_dir).resolve()
         if not self._pool_dir.is_dir():
             raise ValueError(f"KVCR pool directory does not exist: {self._pool_dir}")
-        self._guard_count = guard_count
+        self._guard_count = None if v2_slots else guard_count  # v1 only
+        self._pool_sizes_bytes = pool_sizes_bytes
+        self._journal_bytes = journal_bytes
+        self._heartbeat_timeout_seconds = heartbeat_timeout_seconds
+        self._startup_timeout_seconds = startup_timeout_seconds
+        self._v2_slots = v2_slots
         self._compatibility_digest = compatibility_digest
         self._guards: dict[int, _Guard] = {}
         self._refusing = threading.Event()
@@ -127,62 +132,82 @@ class _PoolRegistry:
             logger.critical, "Uncontained KVCR pool failure: %s"
         )
         self._purge_orphaned_pools()
-        mapping_bytes = journal_bytes + sum(pool_sizes_bytes)
-        for rank in range(guard_count):
+        # v1 builds every group now; a v2 Guard is built at its first claim.
+        for rank in range(0 if v2_slots else guard_count):
             try:
-                # v2 journals and snapshots in the slot's holder-charged meta memfd
-                # and serves the slot's regions, so pool_{rank} is a sparse stub the
-                # supervisor is not charged for. The grant still describes the full
-                # layout (journal_bytes sizes the meta journal); only the file is small.
-                owner = _KVCRPoolOwner.allocate(
-                    pool_id=f"pool_{rank}",
-                    pool_size_bytes=(
-                        _V2_STUB_JOURNAL_BYTES + mmap.PAGESIZE
-                        if v2_slots
-                        else mapping_bytes
-                    ),
-                    journal_bytes=(
-                        _V2_STUB_JOURNAL_BYTES if v2_slots else journal_bytes
-                    ),
-                    pool_dir=self._pool_dir,
-                    populate=not v2_slots,
-                )
-                grant_spec = (
-                    msgspec.structs.replace(
-                        owner.spec,
-                        mapping_bytes=mapping_bytes,
-                        journal_bytes=journal_bytes,
-                    )
-                    if v2_slots
-                    else owner.spec
-                )
-                # Built with the group, not a claim: a Guard that cannot attach its
-                # allocation is better discovered at startup than when a worker dies.
-                try:
-                    guard = _Guard(
-                        grant_spec,
-                        functools.partial(self._guard_failed, rank),
-                        pool_spec=owner.spec,
-                        compatibility_digest=compatibility_digest,
-                        guard_index=rank,
-                        pool_sizes_bytes=pool_sizes_bytes,
-                        owner=owner,
-                        refusing=self._refusing.is_set,
-                        heartbeat_timeout_seconds=heartbeat_timeout_seconds,
-                        startup_timeout_seconds=startup_timeout_seconds,
-                    )
-                except BaseException:
-                    # Nothing has recorded this pool group yet, so the sweep
-                    # below cannot reach it and its file would outlive the process.
-                    owner.close()
-                    raise
-                # Recorded before it starts, so a failed preparation is rolled back by
-                # the sweep below.
-                self._guards[rank] = guard
-                guard.start()
+                self._add_guard(rank)
             except BaseException:
                 self._release_pools()
                 raise
+
+    def _add_guard(self, rank: int) -> None:
+        """Allocate pool_{rank} and start its Guard."""
+        v2_slots, journal_bytes = self._v2_slots, self._journal_bytes
+        # v2 journals and snapshots in the slot's holder-charged meta memfd
+        # and serves the slot's regions, so pool_{rank} is a sparse stub the
+        # supervisor is not charged for. The grant describes the journal
+        # (journal_bytes sizes the meta journal); each claim sizes its pools.
+        owner = _KVCRPoolOwner.allocate(
+            pool_id=f"pool_{rank}",
+            pool_size_bytes=(
+                _V2_STUB_JOURNAL_BYTES + mmap.PAGESIZE
+                if v2_slots
+                else journal_bytes + sum(self._pool_sizes_bytes)
+            ),
+            journal_bytes=_V2_STUB_JOURNAL_BYTES if v2_slots else journal_bytes,
+            pool_dir=self._pool_dir,
+            populate=not v2_slots,
+        )
+        grant_spec = (
+            msgspec.structs.replace(
+                owner.spec,
+                mapping_bytes=journal_bytes + mmap.PAGESIZE,
+                journal_bytes=journal_bytes,
+            )
+            if v2_slots
+            else owner.spec
+        )
+        try:
+            guard = _Guard(
+                grant_spec,
+                functools.partial(self._guard_failed, rank),
+                pool_spec=owner.spec,
+                compatibility_digest=self._compatibility_digest,
+                guard_index=rank,
+                pool_sizes_bytes=() if v2_slots else self._pool_sizes_bytes,
+                owner=owner,
+                refusing=self._refusing.is_set,
+                heartbeat_timeout_seconds=self._heartbeat_timeout_seconds,
+                startup_timeout_seconds=self._startup_timeout_seconds,
+            )
+        except BaseException:
+            # Nothing has recorded this pool group yet, so no sweep can reach
+            # it and its file would outlive the process.
+            owner.close()
+            raise
+        # Recorded before it starts, so a failed preparation is rolled back by
+        # the caller's sweep.
+        self._guards[rank] = guard
+        guard.start()
+
+    def claimed_guard(self, guard_index: int) -> _Guard:
+        """v2: the Guard the claim names, built at its first claim.
+
+        Under the drain lock with the refusal re-checked, so drain and close
+        see every Guard built before them.
+        """
+        with self._drain_lock:
+            if self._refusing.is_set():
+                raise KVCRServiceError("KVCR pool registry is closed")
+            if guard_index not in self._guards:
+                try:
+                    self._add_guard(guard_index)
+                except BaseException:
+                    failed = self._guards.pop(guard_index, None)
+                    if failed is not None:
+                        failed.close()
+                    raise
+            return self._guards[guard_index]
 
     def _release_pools(self) -> None:
         """Give back every pool group built so far after a failed startup."""
@@ -241,7 +266,7 @@ class _PoolRegistry:
                     logger.info("Leaving KVCR pool still in use: %s", path)
 
     def _guard(self, guard_index: int) -> _Guard:
-        if not (0 <= guard_index < self._guard_count):
+        if not self._v2_slots and not (0 <= guard_index < self._guard_count):
             raise KVCRServiceError(
                 f"guard_index {guard_index} is out of range [0, {self._guard_count})"
             )
@@ -303,7 +328,7 @@ class _PoolRegistry:
     def info(self) -> dict[str, Any]:
         healthy = all(
             guard._failure is None and guard._thread.is_alive()
-            for guard in self._guards.values()
+            for guard in list(self._guards.values())  # a claim may add one
         )
         return {
             "version": _PROTOCOL_VERSION,
@@ -818,7 +843,11 @@ class _ThreadingUnixServer(
             raise SlotError(NOT_IMPLEMENTED, "this service takes v2 claims only")
         try:
             # Retain the Guard across a concurrent close; claim validates the request.
-            guard = self.registry._guards.get(request.guard_index)
+            guard = (
+                self.registry._guards.get(request.guard_index)
+                if slot is None
+                else self.registry.claimed_guard(request.guard_index)
+            )
             if slot is not None and slots.dead_incarnations:
                 guard.fence_incarnations(slots.dead_incarnations)
             reattached = slot is not None and slot.reconnecting
@@ -930,8 +959,8 @@ class _KVCRService:
         self,
         socket_path: str | os.PathLike[str],
         pool_dir: str | os.PathLike[str],
-        guard_count: int,
-        pool_sizes_bytes: tuple[int, ...],
+        guard_count: int | None,
+        pool_sizes_bytes: tuple[int, ...] | None,
         compatibility_digest: str,
         journal_bytes: int = _DEFAULT_JOURNAL_BYTES,
         heartbeat_timeout_seconds: float | None = None,
@@ -968,6 +997,11 @@ class _KVCRService:
             v2_slots=slots is not None,
         )
         try:
+            # After a supervisor restart: a Guard for each index the slot table
+            # kept (the name's last part). The holders hand their memfds back
+            # when each worker claims again.
+            for name in list(slots._slots) if slots is not None else ():
+                self._registry.claimed_guard(int(name.rsplit("/", 1)[1]))
             self._server = _ThreadingUnixServer(
                 self.socket_path,
                 self._registry,
@@ -1008,7 +1042,7 @@ class _KVCRService:
         if self._registry._refusing.is_set():
             return 503, "service stopping"
         guards = list(self._registry._guards.values())
-        if len(guards) != self._registry._guard_count:
+        if not self._registry._v2_slots and len(guards) != self._registry._guard_count:
             return 503, "guards unavailable"
         for guard in guards:
             if guard._failure is not None or not guard._thread.is_alive():
@@ -1133,12 +1167,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket-path", required=True)
     parser.add_argument("--pool-dir", required=True)
-    parser.add_argument("--guard-count", type=int, required=True)
+    # v1 only; a v2 (slot) service does not read them.
+    parser.add_argument("--guard-count", type=int)
     parser.add_argument(
-        "--pool-sizes-gb",
-        type=_parse_pool_sizes_gb,
-        dest="pool_sizes_bytes",
-        required=True,
+        "--pool-sizes-gb", type=_parse_pool_sizes_gb, dest="pool_sizes_bytes"
     )
     parser.add_argument("--compatibility-digest", required=True)
     parser.add_argument("--health-host", default="127.0.0.1")
@@ -1168,11 +1200,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="never place pools on hugetlbfs",
     )
     parser.add_argument(
-        "--slot-cap-bytes",
-        type=int,
-        help="enable the v2 slot server with this node capacity (bytes)",
+        "--holder-image", help="digest-pinned holder image; enables the v2 slot server"
     )
-    parser.add_argument("--holder-image", help="digest-pinned holder image")
     parser.add_argument("--namespace", default=os.environ.get("POD_NAMESPACE"))
     parser.add_argument("--node-name", default=os.environ.get("NODE_NAME"))
     parser.add_argument(
@@ -1208,8 +1237,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--advertise-host must be a bare reachable host name or address "
             "(no port, URL, whitespace or wildcard)"
         )
-    if args.guard_count < 1:
-        parser.error("--guard-count must be at least 1")
     if args.health_port is not None and not 1 <= args.health_port <= 65535:
         parser.error("--health-port must be between 1 and 65535")
     if not 1 < args.health_timeout_seconds < float("inf"):
@@ -1238,11 +1265,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--heartbeat-timeout-ms must be at least 1000 and finite")
     if args.startup_timeout_seconds is not None and args.startup_timeout_seconds <= 0:
         parser.error("--startup-timeout-seconds must be positive")
-    if args.slot_cap_bytes is not None:
-        if args.slot_cap_bytes <= 0:
-            parser.error("--slot-cap-bytes must be positive")
-        if not (args.holder_image and args.namespace and args.node_name):
-            parser.error("slots require --holder-image, --namespace and --node-name")
+    if args.holder_image is None:  # v1
+        if args.guard_count is None or args.pool_sizes_bytes is None:
+            parser.error("v1 requires --guard-count and --pool-sizes-gb")
+        if args.guard_count < 1:
+            parser.error("--guard-count must be at least 1")
+    else:  # v2 slots
+        if not (args.namespace and args.node_name):
+            parser.error("slots require --namespace and --node-name")
         if args.require_pod_identity and not _host_proc_visible():
             parser.error(
                 "pod identity needs hostPID (/proc/1/cgroup is not the host's); "
@@ -1262,7 +1292,7 @@ def _host_proc_visible() -> bool:
 
 
 def _build_slots(args: argparse.Namespace) -> SlotTable | None:
-    if args.slot_cap_bytes is None:
+    if args.holder_image is None:
         return None
     broker = NodeBroker(
         namespace=args.namespace,
@@ -1275,7 +1305,6 @@ def _build_slots(args: argparse.Namespace) -> SlotTable | None:
     )
     return SlotTable(
         broker,
-        args.slot_cap_bytes,
         require_pod_identity=args.require_pod_identity,
         journal_bytes=_DEFAULT_JOURNAL_BYTES,
         lease_ttl_ms=args.worker_lease_ttl_ms,
@@ -1330,7 +1359,7 @@ def main() -> None:
                 )
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                 logger.info(
-                    "KVCR service ready: socket=%s guards=%d pool_sizes_bytes=%s "
+                    "KVCR service ready: socket=%s guards=%s pool_sizes_bytes=%s "
                     "journal_bytes=%d advertise_host=%s",
                     args.socket_path,
                     args.guard_count,

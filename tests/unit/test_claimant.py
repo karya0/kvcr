@@ -24,7 +24,7 @@ from test_kvcr_service import (  # noqa: F401 - _channels_are_taken is an autous
     _running_server,
 )
 from test_node_service import _SPECS, make_broker
-from test_node_service_v2 import HEADROOM, pools  # noqa: F401 - fixture
+from test_node_service_v2 import pools  # noqa: F401 - fixture
 
 from kvcr.config import (
     GaaSSettings,
@@ -81,24 +81,21 @@ def _run(harness, capsys, *flags, pages=(4, 2, 8)):
     return code, {step["step"]: step for step in steps}
 
 
-def _serve(tmp_path, pages=64, journal_bytes=None, server_args=(), **slot_table_args):
+def _serve(tmp_path, journal_bytes=None, **slot_table_args):
     info = {
         "state": "ready",
         "pool_specs": _SPECS,
         "compatibility_digest": _TEST_DIGEST,
     }
     broker = make_broker(tmp_path, info=lambda _: info, drain=lambda _: info)
-    table = SlotTable(
-        broker, HEADROOM + pages * PAGE, require_pod_identity=False, **slot_table_args
-    )
-    extra = dict(server_args)
-    if journal_bytes is not None:
-        extra["journal_bytes"] = journal_bytes
+    table = SlotTable(broker, require_pod_identity=False, **slot_table_args)
+    extra = {} if journal_bytes is None else {"journal_bytes": journal_bytes}
     return _running_server(tmp_path, slots=table, **extra), table
 
 
 def _attach(harness, table):
     harness.server._server.slots = table
+    harness.server._server.registry.claimed_guard(0)  # what a first claim builds
     for guard in harness.server._server.registry._guards.values():
         # A real Guard would register the pool with NIXL, which the host cannot.
         guard._prepare_core = Mock()
@@ -125,14 +122,6 @@ def test_grow_shrink_increments_generation_twice(tmp_path, pools, capsys):  # no
         assert steps["shrunk"]["layout_generation"] == 3
         code, steps = _run(harness, capsys, "--mode", "verify", "--release")
         assert code == 0 and steps["verified"]["bytes"] == 4 * PAGE
-
-
-def test_minimum_above_capacity_exits_2(tmp_path, pools, capsys):  # noqa: F811
-    server, table = _serve(tmp_path, pages=3)
-    with server as harness:
-        _attach(harness, table)
-        code, steps = _run(harness, capsys, pages=(8, 4, 8))
-        assert code == 2 and steps["error"]["reason"] == "capacity_below_minimum"
 
 
 def test_mapping_failure_frees_the_claim_and_exits_2(
@@ -283,13 +272,17 @@ def test_client_v2_claim_is_a_claim_v2_and_v1_server_refuses_it(tmp_path):
 
 
 def test_client_surfaces_the_error_reason(tmp_path, pools):  # noqa: F811
-    server, table = _serve(tmp_path, pages=3)
+    server, table = _serve(tmp_path)
     with server as harness:
         _attach(harness, table)
-        with pytest.raises(KVCRServiceReasonError) as refused:
-            _claim(harness, pages=(8, 4, 8))
-    assert refused.value.reason == "capacity_below_minimum"
-    assert "capacity_below_minimum" in str(refused.value)
+        hold = _claim(harness)
+        try:
+            with pytest.raises(KVCRServiceReasonError) as refused:
+                _claim(harness)
+        finally:
+            hold.release()
+    assert refused.value.reason == "slot_held"
+    assert "slot_held" in str(refused.value)
     assert isinstance(refused.value, KVCRServiceError)
 
 
