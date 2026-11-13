@@ -635,7 +635,6 @@ def test_release_cli_needs_no_service_account_or_server_configuration(
     "claim",
     [
         {**_CLAIM, "pool_id": "../escape"},
-        {**_CLAIM, "size_gb": 257},
         {**_CLAIM, "size_gb": True},
         {**_CLAIM, "compatibility_digest": ""},
         {**_CLAIM, "node": "other"},

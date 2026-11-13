@@ -147,10 +147,11 @@ def test_health_tracks_progress_during_preparation_and_promotion(tmp_path):
             assert _get(health, "/live")[0] == 200
 
 
+@pytest.mark.parametrize("v2_slots", [False, True])  # v2: Guard 0 from a first claim
 @pytest.mark.parametrize(
     "failure", ["accept_loop", "guard_loop", "guard_failure", "dead_guard", "shutdown"]
 )
-def test_health_fails_closed_without_waiting_on_guard(failure):
+def test_health_fails_closed_without_waiting_on_guard(failure, v2_slots):
     # State snapshots, without racing the live loops that update progress clocks.
     now = time.monotonic()
     guard = SimpleNamespace(
@@ -166,7 +167,8 @@ def test_health_fails_closed_without_waiting_on_guard(failure):
         _refusing=threading.Event(),
         _draining=threading.Event(),
         _guards={0: guard},
-        _guard_count=1,
+        _guard_count=None if v2_slots else 1,
+        _v2_slots=v2_slots,
     )
     if failure == "accept_loop":
         service._server._last_progress = now - 31
