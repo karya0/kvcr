@@ -157,7 +157,8 @@ def test_local_dram_observer_reports_only_stable_slot_changes() -> None:
     ]
 
 
-def test_pool_headers_index_ready_blocks_and_clear_freed_slots() -> None:
+@pytest.mark.parametrize("telemetry", [False, True])  # untimed and timed copies
+def test_pool_headers_index_ready_blocks_and_clear_freed_slots(telemetry) -> None:
     """A READY block is committed in its pool's header, its position follows the
     G2 order, a freed slot's entry is cleared, and a key of another size fails."""
     block_size = 16
@@ -177,6 +178,7 @@ def test_pool_headers_index_ready_blocks_and_clear_freed_slots() -> None:
         framework_regions=[
             RegionDescriptor(addr=ctypes.addressof(primary), size=block_size, count=2)
         ],
+        enable_telemetry=telemetry,
     )
     pools = kvcr._core._local_dram._pools
     pools._headers = {"": header}
@@ -228,7 +230,33 @@ def test_pool_header_cost_is_counted_only_with_telemetry(telemetry) -> None:
         enable_telemetry=telemetry,
     )
     pools = kvcr._core._local_dram._pools
-    pools._headers = {"": header}
+    # A deterministic clock moved only by the operations under test: the header
+    # operations and the downstream observer each advance it by a distinct amount,
+    # and every read adds 1, so a timer spanning more than its own region is off.
+    now = 0
+
+    def clock() -> int:
+        nonlocal now
+        now += 1
+        return now
+
+    def advance(ns, call):
+        def timed(*args):
+            nonlocal now
+            now += ns
+            return call(*args)
+
+        return timed
+
+    class SlowHeader:
+        publish = staticmethod(advance(1000, header.publish))
+        clear = staticmethod(advance(300, header.clear))
+        scan = staticmethod(header.scan)
+
+    if telemetry:
+        pools._header_cost.clock = clock
+    pools._headers = {"": SlowHeader}
+    pools._observer = advance(40_000, pools._observer)
     key = BlockKey(b"k0")
     stored = kvcr.deposit({key: [_mem_descriptor(0)]})
     _poll_until(kvcr, lambda done: stored in dict(done))
@@ -255,11 +283,18 @@ def test_pool_header_cost_is_counted_only_with_telemetry(telemetry) -> None:
         "clear": (1, 8),
         "journal_g2": (3, 0),
     }
-    assert 0 < state["local_g2_header_publish_key_ns_max"]
-    assert (
-        state["local_g2_header_publish_key_ns_max"]
-        <= state["local_g2_header_publish_key_ns_total"]
-    )
+    # Each timer spans its own call and one clock read, nothing else; publish_pos
+    # advances by the same 1000 as publish_key (one publish), the observer is 3 calls.
+    ns = {
+        op: (state[f"local_g2_header_{op}_ns_total"], state[f"local_g2_header_{op}_ns_max"])
+        for op in ("publish_key", "publish_pos", "clear", "journal_g2")
+    }
+    assert ns == {
+        "publish_key": (1001, 1001),
+        "publish_pos": (1001, 1001),
+        "clear": (301, 301),
+        "journal_g2": (3 * 40_001, 40_001),
+    }
     gauge = ("gauge", "kvcr_state", 1, ("local_g2_header_clear_count",))
     assert gauge in kvcr.get_stats().records
 

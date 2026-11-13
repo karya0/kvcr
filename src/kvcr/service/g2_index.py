@@ -16,6 +16,7 @@ import logging
 import mmap
 import struct
 import time
+from collections.abc import Callable
 from functools import cache
 from typing import Any
 
@@ -195,12 +196,16 @@ class PoolHeader:
 class HeaderCost:
     """What G2 indexing costs the hot path, kept only with telemetry on: per
     operation a [count, total ns, max ns, bytes stored] list. journal_g2 is the
-    residency observer downstream of the headers; its bytes are not counted."""
+    residency observer downstream of the headers: it counts every call of that
+    observer, whether it journals, is the no-op default or an indexed no-op, and
+    its bytes are not counted. ``clock`` (ns) is the timers' one time source."""
 
-    __slots__ = ("publish_key", "publish_pos", "clear", "journal_g2")
+    OPS = ("publish_key", "publish_pos", "clear", "journal_g2")
+    __slots__ = (*OPS, "clock")
 
-    def __init__(self) -> None:
-        for op in self.__slots__:
+    def __init__(self, clock: Callable[[], int] = time.perf_counter_ns) -> None:
+        self.clock = clock
+        for op in self.OPS:
             setattr(self, op, [0, 0, 0, 0])
 
     @staticmethod
@@ -213,7 +218,7 @@ class HeaderCost:
     def telemetry_state(self) -> dict[str, int]:
         return {
             f"local_g2_header_{op}_{field}": value
-            for op in self.__slots__
+            for op in self.OPS
             for field, value in zip(
                 ("count", "ns_total", "ns_max", "bytes"), getattr(self, op)
             )

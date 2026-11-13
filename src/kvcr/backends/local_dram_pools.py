@@ -5,7 +5,6 @@
 import logging
 import queue
 import threading
-import time
 from collections import Counter, deque
 from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
@@ -446,7 +445,8 @@ class _LocalDramPools:
         self._observer(key, record)
 
     def _timed_residency_observer(self, key: BlockKey, record: "_BlockRecord") -> None:
-        cost, clock = cast(HeaderCost, self._header_cost), time.perf_counter_ns
+        cost = cast(HeaderCost, self._header_cost)
+        clock = cost.clock
         residency = record.local_dram
         if (
             self._headers
@@ -868,7 +868,8 @@ class _LocalDramPools:
             self._free_slots[pool].append(slot)
 
     def _timed_free(self, locations: Collection[tuple[str, int]]) -> None:
-        cost, clock = cast(HeaderCost, self._header_cost), time.perf_counter_ns
+        cost = cast(HeaderCost, self._header_cost)
+        clock = cost.clock
         for label, slot in locations:
             pool = label.partition(":")[0]
             if self._headers:
