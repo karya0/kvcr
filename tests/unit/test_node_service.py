@@ -558,12 +558,13 @@ def test_capacity_and_count_budget(tmp_path):
     large_claim = {**_CLAIM, "size_gb": 255.5}
     broker.ensure(large_claim)
     with pytest.raises(ValueError, match="budget"):
-        broker.ensure({**_CLAIM, "pool_id": "pool-b"})
+        broker.ensure({**_CLAIM, "pool_id": "pool-b", "size_gb": 195})
     broker.ensure({**_CLAIM, "pool_id": "pool-b", "size_gb": 0.5})
+    broker.ensure({**_CLAIM, "pool_id": "pool-c", "size_gb": 0.5})
     with pytest.raises(ValueError, match="budget"):
-        broker.ensure({**_CLAIM, "pool_id": "pool-c", "size_gb": 0.5})
+        broker.ensure({**_CLAIM, "pool_id": "pool-d", "size_gb": 0.5})
     broker.release(large_claim)
-    broker.ensure({**large_claim, "pool_id": "pool-c"})
+    broker.ensure({**large_claim, "pool_id": "pool-d"})
 
 
 def test_holder_count_limit_independent_of_capacity(tmp_path):
@@ -571,9 +572,28 @@ def test_holder_count_limit_independent_of_capacity(tmp_path):
     broker = make_broker(tmp_path, api)
     broker.ensure({**_CLAIM, "size_gb": 0.5})
     broker.ensure({**_CLAIM, "pool_id": "pool-b", "size_gb": 0.5})
+    broker.ensure({**_CLAIM, "pool_id": "pool-c", "size_gb": 0.5})
     with pytest.raises(ValueError, match="budget"):
-        broker.ensure({**_CLAIM, "pool_id": "pool-c", "size_gb": 0.5})
-    assert len(api.creates) == 2
+        broker.ensure({**_CLAIM, "pool_id": "pool-d", "size_gb": 0.5})
+    assert len(api.creates) == 3
+
+
+def test_three_slot_cap_sized_holders_fit_the_budget(tmp_path):
+    # The H7 run: three workers, each 161025622016 B, under a 485378490368 B
+    # slot cap (enforced by SlotTable; the broker sees only its holders).
+    claim_bytes, slot_cap_bytes = 161025622016, 485378490368
+    assert 3 * claim_bytes <= slot_cap_bytes - broker_module._HEADROOM_BYTES
+    size_gb = claim_bytes / (1 << 30)  # 153566 MiB, exact in binary
+    api = FakeAPI()
+    broker = make_broker(tmp_path, api)
+    claims = [{**_CLAIM, "pool_id": f"pool-{n}", "size_gb": size_gb} for n in "abcd"]
+    for claim in claims[:3]:
+        broker.ensure(claim)
+    assert len(api.creates) == 3
+    with pytest.raises(ValueError) as rejected:
+        broker.ensure(claims[3])
+    assert str(rejected.value) == "H7 holder count or capacity budget exceeded"
+    assert len(api.creates) == 3
 
 
 def test_client_server_roundtrip(tmp_path):

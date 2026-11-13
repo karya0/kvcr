@@ -559,20 +559,21 @@ def test_slot_state_persists_across_supervisor_restart(tmp_path, pools):
 def test_terminating_holders_still_count_toward_the_budget(tmp_path):
     api = FakeAPI()
     broker = make_broker(tmp_path, api)
-    claims = [{**_CLAIM, "pool_id": f"pool-{name}"} for name in "abc"]
+    claims = [{**_CLAIM, "pool_id": f"pool-{name}"} for name in "abcd"]
     held = broker.ensure(claims[0])["holder_name"]
     terminating = copy.deepcopy(api.pods[held])
     assert broker.release(claims[0])["state"] == "deleted" and not api.pods
     terminating["metadata"]["deletionTimestamp"] = "now"
     api.pods[held] = terminating  # gone from the claim's view, not from the API
     broker.ensure(claims[1])
+    broker.ensure(claims[2])
     with pytest.raises(ValueError, match="budget"):
-        broker.ensure(claims[2])
+        broker.ensure(claims[3])
     api.pods[held]["metadata"]["uid"] = "replacement"  # same name, other UID
     with pytest.raises(RuntimeError, match="replaced"):
-        broker.ensure(claims[2])
+        broker.ensure(claims[3])
     del api.pods[held]
-    broker.ensure(claims[2])
+    broker.ensure(claims[3])
 
 
 def _ids(regions):
